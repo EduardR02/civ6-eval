@@ -34,7 +34,7 @@ test("dashboard merges ledgers: zip fallback, turns, display images, compaction,
       { type: "image", data: "base64dropped" },
       { type: "text", text: "stdout: ready" },
     ])
-    + message("2026-09-08T10:00:04.000Z", "assistant", [{ type: "text", text: "done" }], {
+    + message("2026-09-08T10:00:04.000Z", "assistant", [{ type: "thinking", thinking: "final thoughts" }, { type: "text", text: "done" }], {
       stopReason: "stop",
       usage: { input: 1000, cacheRead: 2000, cacheWrite: 0, output: 300, reasoning: 100, cost: { total: 0.02 } },
     }));
@@ -66,6 +66,12 @@ test("dashboard merges ledgers: zip fallback, turns, display images, compaction,
   expect(html).toContain("final HTTP 413");
   expect(html).toContain("compaction 10:00:03"); // compact request time via usage.jsonl fallback
   expect(html).toContain("3 requests · est $0.52 (0 unpriced)"); // compaction usage counted in totals, not zipped
+  expect(html).toContain('<details class="think" open><summary>thinking</summary><pre>final thoughts</pre></details>'); // most recent thinking opens by default
+  expect(html).toContain('<details class="think"><summary>thinking</summary><pre>capture first</pre></details>'); // older thinking stays collapsed
+  expect(view.render(10, 5, "test-run")).toContain('<meta http-equiv="refresh" content="10">'); // live page self-refreshes at the poll interval
+  expect(html).not.toContain("http-equiv"); // render(0) is the final page: no self-refresh
+  expect(html).toContain('<div id="tail"></div>'); // autoscroll anchor after the last card
+  expect(html).toContain("civ-viewer-follow"); // follow/pinned state script present
   expect(html).not.toContain("a1-0.png"); // artifact copy not double-mapped
 });
 

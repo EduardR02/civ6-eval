@@ -306,6 +306,14 @@ export class RunView {
       return `<div class="card answers"><div class="head">CONTEXT GROWTH · fresh+cached per model call${marks ? " · dashed = compaction" : ""}</div>${svg}</div>`;
     })();
 
+    // The most recent thinking block renders expanded; every older one stays collapsed.
+    let openEntry: Entry | undefined, openBlock = -1;
+    for (let index = entries.length - 1; index >= 0 && !openEntry; index--) {
+      const blocks = entries[index]!.blocks;
+      for (let slot = blocks.length - 1; slot >= 0; slot--) {
+        if (blocks[slot]!.type === "thinking") { openEntry = entries[index]; openBlock = slot; break; }
+      }
+    }
     let body = "", sidebar = "", lastTurn = 0, displayIndex = 0, mark = 0;
     for (const entry of entries) {
       const turn = turnOf(entry.ts, this.endTurns);
@@ -331,8 +339,9 @@ export class RunView {
           continue;
         }
         let inner = "";
-        for (const block of entry.blocks) {
-          if (block.type === "thinking") inner += `<details class="think"><summary>thinking</summary><pre>${esc(block.thinking)}</pre></details>`;
+        for (let index = 0; index < entry.blocks.length; index++) {
+          const block = entry.blocks[index]!;
+          if (block.type === "thinking") inner += `<details class="think"${entry === openEntry && index === openBlock ? " open" : ""}><summary>thinking</summary><pre>${esc(block.thinking)}</pre></details>`;
           else if (block.type === "text") inner += `<div class="text">${linkify(block.text, this.runDir)}</div>`;
           else if (block.type === "toolCall") inner += `<details class="tool"><summary>${esc(block.name)}</summary><pre>${linkify(block.code.length > 16000 ? `${block.code.slice(0, 16000)}\n…[truncated]` : block.code, this.runDir)}</pre></details>`;
         }
@@ -393,8 +402,35 @@ img.shot{max-width:100%;border:1px solid #333;border-radius:4px;margin:4px 0;cur
 a.imglink{color:#6cf;text-decoration:none;border-bottom:1px dotted #468}
 .spark{display:block;margin:10px 0 2px}
 code{color:#9cd;background:#101010;padding:0 3px;border-radius:3px}
-</style></head><body><div id="side">${sidebar}</div><div id="main">${sparkCard}${body}</div>
-<script>onbeforeunload=()=>sessionStorage.setItem("civ-viewer-scroll",String(scrollY));onload=()=>{const y=sessionStorage.getItem("civ-viewer-scroll");if(y!==null)scrollTo(0,+y)};</script></body></html>`;
+#followbtn{position:fixed;right:12px;bottom:12px;z-index:9;padding:4px 10px;font:12px ui-monospace,Consolas,monospace;background:#223;color:#8cf;border:1px solid #556;border-radius:12px;cursor:pointer;opacity:.85}
+#followbtn:hover{opacity:1;background:#334}
+</style></head><body><div id="side">${sidebar}</div><div id="main">${sparkCard}${body}<div id="tail"></div></div>
+<script>(function(){
+var KEY="civ-viewer-follow",tail=document.getElementById("tail"),last=scrollY;
+var follow=function(){return sessionStorage.getItem(KEY)!=="0"};
+addEventListener("scroll",function(){
+  if(innerHeight+scrollY>=document.documentElement.scrollHeight-64)sessionStorage.setItem(KEY,"1");
+  else if(scrollY<last)sessionStorage.setItem(KEY,"0");
+  last=scrollY;
+  btn.textContent=follow()?"follow":"pinned";
+});
+var btn=document.createElement("button");
+btn.id="followbtn";
+btn.textContent=follow()?"follow":"pinned";
+btn.onclick=function(){
+  var next=!follow();
+  sessionStorage.setItem(KEY,next?"1":"0");
+  btn.textContent=next?"follow":"pinned";
+  if(next)tail.scrollIntoView({block:"end"});
+};
+document.body.appendChild(btn);
+onbeforeunload=function(){sessionStorage.setItem("civ-viewer-scroll",String(scrollY))};
+addEventListener("load",function(){
+  if(follow())tail.scrollIntoView({block:"end"});
+  else{var at=sessionStorage.getItem("civ-viewer-scroll");if(at!==null)scrollTo(0,+at)}
+  setTimeout(function(){if(follow()&&innerHeight+scrollY<document.documentElement.scrollHeight-64)tail.scrollIntoView({block:"end"})},400);
+});
+})();</script></body></html>`;
   }
 }
 
@@ -436,7 +472,7 @@ export async function runDashboard(runDir: string, interval: number): Promise<vo
   const view = new RunView();
   const target = join(runDir, "viewer.html");
   console.log(`Dashboard watching ${runDir} (poll every ${interval}s); Ctrl+C to stop.`);
-  let signature = "", idle = 0, pageRefresh = true, stopped = false, lastWaiting: boolean | null = null;
+  let signature = "", stopped = false, lastWaiting: boolean | null = null;
   let wake: (() => void) | undefined;
   const namedInterrupt = (): void => { stopped = true; wake?.(); };
   process.on("SIGINT", namedInterrupt);
@@ -470,18 +506,15 @@ export async function runDashboard(runDir: string, interval: number): Promise<vo
     const waiting = !state.dir || state.transcripts === 0;
     const changed = state.sig !== signature;
     signature = state.sig;
-    idle = changed ? 0 : idle + 1;
-    const wantRefresh = waiting || idle <= 1;
     if (waiting !== lastWaiting) {
       lastWaiting = waiting;
       console.log(waiting ? `[dashboard] waiting for run data in ${runDir}` : `[dashboard] run data found`);
     }
-    if (state.dir && (changed || wantRefresh !== pageRefresh)) {
-      pageRefresh = wantRefresh;
+    if (state.dir && changed) {
       const started = performance.now();
       try {
         await view.refresh(runDir);
-        writeAtomic(target, view.render(wantRefresh ? interval : 0, Math.round(performance.now() - started)));
+        writeAtomic(target, view.render(interval, Math.round(performance.now() - started)));
         console.log(`[dashboard] viewer.html ${waiting ? "waiting page" : "rebuilt"} in ${Math.round(performance.now() - started)}ms · ${view.read.toLocaleString()} bytes read`);
       } catch (error) { console.error(`[dashboard] rebuild failed: ${error instanceof Error ? error.message : String(error)}`); }
     }
