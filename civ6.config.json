@@ -1,0 +1,9 @@
+{
+  "model": "gpt-6-astra",
+  "provider": "codex",
+  "effort": "high",
+  "maxConcurrentAgents": 4,
+  "maxModelCalls": 200,
+  "compactThreshold": 180000,
+  "distro": "Ubuntu-24.04"
+}

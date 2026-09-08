@@ -1,0 +1,154 @@
+# Why this project exists
+
+We want to discover how well current, highly capable language models can play **Civilization VI: Gathering Storm** when given an excellent interface and a powerful general-purpose harness.
+
+Beating Deity AI is a meaningful target: a player that cannot reach that level is less interesting for the original question. But the project is not merely a race to produce one Deity win. We care about how the model understands the game, reasons about competing investments, adapts, makes calculations, builds tools, delegates, and carries decisions through a long game.
+
+A representative intended game is Online speed, Standard map size, eight major civilizations, normal fog of war, and all intended victory conditions enabled. The conversation used roughly 125 turns to victory and a 250-turn cap as a scale example, not a promise or mandatory score cutoff. Thousands of tiles, many units, and interdependent city decisions make representation and interaction a real engineering problem.
+
+The player and the harness are both experimental variables. We must not quietly replace the model's decisions with a hand-authored Civ strategy engine.
+
+## How to read prior research
+
+Prior projects are sources of useful discoveries, not architectural defaults or ceilings on today's models. A year-old model can require workarounds that are unnecessary or harmful now. Inspect the exact model, interface, available information, action granularity, context treatment, and evaluation conditions before importing a conclusion.
+
+ARC-AGI-3 was researched to understand the intelligence landscape and harness sensitivity—not as a blueprint for Civ. MazeBench is similarly informative about active observation, long-horizon behavior, and model-authored tools. Neither requires us to make a Civ player rediscover a stable game API every run. Civ is one well-defined domain; useful domain-specific engineering is appropriate.
+
+Useful reference directions from the research:
+
+- [Civ6 tool-mediated play](https://github.com/lmwilki/civ6-mcp): engine/API discoveries and real failure cases. We did **not** choose to inherit its server, narration, or strategic workflow.
+- [Recursive Language Models](https://arxiv.org/abs/2512.24601): large context as inspectable external data and model calls over selected portions.
+- [PRO-LONG](https://arxiv.org/abs/2607.20064): durable, searchable interaction history and programmatic memory.
+- [ARC Prize's Astra analysis](https://arcprize.org/blog/astra): provider-state preservation and examples of model-authored parsers, planners, and synchronization code.
+- [MazeBench](https://mazebench.com/blog?post=maze-bench-results): agent-controlled viewpoints and distinct visual/text/coding configurations. Do not conflate this with the unrelated static maze-image paper of the same name.
+- [Factorio Learning Environment](https://github.com/JackHopkins/factorio-learning-environment): programmatic observation/action composition and feedback. Its older-model results and mechanically powerful routing helpers are not evidence of Astra's limits or unaided planning ability.
+
+Results from these systems establish hypotheses worth testing here, not universal rules such as “screenshots are bad” or “subagents do not help.”
+
+# Design position
+
+**Build stable, trustworthy access; leave cognition and useful derived tools flexible.**
+
+This is neither screenshot-only asceticism nor a prewritten strategy bot. A small model-facing surface may need careful implementation underneath. Minimal means little accidental friction and little imposed workflow—not the fewest lines of code at any cost.
+
+## Mechanics versus judgment
+
+Provide durable access to identities, coordinates, rules, exact observable quantities, legal actions, and outcomes. The model should not repeatedly discover our serialization format or the correct command for city production.
+
+Leave valuation, strategy, prioritization, planning, and adaptation to the model. Computing an exact adjacency bonus or an engine-authorized movement path is different from choosing an optimal city layout using our own strategic weights. When a helper contains substantial planning, make that contribution explicit rather than crediting it entirely to the model.
+
+The model can create its own strategic helpers. A planner it chooses to write, checks, and uses during play is part of the capability we want to observe. Keep the source and evidence available. Useful code can persist across games; record whether an evaluation uses a pre-existing skill library or starts fresh.
+
+## Neutrality and attention
+
+The interface must not decide that a local military situation is the whole game. “Five enemy units near this city” is a factual observation. “A desperate medieval war on the eastern front” adds narrative and can bias attention.
+
+A competent decision may simultaneously involve those units, a technology beeline, a builder elsewhere, production in another city, and a district investment. Camera focus is not strategic focus. Local inspection must not hide the rest of the empire or create a mandatory military/economic workflow.
+
+No representation is perfectly neutral. We can nevertheless avoid strategic rankings, retain access to alternatives, label uncertainty, and let the model change what it displays. If the model neglects something despite good access, that can be an intelligence/behavior finding. Do not automatically fix every loss by adding another reminder or scripted policy.
+
+# The interaction experience
+
+## Native visuals are first-class
+
+Use Civ's own rendering: normal view, Strategic View, camera movement, zoom, selection, lenses, tooltips, and panels. A screenshot can communicate rich spatial structure efficiently. Do not replace it with a custom map renderer until a demonstrated problem justifies that work.
+
+Observation is an action. The model can think, change a view, inspect what changed, calculate, and act in an interleaved loop. A single screenshot need not contain every fact for this to work well.
+
+Keep images available in the executable workspace. The model or a subagent can crop, annotate, combine, or analyze them. Cropping an existing capture does not reveal pixels that were never captured; zooming the actual game or taking a higher-resolution capture may be necessary. Image cost depends on dimensions/provider settings and repeated inclusion; do not assume a universal token count.
+
+Initial ergonomic recommendation: 1920x1080 windowed, ordinary UI scale, Quick Movement/Combat on, Auto End Turn and Auto Unit Cycling off, no real-time turn timer. Resource icons are useful; yield icons and grid can be toggled for the current question. These are starting choices, not a proven optimum. Reacquire coordinates after resolution, scaling, window, or game changes.
+
+The installed Codex desktop reference reinforced the general pattern: a persistent JavaScript REPL, window-scoped native controls, screenshots, and interleaved calls—not just a legacy one-click tool. Its shipped implementation uses SendInput/UI Automation/Windows.Graphics.Capture. Our Python-backed implementation need not copy its private helper or claim to be identical.
+
+## Exact data complements the picture
+
+Expose documented player-observable state to code: tiles and edges, units, cities, production, research/civics, economy, diplomacy, notifications, rules, and other supported systems. Keep the full available data outside the prompt; acquiring it and printing it are different operations.
+
+Prefer ordinary inspectable data over a deep domain-object hierarchy or many conversational query steps. When useful, one code execution can join city, tile, and unit data into the view the model wants. What is seen, queried, and acted on should have unambiguous matching references.
+
+Preserve geometry correctly. Rivers and cliffs can belong to tile boundaries; a lossy `river=true` field is not enough to reason about a crossing. Stable IDs, coordinate conventions, visibility, and capture revisions matter more than cryptic compressed notation.
+
+The source of truth is **what this player can know**, not everything exposed by the engine:
+
+- Current visible facts.
+- Last-known observations with timestamps.
+- Unknown information.
+- Model inferences and assumptions, stored separately from facts.
+
+An enemy leaving sight is not a confirmed death. A previously explored tile is not permission to read its current hidden contents. Unavailable APIs must be reported honestly; do not fabricate zeros or quietly leak hidden state to fill gaps.
+
+## Derived views should be easy to request, not all prebuilt
+
+A request such as “compare Campus placements across these cities” can go to a subagent. It can inspect rules, fetch data, write calculations, check them, and return a compact table or annotated image with code/evidence references. Its exploratory transcript stays out of the main player's context.
+
+This is why persistent execution and subagents are central. Do not turn every plausible query into another permanent tool. Conversely, do not force the model to recreate stable mechanical access just to satisfy a minimalism ideal. Add a durable convenience function when repeated evidence shows that it removes real friction.
+
+Keep queries composable. Ten tiny calls can cost more than one rich scene that settles a decision. Optimize total computation, context, interaction, and error cost to make and execute good decisions—not individual response length alone.
+
+# Harness and provider contracts
+
+## Pi host and executable memory
+
+Use a Pi-based runner with a deliberately restricted set of host capabilities, not a fork of a large general coding harness or an inherited Civ MCP catalog. MCP is a protocol, not inherently bloat; it was not necessary for this custom local boundary.
+
+The executable workspace supports persistent Python, files, images, access to permitted observations/history, and programmatic subagent/model calls. In the RLM sense, large material stays external and can be inspected/transformed before selected results enter a context. This does not grant access to a model's hidden activations or arbitrary private chain of thought.
+
+Subagents have separate contexts and Python namespaces. They can use the same powerful model for substantive work; cheaper models are an optimization to evaluate, not an assumption. Do not force a permanent cabinet of named ministers. Bounded analyses, independent alternatives, execution handoffs, and persistent specialists are all available when the model finds them useful.
+
+## Provider-specific state must remain correct
+
+Astra defaults to the user's ChatGPT/Codex subscription via OMP's read-only credential source. Preserve complete native Responses items, including opaque reasoning and tool identities. Codex can emit full items in `response.output_item.done` while terminal `output` is empty; do not lose them. Native streaming compaction must preserve its opaque replacement state rather than flattening it into ordinary text.
+
+GLM 5.3 Flash through opencode-go is a cheaper/faster iteration target and an alternate player. Keep the same game/runtime contract, but use its supported provider transport, vision conversion, reasoning levels, and compaction. Provider-compatible summarization is not the same mechanism as Astra's native opaque compaction. A saved run must not silently switch model/provider/account and replay incompatible state.
+
+Read credentials privately at the trusted boundary. Never mount them into player workspaces, include them in artifacts, or expose token-bearing refresh errors. Do not rotate shared subscription refresh tokens behind another harness. Do not switch accounts automatically after rate limits or retry quota failures indefinitely.
+
+## Execution and recovery
+
+One controller owns live game/UI access. Mouse, keyboard, camera, and selection are shared state; independent snapshot analyses are not. Subagents may execute bounded tasks after explicit handoff—“one controller” does not mean the main model must type every action.
+
+Player code runs in a real OS sandbox. The current Windows implementation uses network-isolated Bubblewrap inside WSL for computation, with a trusted Windows desktop service and FireTuner bridge outside it. Raw host filesystem/network/debug access must not become available through arbitrary Python or protocol messages.
+
+Actions use normal legal game requests or native UI input. Do not bypass costs or substitute simulation mutations. Report submission, rejection, pending processing, and observed completion accurately. Batches may interleave queries and conditionals; never silently replay a partly executed batch.
+
+Files, observations, artifacts, and provider history are durable. In-memory Python bindings are not restored by restarting a process. An interrupted request or action has unknown outcome until reobserved. Failed or cancelled transports must stop admitting new work and release held inputs.
+
+## Usage accounting
+
+Track all agents and compaction calls, not only the main model. Persist request identities so resume and repeated reporting cannot double count. Record input, cache reads/writes, output, and reported reasoning tokens without counting reasoning twice; image tokens may be included in input without a separate reported breakdown.
+
+Per-turn attribution is currently based on the last confirmed game/player/turn when a request starts. Preserve that attribution if the game advances before the response arrives. Record an analyst's older snapshot separately. Before a confirmed observation, use an unknown/pre-game bucket; do not pretend screenshot-only activity has exact turn attribution.
+
+Show API-equivalent estimates separately from actual subscription charges. Unknown rates and unreported request usage remain unknown. Preserve rates/provenance used for estimates; changing a rate later must not rewrite historical accounting silently.
+
+# Evaluation and iteration
+
+Start by getting the core access/execution contract right, then use cheaper capable models and agents to iterate without making rate limits the project's dominant bottleneck. Stronger models remain important for load-bearing work and maximum-strength play. Use the same game/tool contract so model comparisons are interpretable.
+
+Maintain two knowledge tracks when evaluating:
+
+- **Uncoached:** game rules, interface documentation, and within-game work; no curated strategy guide.
+- **Expert-informed:** the same harness with selected community/multiplayer strategy material available.
+
+“Uncoached” does not mean the model has never seen Civ strategy in training. Guides can be useful and interesting without being executable strategy scripts. Preserve their ruleset, mod, speed, and multiplayer assumptions. Do not silently mix supplied guide knowledge, supplied procedures, and model-authored skills.
+
+Declare mods, map settings, speed, difficulty, seeds, model/effort, knowledge track, and human interventions. BBG/BBM interface smoke is not an unmodified Gathering Storm benchmark. Development saves and scenario probes are useful for diagnosis; full games are necessary evidence for winning ability. Do not discard early defeats or automation failures from evaluation results.
+
+Useful observations include actual outcome, decision/action errors, missed facts, repeated work, query rounds, context growth, token usage, subagent cost, and elapsed time. Avoid constructing a large benchmark apparatus before the player works.
+
+# What the core checkpoint means
+
+A useful core baseline has a runnable documented CLI; sound provider/session handling; persistent computation and delegation; native visuals and exact observable state; legal actions with confirmed consequences; privacy/cancellation/recovery boundaries; and honest usage reporting. It has focused regressions plus recorded runtime proof.
+
+It does **not** mean every victory path has been tested, every optional game API has a direct wrapper, the representation is optimal, or a Deity win has been achieved. The native UI remains available for specialized interactions. State those limits rather than calling a partial scaffold a finished player.
+
+Create a local Git checkpoint only after the relevant checks pass and secrets/run artifacts are excluded. A commit makes the baseline recoverable and changes inspectable; it does not stop future agents breaking it. Protect the invariants with tests, small reviewable changes, and updated design notes. Keep temporary progress, screenshots, and run-specific failures in ignored artifacts instead of turning this document into a changelog.
+
+## Working agreement with the user
+
+The orchestrator retains project interpretation and acceptance decisions. Delegate implementation and especially live computer-use testing so its large context is not polluted by screenshots, click traces, debugging logs, or small coding excursions. The user explicitly requested that this project context be written by the orchestrator because the nuances developed across the entire conversation matter.
+
+When the user is at the computer, ask them to start/load the intended game rather than spend model calls navigating menus. Respect their open game and settings. Tell them if display changes would improve ergonomics; do not change them unexpectedly during a verifier's coordinate-sensitive work.
+
+Further changes should preserve this intent while remaining open to evidence. Neither “the newest model can do everything unaided” nor “every model failure needs a harness trick” is our premise.
