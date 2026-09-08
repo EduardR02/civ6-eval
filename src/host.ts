@@ -135,22 +135,18 @@ export class PlayerHost {
     }
     if (method === "harness.complain") {
       const note = textArg(args, "note");
-      const at = new Date().toISOString();
-      await this.history("history.read", { limit: 1 });
-      let latestSnapshot: string | undefined;
-      try { latestSnapshot = JSON.parse(await readFile(join(this.runDir, "observations.json"), "utf8")).latest; } catch { /* no observation yet */ }
-      let trace: string[] = [];
-      try {
-        const source = await readFile(join(this.runDir, "history.jsonl"), "utf8");
-        trace = source.trimEnd().split("\n").slice(-20);
-      } catch { /* history unavailable */ }
-      const complaint = { at, agentId, controller: this.controller, latestSnapshot: latestSnapshot ?? null, note, trace };
-      const complaintsDir = join(this.runDir, "complaints");
-      await mkdir(complaintsDir, { recursive: true });
-      const file = join(complaintsDir, `${at.replaceAll(":", "-")}-${agentId}.json`);
-      await writeFile(file, JSON.stringify(complaint, null, 1));
-      this.log({ kind: "complaint", agentId, note, latestSnapshot });
-      return { logged: true, file, agentId, note: "Complaint queued with auto-attached trace (last 20 history rows, current turn reference). Triage happens between agent windows." };
+      if (!note.trim() || note.length > 12000) throw new Error("note must contain 1–12000 characters of text");
+      const complaintId = randomUUID();
+      const complaint = {
+        complaintId, at: new Date().toISOString(), agentId, controller: this.controller,
+        lastObservedSnapshot: this.latestSnapshot ?? null, note,
+        trace: await this.history("history.read", { limit: 20, textLimit: 2000 }),
+      };
+      const artifact = `complaints/${complaintId}.json`;
+      await this.artifact("artifact.write", { name: artifact, content: JSON.stringify(complaint, null, 1) });
+      this.log({ kind: "complaint", complaintId, agentId, note, lastObservedSnapshot: complaint.lastObservedSnapshot, artifact });
+      await this.eventQueue;
+      return { logged: true, complaintId, artifact };
     }
     if (!method.startsWith("civ.") && !method.startsWith("desktop.")) throw new Error(`Unknown RPC method: ${method}`);
     return this.live(agentId, async () => {

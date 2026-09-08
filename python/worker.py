@@ -318,7 +318,7 @@ def _install_pyautogui():
 _namespace = {
     "__name__": "__astra__", "__builtins__": builtins,
     "rpc": rpc, "display": display,
-    "civ": Service("civ", ("snapshot", "inspect", "rules", "action")),
+    "civ": Service("civ", ("snapshot", "inspect", "rules", "action", "keybinds", "dismiss_notifications")),
     "agent": Agents(),
     "artifact": Service("artifact", ("read", "write", "list")),
     "history": Service("history", ("search", "read")),

@@ -122,6 +122,19 @@ Per-turn attribution is currently based on the last confirmed game/player/turn w
 
 Show API-equivalent estimates separately from actual subscription charges. Unknown rates and unreported request usage remain unknown. Preserve rates/provenance used for estimates; changing a rate later must not rewrite historical accounting silently.
 
+## Transport size is separate from model context
+
+Budget serialized request bytes separately from token context. Image encoding can reduce upload size without reducing image tokens; image-token accounting depends on the actual provider/model and dimensions. A successful small JPEG example is not a universal compression ratio or an image-quality guarantee.
+
+Our current Astra path replays native items with `store: false`; it does **not** use `previous_response_id` to keep conversation history server-side. Both this path and the GLM completions path can therefore accumulate large request bodies. Prompt caching reduces some computation/billing, not the bytes our client uploads. A provider exposing a Responses route does not establish that it supports the model, server-side history, or compaction we need.
+
+Prefer stable already-sent representations during ordinary continuation. Compaction is a convenient default boundary for deliberate history reduction, **not** the only API-permitted time to change history. Evaluate cache-prefix effects, valid tool/result pairing, preserved reasoning, and access to original observations independently. Retain original captures and make any lossy model-facing representation explicit. Do not blindly shrink the newest evidence or drop arbitrary tool messages to get under a limit.
+
+Transport limits need their own measured/configurable guard and recoverable failure handling. Token-threshold compaction alone is insufficient, and a compaction request can itself be too large. Raising a provider's token threshold is an experiment, not a remedy for HTTP 413. Native API-equivalent pricing tiers also do not establish how a ChatGPT subscription meters its quota.
+
+When reviewing an experiment, distinguish no recursive delegation from no useful computational memory: a model may build and reuse in-namespace helpers, query external state, and crop images without spawning a subagent or saving a Python module. Likewise, fewer explicit planning notes do not by themselves prove that no planning occurred. Fix misleading mechanics and broken affordances; test behavioral hypotheses before turning them into process rules.
+
+
 # Evaluation and iteration
 
 Start by getting the core access/execution contract right, then use cheaper capable models and agents to iterate without making rate limits the project's dominant bottleneck. Stronger models remain important for load-bearing work and maximum-strength play. Use the same game/tool contract so model comparisons are interpretable.

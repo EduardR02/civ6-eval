@@ -59,6 +59,64 @@ test("history search returns bounded excerpts with recoverable full-record offse
   expect(recovered.rows[0]!.text).toBe("recover-me");
 });
 
+test("complaints expose readable bounded public evidence without private host paths", async () => {
+  const { host, directory } = await fixture();
+  await host.rpc("main", "history.read", {});
+  await writeFile(join(directory, "private.json"), "opaque-private-provider-state");
+  const records = Array.from({ length: 25 }, (_, index) => JSON.stringify({ index, payload: "a".repeat(4000), end: "recover-me" }));
+  await appendFile(join(directory, "history.jsonl"), records.join("\n") + "\n");
+  await host.setController("analyst");
+  const result = await host.rpc("analyst", "harness.complain", { note: "Missing action feedback" }) as { logged: boolean; complaintId: string; artifact: string };
+  expect(result.logged).toBe(true);
+  expect(result.artifact).toMatch(/^complaints\/[a-f0-9-]+\.json$/);
+  expect(JSON.stringify(result)).not.toContain(JSON.stringify(directory).slice(1, -1));
+  const saved = await host.rpc("main", "artifact.read", { name: result.artifact, limit: 50000 }) as { content: string; truncated: boolean };
+  expect(saved.truncated).toBe(false);
+  expect(saved.content).not.toContain("opaque-private-provider-state");
+  expect(saved.content).not.toContain(JSON.stringify(directory).slice(1, -1));
+  const complaint = JSON.parse(saved.content);
+  expect(complaint.complaintId).toBe(result.complaintId);
+  expect(complaint.note).toBe("Missing action feedback");
+  expect(complaint.agentId).toBe("analyst");
+  expect(complaint.controller).toBe("analyst");
+  expect(complaint.lastObservedSnapshot).toBeNull();
+  expect(complaint.trace.total).toBe(27);
+  expect(complaint.trace.rows).toHaveLength(20);
+  const first = complaint.trace.rows[0];
+  expect(first.line).toBe(8);
+  expect(first.text).toBe(records[6]!.slice(0, 2000));
+  expect(first.totalChars).toBe(records[6]!.length);
+  expect(first.textOffset).toBe(0);
+  expect(first.truncated).toBe(true);
+  expect(JSON.parse(complaint.trace.rows.at(-1).text).controller).toBe("analyst");
+  const recovered = await host.rpc("main", "history.read", { offset: first.line - 1, limit: 1, textOffset: records[6]!.indexOf("recover-me"), textLimit: 10 }) as { rows: { text: string }[] };
+  expect(recovered.rows[0]!.text).toBe("recover-me");
+  const history = await readFile(join(directory, "history.jsonl"), "utf8");
+  expect(JSON.parse(history.trimEnd().split("\n").at(-1)!)).toMatchObject({ kind: "complaint", complaintId: result.complaintId });
+});
+
+test("simultaneous complaints retain distinct complete artifacts", async () => {
+  const { host } = await fixture();
+  const results = await Promise.all(Array.from({ length: 12 }, (_, index) =>
+    host.rpc("main", "harness.complain", { note: `Report ${index}` }) as Promise<{ complaintId: string; artifact: string }>));
+  expect(new Set(results.map(result => result.complaintId)).size).toBe(12);
+  for (const [index, result] of results.entries()) {
+    const saved = await host.rpc("main", "artifact.read", { name: result.artifact, limit: 50000 }) as { content: string };
+    expect(JSON.parse(saved.content).note).toBe(`Report ${index}`);
+  }
+});
+
+test("complaints reject invalid notes and missing evidence instead of claiming success", async () => {
+  const { host, directory } = await fixture();
+  for (const note of [undefined, "", "  ", 42, "a".repeat(12001)]) {
+    await expect(host.rpc("main", "harness.complain", { note })).rejects.toThrow();
+  }
+  await host.rpc("main", "history.read", {});
+  await rm(join(directory, "history.jsonl"));
+  await expect(host.rpc("main", "harness.complain", { note: "Evidence unavailable" })).rejects.toThrow();
+  expect(await host.rpc("main", "artifact.list", { prefix: "complaints/" })).toEqual({ files: [], limit: 1000 });
+});
+
 test("concurrent artifact replacements publish complete versions to readers", async () => {
   const { host } = await fixture();
   const versions = ["a", "b"].map(value => JSON.stringify({ value: value.repeat(16000) }));

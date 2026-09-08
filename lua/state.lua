@@ -13,6 +13,16 @@ if not A.notificationsInitialized then
   A.notificationsRestoredFor = nil
   A.notificationsInitialized = true
 end
+local function restoreNotifications(pid)
+  if A.notificationsRestoredFor ~= pid then
+    NotificationManager.RestoreVisualState(pid)
+    A.notificationsRestoredFor = pid
+  end
+end
+local blockerNames = {}
+for name, value in pairs(EndTurnBlockingTypes or {}) do
+  if type(name) == 'string' and type(value) == 'number' then blockerNames[value] = name end
+end
 local function id(kind, owner, index)
   if index == nil then return A.session..':'..kind..':'..owner end
   return A.session..':'..kind..':'..owner..':'..index
@@ -24,12 +34,14 @@ function A.localPlayer()
 end
 function A.turnState()
   local pid, player = A.localPlayer()
-  local ids=A.static('notifications',NotificationManager,'GetAllEndTurnBlocking',pid)
-  local blockers=A.array()
-  if ids~=A.null then
-    for _,bid in ipairs(ids) do
-      local n=A.call('notifications',NotificationManager,'Find',pid,bid)
-      blockers[#blockers+1]={id=bid, type=(n and A.call('notifications',n,'GetTypeName') or A.null), summary=(n and A.call('notifications',n,'GetSummary') or A.null)}
+  local types=A.static('notifications',NotificationManager,'GetAllEndTurnBlocking',pid)
+  local blockers=A.null
+  if types~=A.null then
+    blockers=A.array()
+    for _,blockingType in ipairs(types) do
+      local n=A.static('notifications',NotificationManager,'FindEndTurnBlocking',blockingType,pid)
+      -- id is an EndTurnBlockingTypes identifier, not a notification ID; unit orders may have no notification.
+      blockers[#blockers+1]={id=blockingType, type=blockerNames[blockingType] or A.null, summary=n~=A.null and A.call('notifications',n,'GetSummary') or A.null}
     end
   end
   return {
@@ -44,9 +56,10 @@ end
 
 function A.dismiss_notifications(args)
   local pid = A.localPlayer()
+  restoreNotifications(pid)
   local dismissed = A.array()
-  for _, nid in pairs(A.notificationIds[pid] or {}) do
-    local n = A.call('dismiss', NotificationManager, 'Find', pid, nid)
+  for nid in pairs(A.notificationIds[pid] or {}) do
+    local n = A.static('dismiss', NotificationManager, 'Find', pid, nid)
     if n and n ~= A.null and A.call('dismiss', n, 'CanUserDismiss') == true then
       NotificationManager.Dismiss(pid, nid)
       dismissed[#dismissed+1] = id('notification', pid, nid)
@@ -56,28 +69,31 @@ function A.dismiss_notifications(args)
 end
 
 function A.keybinds(args)
+  args = args or {}
+  local limit, offset = args.limit or 400, args.offset or 0
+  assert(type(limit)=='number' and limit>=1 and limit<=1000 and limit%1==0, 'limit must be 1..1000')
+  assert(type(offset)=='number' and offset>=0 and offset%1==0, 'offset must be a nonnegative integer')
+  assert(args.category==nil or type(args.category)=='string', 'category must be a string')
+  local category = args.category and string.lower(args.category)
   return A.section('keybinds', function()
-    local out, limit, offset = A.array(), math.min(tonumber(args and args.limit) or 400, 1000), math.max(tonumber(args and args.offset) or 0, 0)
-    local category = args and args.category
+    local out = A.array()
     local count = Input.GetActionCount()
     local matched = 0
-    for i = 0, (count or 0) - 1 do
+    for i = 0, count - 1 do
       local actionId = Input.GetActionId(i)
-      if actionId and Input.ShouldShowActionKeybinding(actionId) then
-        local key = Input.GetGestureDisplayString(actionId, 0)
-        local alt = Input.GetGestureDisplayString(actionId, 1)
-        if (key and key ~= '') or (alt and alt ~= '') then
-          local cat = Input.GetActionCategory(actionId)
-          if not category or (cat and string.find(string.lower(cat), string.lower(category), 1, true)) then
-            matched = matched + 1
-            if matched > offset and #out < limit then
-              out[#out+1] = { name = Input.GetActionName(actionId), category = cat, key = key or A.null, alt = alt or A.null }
-            end
+      if Input.ShouldShowActionKeybinding(actionId) then
+        local categoryKey = Input.GetActionCategory(actionId)
+        local cat = Locale.Lookup(categoryKey)
+        if not category or string.find(string.lower(cat), category, 1, true) or string.find(string.lower(categoryKey), category, 1, true) then
+          matched = matched + 1
+          if matched > offset and #out < limit then
+            out[#out+1] = { name = Locale.Lookup(Input.GetActionName(actionId)), category = cat,
+              key = Input.GetGestureDisplayString(actionId, 0) or A.null, alt = Input.GetGestureDisplayString(actionId, 1) or A.null }
           end
         end
       end
     end
-    return { actions = out, total = matched, more = matched > offset + #out }
+    return { actions = out, offset = offset, total = matched, more = matched > offset + #out }
   end)
 end
 local function yields(group, object)
@@ -311,10 +327,7 @@ function A.snapshot(args)
     return result
   end)
   out.notifications=A.section('notifications',function()
-    if A.notificationsRestoredFor ~= pid then
-      NotificationManager.RestoreVisualState(pid)
-      A.notificationsRestoredFor = pid
-    end
+    restoreNotifications(pid)
     local result=A.array()
     for notificationId in pairs(A.notificationIds[pid] or {}) do
       local notification=NotificationManager.Find(pid,notificationId)

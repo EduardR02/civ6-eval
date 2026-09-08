@@ -251,7 +251,7 @@ async function main(): Promise<void> {
         const block = result.content[i];
         if (block.type === "text") console.log(block.text);
         else {
-          const imagePath = join(runDir, `execution-${i}.png`);
+          const imagePath = join(runDir, `execution-${i}.${block.mimeType === "image/jpeg" ? "jpg" : "png"}`);
           await writeFile(imagePath, Buffer.from(block.data, "base64"));
           console.log(`Image: ${imagePath}`);
         }

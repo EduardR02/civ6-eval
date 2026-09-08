@@ -1,7 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, writeFile, rm, readdir } from "node:fs/promises";
+import { mkdtemp, writeFile, rm, readdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir, homedir } from "node:os";
+import { pathToFileURL } from "node:url";
 import { loadConfig } from "../src/config.ts";
 
 const directories: string[] = [];
@@ -107,4 +108,36 @@ test("usage failures exit nonzero rather than creating or silently accepting a r
   const corrupt = await cli(["usage", "--run", directory, "--json"]);
   expect(corrupt.exitCode).toBe(1);
   expect(corrupt.stdout).toBe("");
+});
+
+test("CLI exec writes JPEG and PNG image bytes with matching filenames", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "civ-image-cli-"));
+  directories.push(directory);
+  const images = [
+    { type: "image", mimeType: "image/jpeg", data: "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAb/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAABgf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCLAGVxf//Z" },
+    { type: "image", mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aGioAAAAASUVORK5CYII=" },
+  ];
+  const runDir = join(directory, "run");
+  const configPath = join(directory, "config.json");
+  await writeFile(configPath, JSON.stringify({ authPath: join(directory, "missing-auth.json"), pythonPath: join(directory, "missing-python.exe"), distro: "no-live-sandbox" }));
+  // Isolate the execution fixture in a subprocess; exercise the real CLI and file writes, never desktop/model services.
+  const runner = join(directory, "images.ts");
+  const cliPath = resolve(import.meta.dir, "../src/cli.ts");
+  await writeFile(runner, `
+    import { ExecutionService } from ${JSON.stringify(pathToFileURL(resolve(import.meta.dir, "../src/execution.ts")).href)};
+    ExecutionService.prototype.execute = async () => (${JSON.stringify({ content: images, isError: false })});
+    process.argv = ${JSON.stringify([process.execPath, cliPath, "exec", "--config", configPath, "--run", runDir, "--code", "fixture"])};
+    // Load the CLI only after installing the offline execution fixture and arguments.
+    await import(${JSON.stringify(pathToFileURL(cliPath).href)});
+  `);
+  const child = Bun.spawn([process.execPath, runner], { stdout: "pipe", stderr: "pipe", env: { ...process.env, OPENAI_API_KEY: "" } });
+  const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+  expect(exitCode).toBe(0);
+  expect(stderr).toBe("");
+  expect((await readdir(runDir)).filter(name => name.startsWith("execution-")).sort()).toEqual(["execution-0.jpg", "execution-1.png"]);
+  for (const [index, extension] of ["jpg", "png"].entries()) {
+    const path = join(runDir, `execution-${index}.${extension}`);
+    expect(await readFile(path)).toEqual(Buffer.from(images[index]!.data, "base64"));
+    expect(stdout).toContain(path);
+  }
 });
