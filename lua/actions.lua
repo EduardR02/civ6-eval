@@ -143,7 +143,7 @@ function A.action(args)
     coordinates(args,parameters,UnitOperationTypes,pid,true)
     assert(CityManager.CanStartCommand(city,CityCommandTypes.RANGE_ATTACK,parameters),'Engine rejected city ranged attack')
     accepted=CityManager.RequestCommand(city,CityCommandTypes.RANGE_ATTACK,parameters)
-  else error('Unsupported action type. Use civ.probe for fixed action schema; native GUI handles diplomacy, governors, religion founding, great people, espionage and other specialized interactions.') end
+  else error('Unsupported action type: '..args.type..'. Valid types: move, attack, found, unit_operation, unit_command, production, purchase, research, civic, government, policies, unlock_policies, city_attack, end_turn. Use civ.probe for fixed action schema; native GUI handles diplomacy, governors, religion founding, great people, espionage and other specialized interactions.') end
   if accepted==false then return {accepted=false,completed=false,status='rejected',turnState=A.turnState()} end
   return {accepted=true,completed=false,status='submitted',turnState=A.turnState(),note='Native request queued; accepted means submission, not engine completion. Observe the refreshed snapshot before deciding the outcome.'}
 end

@@ -304,10 +304,7 @@ export class PlayerHost {
     }
     const workspaceFiles = result.artifacts ?? [];
     result.artifacts = [];
-    if (workspaceFiles.length) result.content.push({
-      type: "text",
-      text: `Full execution files in your own workspace (not shared artifacts): ${workspaceFiles.join(", ")}. Share needed contents with artifact.write.`,
-    });
+    if (workspaceFiles.length) result.content.push({ type: "text", text: `files: ${workspaceFiles.join(", ")}` });
     const recorded = [];
     for (let i = 0; i < result.content.length; i++) {
       const block = result.content[i];
