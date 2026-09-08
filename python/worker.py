@@ -1,7 +1,7 @@
 """Persistent Astra Python runtime. The OS sandbox, not Python restrictions, is the boundary.
 
 Namespace and files in /workspace survive executions; reset loses only the namespace.
-Top-level await works. A final expression is displayed, and display(image) emits a PNG.
+Top-level await works. A final expression is displayed, and display(image) emits a compressed JPEG (full=True for lossless PNG).
 All live interaction is synchronous, permission-checked host RPC (no sandbox network):
 
     import pyautogui as pg
@@ -179,24 +179,32 @@ class Agents:
         return rpc("agent.list")
 
 
-def display(value):
-    """Emit a PIL image as PNG or another value as text. Saved images are artifacts.
+def display(value, full=False):
+    """Emit a PIL image to your vision context or another value as text.
 
-    Image output is limited to 24 MiB total and 64 displays per execution. Save
-    large arrays/images in /workspace instead. Full stdout/stderr logs are saved.
+    Images are encoded as JPEG quality 85 at their native size by default
+    (full=True emits lossless PNG instead). Bytes are frozen at first
+    inclusion, so what reaches the model history is deterministic. Output is
+    limited to 24 MiB total and 64 displays per execution. Save large
+    arrays/images in /workspace instead. Full stdout/stderr logs are saved.
     """
     global _content_bytes
     if len(_content) >= MAX_DISPLAYS:
         raise ValueError("Execution exceeded 64 display outputs; save additional data to a file")
     if isinstance(value, Image.Image):
-        image_path = _execution_dir / f"display-{len(_content) + 1}.png"
-        value.save(image_path, format="PNG")
+        lossless = bool(full)
+        suffix = "png" if lossless else "jpg"
+        image_path = _execution_dir / f"display-{len(_content) + 1}.{suffix}"
+        if lossless:
+            value.save(image_path, format="PNG")
+        else:
+            value.convert("RGB").save(image_path, format="JPEG", quality=85)
         _artifacts.append(str(image_path.relative_to('/workspace')))
         size = image_path.stat().st_size
         if _content_bytes + ((size + 2) // 3) * 4 > MAX_CONTENT_BYTES:
-            raise ValueError(f"Image exceeds remaining display budget; full PNG saved as {image_path}")
+            raise ValueError(f"Image exceeds remaining display budget; full image saved as {image_path}")
         data = base64.b64encode(image_path.read_bytes()).decode("ascii")
-        _content.append({"type": "image", "data": data, "mimeType": "image/png"})
+        _content.append({"type": "image", "data": data, "mimeType": "image/png" if lossless else "image/jpeg"})
         _content_bytes += len(data)
         return
     if isinstance(value, str):

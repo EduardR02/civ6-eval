@@ -294,7 +294,7 @@ export class PlayerHost {
       const block = result.content[i];
       if (block.type === "text") recorded.push(block);
       else {
-        const name = `executions/${agentId}/${executionId}-${i}.png`;
+        const name = `executions/${agentId}/${executionId}-${i}.${block.mimeType === "image/jpeg" ? "jpg" : "png"}`;
         await this.artifact("artifact.write", { name, content: block.data, encoding: "base64" });
         recorded.push({ type: "image", artifact: name, mimeType: block.mimeType });
         (result.artifacts ??= []).push(name);
