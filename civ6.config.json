@@ -5,5 +5,6 @@
   "maxConcurrentAgents": 4,
   "maxModelCalls": 200,
   "compactThreshold": 180000,
+  "compactThresholds": { "opencode-go": 500000 },
   "distro": "Ubuntu-24.04"
 }

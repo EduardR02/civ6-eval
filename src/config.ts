@@ -17,6 +17,7 @@ export interface Config {
   maxConcurrentAgents: number;
   maxModelCalls: number;
   compactThreshold: number;
+  compactThresholds?: Record<string, number>;
   runsDir: string;
 }
 export async function loadConfig(projectRoot: string, filename?: string): Promise<Config> {
@@ -32,7 +33,7 @@ export async function loadConfig(projectRoot: string, filename?: string): Promis
   try { raw = JSON.parse(await readFile(path, "utf8")); }
   catch (error) { if (filename || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Configuration must be a JSON object");
-  for (const key of Object.keys(raw)) if (!Object.hasOwn(config, key) && key !== "baseUrl" && key !== "apiRates") throw new Error(`Unknown configuration key: ${key}`);
+  for (const key of Object.keys(raw)) if (!Object.hasOwn(config, key) && key !== "baseUrl" && key !== "apiRates" && key !== "compactThresholds") throw new Error(`Unknown configuration key: ${key}`);
   Object.assign(config, raw);
   if (raw.provider === "opencode-go" && raw.model === undefined) config.model = "glm-5.3-flash";
   if (!["openai", "codex", "opencode-go"].includes(config.provider)) throw new Error("provider must be openai, codex or opencode-go");
@@ -42,6 +43,14 @@ export async function loadConfig(projectRoot: string, filename?: string): Promis
   }
   for (const key of ["tunerPort", "maxConcurrentAgents", "maxModelCalls", "compactThreshold"] as const) {
     if (!Number.isSafeInteger(config[key]) || config[key] <= 0) throw new Error(`${key} must be a positive integer`);
+  }
+  if (config.compactThresholds !== undefined) {
+    const thresholds = config.compactThresholds;
+    if (typeof thresholds !== "object" || thresholds === null || Array.isArray(thresholds)) throw new Error("compactThresholds must be an object keyed by provider");
+    for (const [provider, threshold] of Object.entries(thresholds)) {
+      if (!["openai", "codex", "opencode-go"].includes(provider)) throw new Error(`compactThresholds key must be openai, codex or opencode-go, not: ${provider}`);
+      if (!Number.isSafeInteger(threshold) || threshold <= 0) throw new Error(`compactThresholds.${provider} must be a positive integer`);
+    }
   }
   if (config.tunerPort > 65535) throw new Error("tunerPort exceeds 65535");
   for (const key of ["authPath", "pythonPath", "runsDir"] as const) config[key] = resolve(projectRoot, config[key].replace(/^~(?=[/\\])/, homedir()));

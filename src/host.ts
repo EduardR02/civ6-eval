@@ -44,7 +44,7 @@ export class PlayerHost {
       projectRoot, runDir, model: config.model, provider: config.provider, effort: config.effort,
       authPath: config.authPath, apiKey: config.provider === "openai" ? process.env.OPENAI_API_KEY : undefined, baseUrl: config.baseUrl,
       maxConcurrentAgents: config.maxConcurrentAgents, maxModelCalls: config.maxModelCalls,
-      compactThreshold: config.compactThreshold, rpc: this.rpc.bind(this),
+      compactThreshold: config.compactThresholds?.[config.provider] ?? config.compactThreshold, rpc: this.rpc.bind(this),
       execute: (id, code, options) => this.execute(code, id, options),
       onEvent: event => { this.usage.onEvent(event); this.log({ kind: "player", ...event }); onEvent?.(event); },
     });
@@ -132,6 +132,25 @@ export class PlayerHost {
       const snapshot = JSON.parse(await readFile(join(this.runDir, "snapshots", `${id}.json`), "utf8"));
       this.usage.observe(snapshot, agentId);
       return snapshot;
+    }
+    if (method === "harness.complain") {
+      const note = textArg(args, "note");
+      const at = new Date().toISOString();
+      await this.history("history.read", { limit: 1 });
+      let latestSnapshot: string | undefined;
+      try { latestSnapshot = JSON.parse(await readFile(join(this.runDir, "observations.json"), "utf8")).latest; } catch { /* no observation yet */ }
+      let trace: string[] = [];
+      try {
+        const source = await readFile(join(this.runDir, "history.jsonl"), "utf8");
+        trace = source.trimEnd().split("\n").slice(-20);
+      } catch { /* history unavailable */ }
+      const complaint = { at, agentId, controller: this.controller, latestSnapshot: latestSnapshot ?? null, note, trace };
+      const complaintsDir = join(this.runDir, "complaints");
+      await mkdir(complaintsDir, { recursive: true });
+      const file = join(complaintsDir, `${at.replaceAll(":", "-")}-${agentId}.json`);
+      await writeFile(file, JSON.stringify(complaint, null, 1));
+      this.log({ kind: "complaint", agentId, note, latestSnapshot });
+      return { logged: true, file, agentId, note: "Complaint queued with auto-attached trace (last 20 history rows, current turn reference). Triage happens between agent windows." };
     }
     if (!method.startsWith("civ.") && !method.startsWith("desktop.")) throw new Error(`Unknown RPC method: ${method}`);
     return this.live(agentId, async () => {

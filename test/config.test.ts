@@ -35,6 +35,23 @@ test("unknown options and non-object configuration fail rather than silently cha
   await expect(loadConfig(directory)).rejects.toThrow("JSON object");
 });
 
+test("per-provider compaction thresholds must be positive integers keyed by known providers", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "civ-config-"));
+  directories.push(directory);
+  const file = join(directory, "civ6.config.json");
+  await writeFile(file, JSON.stringify({ provider: "opencode-go", compactThresholds: { "opencode-go": 500000 } }));
+  const config = await loadConfig(directory);
+  expect(config.compactThresholds).toEqual({ "opencode-go": 500000 });
+  for (const thresholds of [{ "opencode-go": 0 }, { "opencode-go": -5 }, { "opencode-go": 1.5 }, { "opencode-go": "500000" }]) {
+    await writeFile(file, JSON.stringify({ compactThresholds: thresholds }));
+    await expect(loadConfig(directory)).rejects.toThrow("must be a positive integer");
+  }
+  await writeFile(file, JSON.stringify({ compactThresholds: { "opencode-g0": 500000 } }));
+  await expect(loadConfig(directory)).rejects.toThrow("compactThresholds key");
+  await writeFile(file, JSON.stringify({ compactThresholds: [500000] }));
+  await expect(loadConfig(directory)).rejects.toThrow("compactThresholds must be an object");
+});
+
 async function cli(args: string[]) {
   const child = Bun.spawn([process.execPath, resolve(import.meta.dir, "../src/cli.ts"), ...args], {
     stdout: "pipe", stderr: "pipe", env: { ...process.env, OPENAI_API_KEY: "" },
