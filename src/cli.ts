@@ -7,6 +7,7 @@ import { PlayerHost } from "./host.ts";
 import { readOmpApiKey, readOmpCredential } from "./player/auth.ts";
 import type { PlayerEvent } from "./contracts.ts";
 import { readUsageReport, formatUsageReport } from "./usage.ts";
+import { runDashboard } from "./dashboard.ts";
 
 const HELP = `Civ VI player — native visuals, isolated Python, Astra and subagents
 
@@ -19,7 +20,7 @@ const HELP = `Civ VI player — native visuals, isolated Python, Astra and subag
   bun start play --prompt '...'    Run one autonomous task, then exit
   bun start play --resume RUN      Resume a saved run (never replays game actions)
   bun start usage --run RUN        Read saved token/cost accounting offline
-  bun start usage --run RUN --json Print the same report as JSON
+  bun start dashboard --run DIR    Regenerate DIR/viewer.html from run ledgers while they grow
 
 Options:
   --config PATH   JSON configuration (default civ6.config.json if present)
@@ -33,7 +34,7 @@ Options:
   --code TEXT     Python source for exec (mutually exclusive with --file)
   --file PATH     Python file for exec
   --json          Machine-readable output for usage only
-  --help          Show this help without starting the player
+  --interval N    Dashboard poll interval in seconds (default 10)
 
 Authentication: ChatGPT/Codex subscription from ~/.omp/agent/agent.db by default.
 Set authPath to ~/.codex/auth.json to use the desktop/CLI login instead.
@@ -67,6 +68,7 @@ const COMMAND_OPTIONS: Record<string, readonly string[]> = {
   exec: ["config", "run", "code", "file"],
   play: ["config", "run", "resume", "provider", "model", "effort", "calls", "prompt"],
   usage: ["run", "json"],
+  dashboard: ["run", "interval"],
 };
 const FLAGS: Record<string, true> = { help: true, "enable-tuner": true, json: true };
 
@@ -89,7 +91,7 @@ function parseArguments(argv: string[]): { command: string; options: Record<stri
   if (options.run && options.resume) throw new Error("--run and --resume are mutually exclusive");
   if (options.code && options.file) throw new Error("--code and --file are mutually exclusive");
   if (!options.help && command === "usage" && !options.run) throw new Error("usage requires --run DIR");
-  if (!options.help && command === "exec" && !options.code && !options.file) throw new Error("exec needs --code or --file");
+  if (!options.help && command === "dashboard" && !options.run) throw new Error("dashboard requires --run DIR");
   return { command, options };
 }
 const projectRoot = resolve(import.meta.dir, "..");
@@ -107,6 +109,12 @@ async function main(): Promise<void> {
   if (command === "usage") {
     const report = await readUsageReport(resolve(option("run")!));
     console.log(options.json ? JSON.stringify(report, null, 2) : formatUsageReport(report));
+    return;
+  }
+  if (command === "dashboard") {
+    const interval = Number(option("interval") ?? 10);
+    if (!Number.isSafeInteger(interval) || interval < 1) throw new Error("--interval must be a positive integer (seconds)");
+    await runDashboard(resolve(option("run")!), interval);
     return;
   }
   const config = await loadConfig(projectRoot, option("config"));
