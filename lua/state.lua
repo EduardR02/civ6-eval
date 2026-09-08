@@ -24,8 +24,14 @@ function A.localPlayer()
 end
 function A.turnState()
   local pid, player = A.localPlayer()
-  local blockers=A.static('notifications',NotificationManager,'GetAllEndTurnBlocking',pid)
-  if blockers~=A.null then blockers=A.array(blockers) end
+  local ids=A.static('notifications',NotificationManager,'GetAllEndTurnBlocking',pid)
+  local blockers=A.array()
+  if ids~=A.null then
+    for _,bid in ipairs(ids) do
+      local n=A.call('notifications',NotificationManager,'Find',pid,bid)
+      blockers[#blockers+1]={id=bid, type=(n and A.call('notifications',n,'GetTypeName') or A.null), summary=(n and A.call('notifications',n,'GetSummary') or A.null)}
+    end
+  end
   return {
     turn=Game.GetCurrentGameTurn(), active=A.call('turn',player,'IsTurnActive'),
     processing=A.static('turn',UI,'IsProcessingMessages'),
@@ -34,6 +40,45 @@ function A.turnState()
     firstBlocker=A.static('notifications',NotificationManager,'GetFirstEndTurnBlocking',pid),
     blockers=blockers
   }
+end
+
+function A.dismiss_notifications(args)
+  local pid = A.localPlayer()
+  local dismissed = A.array()
+  for _, nid in pairs(A.notificationIds[pid] or {}) do
+    local n = A.call('dismiss', NotificationManager, 'Find', pid, nid)
+    if n and n ~= A.null and A.call('dismiss', n, 'CanUserDismiss') == true then
+      NotificationManager.Dismiss(pid, nid)
+      dismissed[#dismissed+1] = id('notification', pid, nid)
+    end
+  end
+  return { dismissed = dismissed, count = #dismissed }
+end
+
+function A.keybinds(args)
+  return A.section('keybinds', function()
+    local out, limit, offset = A.array(), math.min(tonumber(args and args.limit) or 400, 1000), math.max(tonumber(args and args.offset) or 0, 0)
+    local category = args and args.category
+    local count = Input.GetActionCount()
+    local matched = 0
+    for i = 0, (count or 0) - 1 do
+      local actionId = Input.GetActionId(i)
+      if actionId and Input.ShouldShowActionKeybinding(actionId) then
+        local key = Input.GetGestureDisplayString(actionId, 0)
+        local alt = Input.GetGestureDisplayString(actionId, 1)
+        if (key and key ~= '') or (alt and alt ~= '') then
+          local cat = Input.GetActionCategory(actionId)
+          if not category or (cat and string.find(string.lower(cat), string.lower(category), 1, true)) then
+            matched = matched + 1
+            if matched > offset and #out < limit then
+              out[#out+1] = { name = Input.GetActionName(actionId), category = cat, key = key or A.null, alt = alt or A.null }
+            end
+          end
+        end
+      end
+    end
+    return { actions = out, total = matched, more = matched > offset + #out }
+  end)
 end
 local function yields(group, object)
   local out = {}

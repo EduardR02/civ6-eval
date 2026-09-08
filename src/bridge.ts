@@ -193,14 +193,14 @@ export class CivBridge {
     }
   }
 
-  private async invoke(method: "snapshot" | "rules" | "action" | "turnState", args: Arguments): Promise<Envelope> {
+  private async invoke(method: string, args: Arguments): Promise<Envelope> {
     const index = await this.context(method === "rules");
     const marker = "ASTRA_" + randomUUID().replaceAll("-", "");
     return this.collect(index, `AstraCiv.emit(${luaLiteral(marker)},function() return AstraCiv.${method}(${luaLiteral(args)}) end)`, marker);
   }
 
   request(method: string, args: Arguments = {}): Promise<unknown> {
-    if (!["civ.probe", "civ.snapshot", "civ.inspect", "civ.rules", "civ.action"].includes(method)) return Promise.reject(new Error(`Unsupported bridge method ${method}; no arbitrary Lua or SQL RPC exists.`));
+    if (!["civ.probe", "civ.snapshot", "civ.inspect", "civ.rules", "civ.action", "civ.dismiss_notifications", "civ.keybinds"].includes(method)) return Promise.reject(new Error(`Unsupported bridge method ${method}; no arbitrary Lua or SQL RPC exists.`));
     // Validate and bound data before connecting or submitting anything.
     const encoded = luaLiteral(args);
     if (encoded.length > 256 * 1024) return Promise.reject(new Error("Bridge arguments exceed 256 KiB encoded bound."));
@@ -218,6 +218,8 @@ export class CivBridge {
           "civ.snapshot": "{mapOffset?:integer,mapLimit?:1..100000}; full own state, currently visible tiles, cached last-known observations",
           "civ.inspect": "{id:string} or {x:integer,y:integer}; fresh fog-filtered snapshot lookup, never raw engine lookup",
           "civ.rules": "{table?:allowlisted GameInfo table,where?:exact scalar equality object,offset?:integer,limit?:1..500}; omit table to list",
+          "civ.dismiss_notifications": "{None}; dismisses every dismissable notification in the on-screen rail (their content already arrives in snapshots; cosmetic only)",
+          "civ.keybinds": "{category?:string,offset?:integer,limit?:integer}; the game's live keyboard bindings from the Input manager (name, category, key, alt)",
           "civ.action": { actions: ACTION_HELP, expectedTurn: "optional integer guard", outcome: "accepted is queued native request, completed remains false until observed; refresh returned separately", unsupported: "Use desktop GUI for specialized interactions; no cost bypass or strategic automation." },
         }, semantics: { gameId: "Loaded Lua-world instance UUID, stable over TCP reconnects; a reload gets a new instance", fog: "Only local player and visible entities are queried. Nonvisible tiles retain earlier observations, not live data. Enemy disappearance is not death.", unavailable: "null values plus grouped unavailable diagnostics; not fabricated zeroes" } };
       }
@@ -234,6 +236,14 @@ export class CivBridge {
         try { observation = await this.snapshot({}); }
         catch (error) { observation = { unavailable: error instanceof Error ? error.message : String(error), recovery: "Call civ.snapshot; do not replay the action." }; }
         return { ...(response.result as object), unavailable: response.unavailable, observation };
+      }
+      if (method === "civ.dismiss_notifications") {
+        const response = await this.invoke("dismiss_notifications", args);
+        return { ...(response.result as object), unavailable: response.unavailable };
+      }
+      if (method === "civ.keybinds") {
+        const response = await this.invoke("keybinds", args);
+        return { ...(response.result as object), unavailable: response.unavailable };
       }
       const snapshot = await this.snapshot(method === "civ.snapshot" ? args : {});
       if (method === "civ.snapshot") return snapshot;

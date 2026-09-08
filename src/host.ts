@@ -163,7 +163,7 @@ export class PlayerHost {
         this.log({ kind: "error", agentId, method, error: String(error) });
         throw error;
       }
-    }, method !== "civ.rules" && method !== "civ.probe");
+    }, method !== "civ.rules" && method !== "civ.probe" && method !== "civ.keybinds");
   }
   private async artifactPath(name: string, createParent = false): Promise<string> {
     if (!/^[A-Za-z0-9_./-]+$/.test(name) || name.split("/").some(part => !part || part === "." || part === "..")) throw new Error("Invalid artifact name");
