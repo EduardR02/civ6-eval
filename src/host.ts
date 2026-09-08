@@ -170,9 +170,6 @@ export class PlayerHost {
           await this.artifact("artifact.write", { name, content: screenshot.data, encoding: "base64" });
           this.log({ kind: "result", agentId, method, result: { ...screenshot, data: undefined, artifact: name } });
         } else this.log({ kind: "result", agentId, method, result });
-        if (method === "civ.action" && result && typeof result === "object" && "observation" in result) {
-          this.usage.observe(result.observation);
-        }
         return result;
       } catch (error) {
         this.log({ kind: "error", agentId, method, error: String(error) });

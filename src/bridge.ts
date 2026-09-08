@@ -220,7 +220,7 @@ export class CivBridge {
           "civ.rules": "{table?:allowlisted GameInfo table,where?:exact scalar equality object,offset?:integer,limit?:1..500}; omit table to list",
           "civ.dismiss_notifications": "{None}; dismisses every dismissable notification in the on-screen rail (their content already arrives in snapshots; cosmetic only)",
           "civ.keybinds": "{category?:string,offset?:integer,limit?:integer}; the game's live keyboard bindings from the Input manager (name, category, key, alt)",
-          "civ.action": { actions: ACTION_HELP, expectedTurn: "optional integer guard", outcome: "accepted is queued native request, completed remains false until observed; refresh returned separately", unsupported: "Use desktop GUI for specialized interactions; no cost bypass or strategic automation." },
+          "civ.action": { actions: ACTION_HELP, expectedTurn: "optional integer guard", outcome: "accepted is queued native request, completed remains false until observed; call civ.snapshot to verify (snapshots are large at Standard size; page with mapLimit and print compact views)", unsupported: "Use desktop GUI for specialized interactions; no cost bypass or strategic automation." },
         }, semantics: { gameId: "Loaded Lua-world instance UUID, stable over TCP reconnects; a reload gets a new instance", fog: "Only local player and visible entities are queried. Nonvisible tiles retain earlier observations, not live data. Enemy disappearance is not death.", unavailable: "null values plus grouped unavailable diagnostics; not fabricated zeroes" } };
       }
       if (method === "civ.rules") {
@@ -229,13 +229,8 @@ export class CivBridge {
         return { ...(response.result as object), unavailable: response.unavailable };
       }
       if (method === "civ.action") {
-        let response: Envelope;
-        try { response = await this.invoke("action", args); }
-        catch (error) { throw new Error(`Action failed or its acknowledgement was lost; outcome may be unknown. It was NOT replayed. Read a new snapshot before deciding whether to retry. ${error instanceof Error ? error.message : String(error)}`); }
-        let observation: unknown;
-        try { observation = await this.snapshot({}); }
-        catch (error) { observation = { unavailable: error instanceof Error ? error.message : String(error), recovery: "Call civ.snapshot; do not replay the action." }; }
-        return { ...(response.result as object), unavailable: response.unavailable, observation };
+        const response = await this.invoke("action", args).catch((error: unknown) => { throw new Error(`Action failed or its acknowledgement was lost; outcome may be unknown. It was NOT replayed. Read a new snapshot before deciding whether to retry. ${error instanceof Error ? error.message : String(error)}`); });
+        return { ...(response.result as object), unavailable: response.unavailable };
       }
       if (method === "civ.dismiss_notifications") {
         const response = await this.invoke("dismiss_notifications", args);
