@@ -46,7 +46,7 @@ export async function createRuntime(options: PlayerOptions): Promise<{ runtime: 
   const authPath = join(directory, "auth.json");
   const provider = options.provider === "openai" ? "openai" : options.provider === "opencode-go" ? "opencode-go" : "openai-codex";
   const effort = options.effort ?? (provider === "opencode-go" ? "high" : "xhigh");
-  if (provider === "opencode-go" && !["low", "high", "max"].includes(effort)) throw new Error("opencode-go reasoning effort must be low, high or max; unsupported levels are never remapped.");
+  if (provider === "opencode-go" && !["low", "high", "max", "xhigh"].includes(effort)) throw new Error("opencode-go reasoning effort must be low, high, max or xhigh; unsupported levels are never remapped.");
   if (provider !== "opencode-go" && effort === "max") throw new Error("max reasoning effort is only supported by opencode-go; use xhigh for Codex/OpenAI.");
   const sourcePath = options.authPath ? resolve(options.authPath.replace(/^~(?=[/\\])/, homedir())) : join(homedir(), ".omp", "agent", "agent.db");
   const ompSource = provider === "openai-codex" && sourcePath.endsWith(".db");
@@ -89,7 +89,7 @@ export async function createRuntime(options: PlayerOptions): Promise<{ runtime: 
     modify: async () => { throw new Error("Refresh the subscription login in its source application; this player cannot rotate shared credentials."); },
     delete: async () => { throw new Error("Subscription credential storage is read-only."); },
   } : undefined;
-  const runtime = await ModelRuntime.create({ credentials: sourceStore, authPath, modelsPath: null, modelsStorePath: join(directory, "models-cache.json"), refreshOnCreate: false, allowModelNetwork: false });
+  const runtime = await ModelRuntime.create({ credentials: sourceStore, authPath, modelsPath: join(import.meta.dir, "models.json"), modelsStorePath: join(directory, "models-cache.json"), refreshOnCreate: false, allowModelNetwork: false });
   if (provider === "openai") {
     const key = options.apiKey ?? process.env.OPENAI_API_KEY;
     if (!key) throw new Error("OpenAI API authentication is missing. Set OPENAI_API_KEY or supply apiKey; alternatively choose provider codex and run 'codex login'.");
@@ -101,12 +101,16 @@ export async function createRuntime(options: PlayerOptions): Promise<{ runtime: 
   }
   const id = options.model ?? (provider === "opencode-go" ? "glm-5.3-flash" : "gpt-6-astra");
   const registered = runtime.getModel(provider, id);
-  if (provider === "opencode-go" && (!registered || registered.api !== "openai-completions")) throw new Error("Select a registered opencode-go completions model, such as glm-5.3-flash.");
+  if (provider === "opencode-go" && (!registered || (registered.api !== "openai-completions" && registered.api !== "openai-responses"))) throw new Error("Select a registered opencode-go completions or responses model, such as glm-5.3-flash or muse-spark-1.3-contributor.");
+  if (provider === "opencode-go" && registered && registered.thinkingLevelMap?.[effort] === null) {
+    const supported = (["low", "high", "max"] as const).filter(level => registered.thinkingLevelMap?.[level] !== null);
+    throw new Error(`${id} does not support reasoning effort ${effort}; supported opencode-go efforts: ${supported.join(", ")}.`);
+  }
   // Explicit profile avoids registry staleness; catalog profiles are authoritative for opencode-go.
   const model: Model<Api> = {
     ...registered,
     id, name: id, provider,
-    api: provider === "opencode-go" ? "openai-completions" : provider === "openai" ? "openai-responses" : "openai-codex-responses",
+    api: provider === "opencode-go" && registered ? registered.api : provider === "openai" ? "openai-responses" : "openai-codex-responses",
     baseUrl: options.baseUrl ?? (provider === "opencode-go" ? "https://opencode.ai/zen/go/v1" : provider === "openai" ? "https://api.openai.com/v1" : "https://chatgpt.com/backend-api"),
     reasoning: registered?.reasoning ?? true, input: registered?.input ?? ["text", "image"],
     contextWindow: registered?.contextWindow ?? 1_000_000,

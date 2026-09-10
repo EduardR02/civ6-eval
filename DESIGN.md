@@ -100,7 +100,7 @@ Subagents have separate contexts and Python namespaces. They can use the same po
 
 Astra defaults to the user's ChatGPT/Codex subscription via OMP's read-only credential source. Preserve complete native Responses items, including opaque reasoning and tool identities. Codex can emit full items in `response.output_item.done` while terminal `output` is empty; do not lose them. Native streaming compaction must preserve its opaque replacement state rather than flattening it into ordinary text.
 
-GLM 5.3 Flash through opencode-go is a cheaper/faster iteration target and an alternate player. Keep the same game/runtime contract, but use its supported provider transport, vision conversion, reasoning levels, and compaction. Provider-compatible summarization is not the same mechanism as Astra's native opaque compaction. A saved run must not silently switch model/provider/account and replay incompatible state.
+GLM 5.3 Flash and Muse Spark through opencode-go are cheaper/faster iteration targets and alternate players. Keep the same game/runtime contract, but use each model's supported provider transport, vision conversion, reasoning levels, and compaction. Muse's Responses support does not imply support for `/responses/compact`: context reduction uses a model-generated continuation summary through the ordinary Responses endpoint, with no tools exposed. Complete original native items remain in the private journal; new operator instructions enter after successful summarization. Failed or incomplete summaries must not replace context or authorize actions. This is not Astra's native opaque compaction. A saved run must not silently switch model/provider/account and replay incompatible state.
 
 Read credentials privately at the trusted boundary. Never mount them into player workspaces, include them in artifacts, or expose token-bearing refresh errors. Do not rotate shared subscription refresh tokens behind another harness. Do not switch accounts automatically after rate limits or retry quota failures indefinitely.
 
@@ -114,6 +114,8 @@ Actions use normal legal game requests or native UI input. Do not bypass costs o
 
 Files, observations, artifacts, and provider history are durable. In-memory Python bindings are not restored by restarting a process. An interrupted request or action has unknown outcome until reobserved. Failed or cancelled transports must stop admitting new work and release held inputs.
 
+The operator may set a finite saved-run model-call ceiling or explicitly choose `--calls unlimited` (`maxModelCalls: "unlimited"` in configuration). Unlimited disables only the harness's call-admission ceiling, including children and compaction; it does not bypass provider quota, authentication expiry, transport limits, or the need to stop after an uncertain failure. A full-game task need not have a harness turn limit.
+
 ## Usage accounting
 
 Track all agents and compaction calls, not only the main model. Persist request identities so resume and repeated reporting cannot double count. Record input, cache reads/writes, output, and reported reasoning tokens without counting reasoning twice; image tokens may be included in input without a separate reported breakdown.
@@ -121,6 +123,14 @@ Track all agents and compaction calls, not only the main model. Persist request 
 Per-turn attribution is currently based on the last confirmed game/player/turn when a request starts. Preserve that attribution if the game advances before the response arrives. Record an analyst's older snapshot separately. Before a confirmed observation, use an unknown/pre-game bucket; do not pretend screenshot-only activity has exact turn attribution.
 
 Show API-equivalent estimates separately from actual subscription charges. Unknown rates and unreported request usage remain unknown. Preserve rates/provenance used for estimates; changing a rate later must not rewrite historical accounting silently.
+
+## Live operator monitoring
+
+`bun start dashboard --run DIR --interval 1` starts a separate read-only process and prints a loopback URL. Open that URL rather than an old generated `viewer.html`. The viewer reads durable run observations, transcripts, and usage; it does not own game control, make model calls, or promise token-by-token visibility into an unfinished response.
+
+The browser receives an initial state followed by incremental server-sent updates, not repeated downloads of the full transcript or page reloads. Source reads consume appended bytes; idle cycles do not rebuild cards. Changed cycles still reconcile accumulated chronological metadata, while unchanged card HTML is cached. Reconnection or rewritten history rebuilds the view explicitly; ordinary updates preserve reading position and expanded details, with a separate follow control.
+
+The server binds only to `127.0.0.1` and serves the viewer, its event stream, and recorded display images through a constrained route. It is not a static server for the run directory: provider state, credentials, saves, and arbitrary workspace paths must not be published. Treat visible run text and captures as private local material, not a public-safe export. Monitoring does not guarantee that the player is progressing; quota errors and other stops remain part of the experiment.
 
 ## Transport size is separate from model context
 

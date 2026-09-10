@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import type { PlayerEvent } from "../src/contracts.ts";
+import type { PlayerEvent, PlayerOptions } from "../src/contracts.ts";
 import { UsageLedger, readUsageReport, formatUsageReport } from "../src/usage.ts";
 import { NativeResponses, emptyUsage } from "../src/player/native.ts";
 import { saveJson } from "../src/player/storage.ts";
@@ -241,3 +241,115 @@ test("GLM Go catalog prices are persisted API equivalents, with unknown subscrip
   expect(report.summary.estimatedUsd).toBeNull();
   expect(report.summary.knownEstimatedUsd).toBeCloseTo(0.0002003, 10);
 });
+
+test("Muse Spark contributor prices persist the effectively-free catalog rates", async () => {
+  const dir = directory();
+  const ledger = new UsageLedger(dir, "muse-spark-1.3-contributor", "opencode-go");
+  ledger.onEvent(event("model_call", "muse"));
+  ledger.onEvent(event("usage", "muse", { usage }));
+  ledger.onEvent(event("model_end", "muse", { outcome: "completed" }));
+  const report = await readUsageReport(dir);
+  expect(report.requests[0]!.estimatedUsd).toBeCloseTo(0.00002004, 10);
+  expect(report.requests[0]!.pricing.source).toContain("muse-spark-1.3-contributor");
+  expect(report.requests[0]!.pricing.rates).toEqual({ input: 0.1, cachedInput: 0.002, cacheWrite: 0, output: 0.2 });
+});
+
+test("native image budget purges to the watermark in one batch and stays append-only between purges", async () => {
+  const dir = directory();
+  const bodies: { input: Record<string, unknown>[] }[] = [];
+  const { model, runtime, options } = imageBudgetFixture(dir, bodies);
+  const agentDir = join(dir, "player", "agents", "main");
+  // 47 tool screenshots plus 3 inline user screenshots: 50 images, 5 over the 45 trigger.
+  const items: Record<string, unknown>[] = [];
+  const completedCalls: string[] = [];
+  for (let index = 0; index < 47; index++) {
+    items.push({ type: "function_call", id: `fc_${index}`, call_id: `call_${index}`, name: "civ.snapshot", arguments: "{}", status: "completed" });
+    items.push({ type: "function_call_output", call_id: `call_${index}`, output: [{ type: "input_image", image_url: `data:image/png;base64,tool-${index}`, detail: "original" }] });
+    if (index === 0 || index === 23 || index === 46) items.push({ role: "user", content: [{ type: "input_text", text: `turn ${index}` }, { type: "input_image", image_url: `data:image/png;base64,user-${index}`, detail: "original" }] });
+    completedCalls.push(`call_${index}`);
+  }
+  saveJson(join(agentDir, "native.json"), { version: 1, items, seenInputs: [], completedCalls, inputTokens: 0, compactions: 0, totalUsage: emptyUsage() });
+  const native = new NativeResponses("main", options, runtime, model, () => {}, () => {});
+  expect((await native.stream({ messages: [] }).result()).stopReason).toBe("stop");
+  expect((await native.stream({ messages: [] }).result()).stopReason).toBe("stop");
+  const [first, second] = bodies;
+  expect(first!.input).toHaveLength(items.length);
+  // One batched purge: the oldest 45 images become placeholders, exactly 5 survive.
+  expect(countParts(first!.input, "input_image")).toBe(5);
+  expect(countParts(second!.input, "input_image")).toBe(5);
+  const placeholder = "[screenshot elided — image budget]";
+  expect(countParts(first!.input, "input_text", placeholder)).toBe(45);
+  expect(countParts(second!.input, "input_text", placeholder)).toBe(45);
+  const outputFor = (callId: string) => first!.input.find(item => item.call_id === callId && item.type === "function_call_output") as { output: Record<string, unknown>[] };
+  expect(outputFor("call_0").output).toEqual([{ type: "input_text", text: placeholder }]);
+  expect(outputFor("call_42").output).toEqual([{ type: "input_text", text: placeholder }]);
+  expect(outputFor("call_43").output).toEqual([{ type: "input_image", image_url: "data:image/png;base64,tool-43", detail: "original" }]);
+  expect(outputFor("call_46").output).toEqual([{ type: "input_image", image_url: "data:image/png;base64,tool-46", detail: "original" }]);
+  const turn = (index: number) => first!.input.find(item => Array.isArray(item.content) && (item.content as Record<string, unknown>[])[0]!.text === `turn ${index}`) as { content: Record<string, unknown>[] };
+  expect(turn(0).content[1]).toEqual({ type: "input_text", text: placeholder });
+  expect(turn(23).content[1]).toEqual({ type: "input_text", text: placeholder });
+  expect(turn(46).content[1]).toEqual({ type: "input_image", image_url: "data:image/png;base64,user-46", detail: "original" });
+  // Between purges the outbound prefix is byte-identical: no churn, only appends.
+  expect(JSON.stringify(second!.input)).toBe(JSON.stringify(first!.input));
+  // A new screenshot lands below the trigger: nothing is rewritten or journaled.
+  expect((await native.stream({ messages: [{ role: "user", content: [{ type: "image", data: "bmV3", mimeType: "image/png" }], timestamp: 3 }] }).result()).stopReason).toBe("stop");
+  expect(bodies[2]).toBeDefined();
+  expect(bodies[2]!.input).toHaveLength(items.length + 1);
+  expect(countParts(bodies[2]!.input, "input_image")).toBe(6);
+  expect(countParts(bodies[2]!.input, "input_text", placeholder)).toBe(45);
+  expect(JSON.stringify(bodies[2]!.input.slice(0, second!.input.length))).toBe(JSON.stringify(second!.input));
+  // The purge rewrote the durable ledger exactly once; resume replays the placeholders unchanged.
+  const resumed = new NativeResponses("main", options, runtime, model, () => {}, () => {});
+  expect((await resumed.stream({ messages: [] }).result()).stopReason).toBe("stop");
+  expect(countParts(bodies[3]!.input, "input_image")).toBe(6);
+  expect(countParts(bodies[3]!.input, "input_text", placeholder)).toBe(45);
+  const state = JSON.parse(readFileSync(join(agentDir, "native.json"), "utf8"));
+  expect(countParts(state.items, "input_image")).toBe(6);
+  expect(countParts(state.items, "input_text", placeholder)).toBe(45);
+  const rewrites = readFileSync(join(agentDir, "native.jsonl"), "utf8").trimEnd().split("\n").map(line => JSON.parse(line) as { kind: string }).filter(entry => entry.kind === "image_budget");
+  expect(rewrites).toHaveLength(1);
+  expect(rewrites[0]).toMatchObject({ elided: 45, remaining: 5 });
+});
+
+test("native image budget leaves a ledger at the trigger threshold untouched", async () => {
+  const dir = directory();
+  const bodies: { input: Record<string, unknown>[] }[] = [];
+  const { model, runtime, options } = imageBudgetFixture(dir, bodies);
+  const agentDir = join(dir, "player", "agents", "main");
+  const items: Record<string, unknown>[] = [];
+  const completedCalls: string[] = [];
+  for (let index = 0; index < 45; index++) {
+    items.push({ type: "function_call", id: `fc_${index}`, call_id: `call_${index}`, name: "civ.snapshot", arguments: "{}", status: "completed" });
+    items.push({ type: "function_call_output", call_id: `call_${index}`, output: [{ type: "input_image", image_url: `data:image/png;base64,tool-${index}`, detail: "original" }] });
+    completedCalls.push(`call_${index}`);
+  }
+  saveJson(join(agentDir, "native.json"), { version: 1, items, seenInputs: [], completedCalls, inputTokens: 0, compactions: 0, totalUsage: emptyUsage() });
+  const native = new NativeResponses("main", options, runtime, model, () => {}, () => {});
+  expect((await native.stream({ messages: [] }).result()).stopReason).toBe("stop");
+  expect(countParts(bodies[0]!.input, "input_image")).toBe(45);
+  expect(readFileSync(join(agentDir, "native.jsonl"), "utf8")).not.toContain("image_budget");
+  const state = JSON.parse(readFileSync(join(agentDir, "native.json"), "utf8"));
+  expect(countParts(state.items, "input_image")).toBe(45);
+  expect(countParts(state.items, "input_text", "[screenshot elided — image budget]")).toBe(0);
+});
+
+function imageBudgetFixture(dir: string, bodies: { input: Record<string, unknown>[] }[]) {
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    bodies.push(await request.json());
+    return new Response(`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } })}\n\n`, { headers: { "content-type": "text/event-stream" } });
+  } });
+  cleanups.push(() => server.stop(true));
+  const model: Model<Api> = { id: "muse-spark-1.3-contributor", name: "fixture", provider: "opencode-go", api: "openai-responses", baseUrl: `http://127.0.0.1:${server.port}/v1`, reasoning: true, input: ["text", "image"], contextWindow: 10000, maxTokens: 1000, cost: { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 } };
+  const runtime = { getAuth: async () => ({ auth: { apiKey: "fixture-only" } }) } as unknown as ModelRuntime;
+  const options: PlayerOptions = { projectRoot: process.cwd(), runDir: dir, rpc: async () => ({}), execute: async () => ({ content: [] }) };
+  return { model, runtime, options };
+}
+
+function countParts(input: readonly unknown[], type: string, text?: string): number {
+  let total = 0;
+  for (const item of input) {
+    const parts = [...Array.isArray((item as Record<string, unknown>).content) ? (item as Record<string, unknown>).content as Record<string, unknown>[] : [], ...Array.isArray((item as Record<string, unknown>).output) ? (item as Record<string, unknown>).output as Record<string, unknown>[] : []];
+    for (const part of parts) if (part.type === type && (text === undefined || part.text === text)) total++;
+  }
+  return total;
+}

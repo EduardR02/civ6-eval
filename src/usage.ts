@@ -61,6 +61,8 @@ const ASTRA_SOURCE = "https://developers.openai.com/api/docs/models/gpt-6-astra 
 const ASTRA_RATES: ApiRates = { input: 10, cachedInput: 1, cacheWrite: 12.5, output: 50, longContextThreshold: 272000, longContextInputMultiplier: 2, longContextOutputMultiplier: 1.5 };
 const GLM_SOURCE = "@earendil-works/pi-ai 0.84.4 opencode-go catalog, glm-5.3-flash (verified 2026-09-08)";
 const GLM_RATES: ApiRates = { input: 0.075, cachedInput: 0.015, cacheWrite: 0, output: 0.25 };
+const MUSE_SOURCE = "@earendil-works/pi-ai 0.84.4 opencode-go catalog, muse-spark-1.3-contributor (verified 2026-09-09)";
+const MUSE_RATES: ApiRates = { input: 0.1, cachedInput: 0.002, cacheWrite: 0, output: 0.2 };
 
 export function validateApiRates(value: unknown): asserts value is ApiRates {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("apiRates must be an object");
@@ -76,8 +78,8 @@ export function validateApiRates(value: unknown): asserts value is ApiRates {
   if ((rates.longContextInputMultiplier !== undefined || rates.longContextOutputMultiplier !== undefined) && rates.longContextThreshold === undefined) throw new Error("apiRates long-context multipliers require longContextThreshold");
 }
 function pricing(model: string, provider: string, rates?: ApiRates): Pricing {
-  const defaults = model === "gpt-6-astra" ? ASTRA_RATES : model === "glm-5.3-flash" && provider === "opencode-go" ? GLM_RATES : null;
-  const source = rates ? "configured apiRates" : defaults === ASTRA_RATES ? ASTRA_SOURCE : defaults === GLM_RATES ? GLM_SOURCE : null;
+  const defaults = model === "gpt-6-astra" ? ASTRA_RATES : model === "glm-5.3-flash" && provider === "opencode-go" ? GLM_RATES : model === "muse-spark-1.3-contributor" && provider === "opencode-go" ? MUSE_RATES : null;
+  const source = rates ? "configured apiRates" : defaults === ASTRA_RATES ? ASTRA_SOURCE : defaults === GLM_RATES ? GLM_SOURCE : defaults === MUSE_RATES ? MUSE_SOURCE : null;
   return { model, rates: rates ? { ...rates } : defaults ? { ...defaults } : null, source, basis: "standard API-equivalent USD per million tokens" };
 }
 function reference(value: unknown): TurnReference | null {

@@ -20,13 +20,13 @@ const HELP = `Civ VI player — native visuals, isolated Python, Astra and subag
   bun start play --prompt '...'    Run one autonomous task, then exit
   bun start play --resume RUN      Resume a saved run (never replays game actions)
   bun start usage --run RUN        Read saved token/cost accounting offline
-  bun start dashboard --run DIR    Regenerate DIR/viewer.html from run ledgers while they grow
+  bun start dashboard --run DIR    Serve a private live viewer on a loopback URL
 
 Options:
   --config PATH   JSON configuration (default civ6.config.json if present)
   --run PATH      Use an explicit run directory
   --resume PATH   Resume an existing run directory
-  --calls N       Saved-run call ceiling: main + children + compaction, not per task
+  --calls N       Saved-run call ceiling, or unlimited (children + compaction included)
   --provider MODE codex (default), openai or opencode-go
   --model NAME    Default gpt-6-astra (glm-5.3-flash for opencode-go)
   --effort LEVEL  Codex/OpenAI: low, medium, high, xhigh; opencode-go: low, high, max (default high)
@@ -34,7 +34,7 @@ Options:
   --code TEXT     Python source for exec (mutually exclusive with --file)
   --file PATH     Python file for exec
   --json          Machine-readable output for usage only
-  --interval N    Dashboard poll interval in seconds (default 10)
+  --interval N    Dashboard ledger poll interval in seconds (default 10)
 
 Authentication: ChatGPT/Codex subscription from ~/.omp/agent/agent.db by default.
 Set authPath to ~/.codex/auth.json to use the desktop/CLI login instead.
@@ -130,11 +130,12 @@ async function main(): Promise<void> {
     if (!["low", "medium", "high", "xhigh", "max"].includes(value)) throw new Error("Invalid --effort");
     config.effort = value as typeof config.effort;
   }
-  if (config.provider === "opencode-go" && !["low", "high", "max"].includes(config.effort)) throw new Error("opencode-go --effort must be low, high or max");
+  if (config.provider === "opencode-go" && !["low", "high", "max", "xhigh"].includes(config.effort)) throw new Error("opencode-go --effort must be low, high, max or xhigh");
   if (config.provider !== "opencode-go" && config.effort === "max") throw new Error("Codex/OpenAI --effort max is unsupported; choose xhigh");
   if (option("calls")) {
-    const count = Number(option("calls"));
-    if (!Number.isSafeInteger(count) || count < 1) throw new Error("--calls must be a positive integer");
+    const value = option("calls")!;
+    const count = value === "unlimited" ? value : Number(value);
+    if (count !== "unlimited" && (!Number.isSafeInteger(count) || count < 1)) throw new Error("--calls must be a positive integer or unlimited");
     config.maxModelCalls = count;
   }
   if (command === "setup") {

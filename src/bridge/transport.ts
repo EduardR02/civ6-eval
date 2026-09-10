@@ -3,6 +3,19 @@ import { createConnection, type Socket } from "node:net";
 export interface TunerFrame { tag: number; payload: string }
 const MAX_FRAME = 8 * 1024 * 1024;
 
+/** Distinguish initial setup failures from loss of a previously reachable game. */
+function connectFailureMessage(established: boolean, host: string, port: number, detail: string): string {
+  return established
+    ? `Cannot reconnect to Civ VI at ${host}:${port}: ${detail}. The previously working game connection is unavailable. Ask the operator to restore access, then reobserve; interrupted requests are not replayed.`
+    : `Cannot connect to FireTuner at ${host}:${port}: ${detail}. EnableTuner=1 requires restarting Civ VI.`;
+}
+
+function connectTimeoutMessage(established: boolean, host: string, port: number): string {
+  return established
+    ? `FireTuner connection timed out at ${host}:${port}; the previously connected game process is unreachable or has exited.`
+    : `FireTuner connection timed out at ${host}:${port}; enable EnableTuner=1 and restart Civ VI.`;
+}
+
 /** Nexus framing is payload length (not total frame length), then signed tag, then UTF-8/NUL. */
 export class TunerTransport {
   private socket?: Socket;
@@ -15,6 +28,8 @@ export class TunerTransport {
   private queuedBytes = 0;
   private receiver?: { resolve: (frame: TunerFrame) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
   private failure?: Error;
+  /** Retain connection history across reconnects so setup hints do not mask a lost game. */
+  private everConnected = false;
 
   get connected(): boolean { return !!this.socket && !this.socket.destroyed && !this.failure; }
 
@@ -30,12 +45,18 @@ export class TunerTransport {
     this.socket = socket;
     socket.setNoDelay(true);
     socket.on("data", (bytes: Buffer) => this.consume(bytes));
-    socket.on("error", error => this.fail(error));
-    socket.on("close", () => this.fail(new Error("FireTuner disconnected. Restart/reload the game or reconnect.")));
+    socket.on("error", error => this.fail(this.lost(error)));
+    socket.on("close", () => this.fail(this.lost(new Error("connection closed"))));
     const { promise, resolve, reject } = Promise.withResolvers<void>();
-    const timer = setTimeout(() => { socket.destroy(); reject(new Error(`FireTuner connection timed out at ${host}:${port}; enable EnableTuner=1 and restart Civ VI.`)); }, timeoutMs);
-    socket.once("connect", () => { clearTimeout(timer); resolve(); });
-    socket.once("error", error => { clearTimeout(timer); reject(new Error(`Cannot connect to FireTuner at ${host}:${port}: ${error.message}. EnableTuner=1 requires restarting Civ VI.`)); });
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(connectTimeoutMessage(this.everConnected, host, port)));
+    }, timeoutMs);
+    socket.once("connect", () => { clearTimeout(timer); this.everConnected = true; resolve(); });
+    socket.once("error", error => {
+      clearTimeout(timer);
+      reject(new Error(connectFailureMessage(this.everConnected, host, port, error.message)));
+    });
     socket.once("close", () => { clearTimeout(timer); reject(new Error("FireTuner connection closed before ready.")); });
     await promise;
   }
@@ -116,6 +137,12 @@ export class TunerTransport {
       this.receiver = undefined;
     }
     this.socket?.destroy();
+  }
+
+  /** A lost socket cannot establish whether the game crashed, exited, or became unreachable. */
+  private lost(error: Error): Error {
+    if (!this.everConnected) return error;
+    return new Error(`FireTuner connection lost: the Civ VI process is unreachable or has exited (${error.message}). Ask the operator to restore access, then reobserve; interrupted requests may have unknown outcomes and are not replayed.`);
   }
 
   close(): void {

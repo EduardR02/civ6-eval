@@ -22,6 +22,24 @@ function textArg(args: Arguments, name: string): string {
 function validAgent(id: string): void {
   if (!/^[A-Za-z0-9_-]{1,80}$/.test(id)) throw new Error("Invalid agent id");
 }
+const MAX_NOTE_BYTES = 8 * 1024;
+const NOTE_WINDOW_MS = 60_000;
+const MAX_NOTES_PER_WINDOW = 30;
+/**
+ * Which snapshot sections a captured observation actually carries. The bridge normalises `sections`;
+ * an archive without it predates sectioning and carried every collection.
+ */
+function sectionsOf(value: unknown): string[] {
+  const data = value as Record<string, unknown> | null;
+  if (!data || typeof data !== "object") return [];
+  if (Array.isArray(data.sections) && data.sections.every(section => typeof section === "string")) return data.sections as string[];
+  const map = data.map as { tiles?: unknown } | undefined;
+  const present = ["core"];
+  if (Array.isArray(data.units)) present.push("units");
+  if (Array.isArray(data.cities)) present.push("cities");
+  if (Array.isArray(map?.tiles)) present.push("map");
+  return present;
+}
 export class PlayerHost {
   readonly bridge: CivBridge;
   readonly desktop: DesktopService;
@@ -31,6 +49,8 @@ export class PlayerHost {
   private controlEpoch = 0;
   private liveQueue: Promise<unknown> = Promise.resolve();
   private latestSnapshot?: string;
+  private lastObserved: { turn: number | null; gameId: string | null } = { turn: null, gameId: null };
+  private noteRate = new Map<string, number[]>();
   private nativeLock?: Promise<Server>;
   private closed = false;
   private eventQueue: Promise<void> = Promise.resolve();
@@ -43,7 +63,7 @@ export class PlayerHost {
     this.player = new Player({
       projectRoot, runDir, model: config.model, provider: config.provider, effort: config.effort,
       authPath: config.authPath, apiKey: config.provider === "openai" ? process.env.OPENAI_API_KEY : undefined, baseUrl: config.baseUrl,
-      maxConcurrentAgents: config.maxConcurrentAgents, maxModelCalls: config.maxModelCalls,
+      maxConcurrentAgents: config.maxConcurrentAgents, maxModelCalls: config.maxModelCalls === "unlimited" ? undefined : config.maxModelCalls,
       compactThreshold: config.compactThresholds?.[config.provider] ?? config.compactThreshold, rpc: this.rpc.bind(this),
       execute: (id, code, options) => this.execute(code, id, options),
       onEvent: event => { this.usage.onEvent(event); this.log({ kind: "player", ...event }); onEvent?.(event); },
@@ -52,12 +72,23 @@ export class PlayerHost {
   async initialize(): Promise<void> {
     await mkdir(join(this.runDir, "artifacts"), { recursive: true });
     await mkdir(join(this.runDir, "snapshots"), { recursive: true });
+    // Recovery memory and the latest capture are separate concepts. Accumulated knowledge is the
+    // union of everything ever observed; the latest snapshot may be a small regional page, and
+    // restoring from that would silently discard remembered tiles.
+    let recovered = false;
+    try {
+      const archive = JSON.parse(await readFile(join(this.runDir, "knowledge.json"), "utf8"));
+      this.bridge.restoreKnowledge(archive);
+      recovered = true;
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     try {
       const index = JSON.parse(await readFile(join(this.runDir, "observations.json"), "utf8"));
       if (typeof index.latest === "string" && /^s-[a-f0-9-]+$/.test(index.latest)) {
         const snapshot = JSON.parse(await readFile(join(this.runDir, "snapshots", `${index.latest}.json`), "utf8"));
-        this.bridge.restoreKnowledge(snapshot);
+        // Runs that predate knowledge.json still recover from their last capture.
+        if (!recovered) this.bridge.restoreKnowledge(snapshot);
         this.latestSnapshot = index.latest;
+        this.observedTurn(snapshot);
         this.usage.restoreObservation(snapshot);
       }
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -67,6 +98,13 @@ export class PlayerHost {
     this.eventQueue = this.eventQueue.then(() => appendFile(join(this.runDir, "history.jsonl"), JSON.stringify({ at: new Date().toISOString(), ...event as object }) + "\n"));
     // Attach a rejection handler immediately; close/flush still observes the original failure.
     void this.eventQueue.catch(error => console.error("History persistence failed:", error.message));
+  }
+  /** Last turn this run actually observed, from any snapshot including a sectioned one. */
+  private observedTurn(snapshot: unknown): void {
+    const data = snapshot as Record<string, unknown> | null;
+    if (!data || typeof data !== "object") return;
+    if (Number.isSafeInteger(data.turn) && (data.turn as number) >= 0) this.lastObserved.turn = data.turn as number;
+    if (typeof data.gameId === "string" && data.gameId) this.lastObserved.gameId = data.gameId;
   }
   private lockNativeAccess(): Promise<Server> {
     if (!this.nativeLock) {
@@ -124,7 +162,7 @@ export class PlayerHost {
       return { controller: this.controller };
     }
     if (method.startsWith("artifact.")) return this.artifact(method, args);
-    if (method.startsWith("history.")) return this.history(method, args);
+    if (method.startsWith("history.")) return this.history(method, args, agentId);
     if (method === "civ.snapshot" && (args.snapshotId || agentId !== this.controller)) {
       const id = typeof args.snapshotId === "string" ? args.snapshotId : this.latestSnapshot;
       if (!id) throw new Error("No snapshot captured yet. Ask the controller to call civ.snapshot first.");
@@ -140,7 +178,7 @@ export class PlayerHost {
       const complaint = {
         complaintId, at: new Date().toISOString(), agentId, controller: this.controller,
         lastObservedSnapshot: this.latestSnapshot ?? null, note,
-        trace: await this.history("history.read", { limit: 20, textLimit: 2000 }),
+        trace: await this.history("history.read", { limit: 20, textLimit: 2000 }, agentId),
       };
       const artifact = `complaints/${complaintId}.json`;
       await this.artifact("artifact.write", { name: artifact, content: JSON.stringify(complaint, null, 1) });
@@ -158,12 +196,20 @@ export class PlayerHost {
         if (method === "civ.snapshot") {
           const snapshotId = `s-${randomUUID()}`;
           result = { ...(result as object), snapshotId, capturedAt: new Date().toISOString() };
+          // Every capture is archived and addressable. `latest` is the analyst pointer and always
+          // advances, partial or not, because its coverage travels with it. Recovery memory is the
+          // bridge's accumulated knowledge, persisted separately so a regional page never replaces it.
           await writeFile(join(this.runDir, "snapshots", `${snapshotId}.json`), JSON.stringify(result));
+          const sections = sectionsOf(result);
+          const complete = ["map", "units", "cities"].every(section => sections.includes(section));
           await writeFile(join(this.runDir, "observations.json"), JSON.stringify({ latest: snapshotId }));
           this.latestSnapshot = snapshotId;
+          const knowledge = this.bridge.exportKnowledge();
+          if (knowledge) await writeFile(join(this.runDir, "knowledge.json"), JSON.stringify(knowledge));
+          this.observedTurn(result);
           this.usage.observe(result);
           this.usage.observe(result, agentId);
-          this.log({ kind: "result", agentId, method, snapshotId });
+          this.log({ kind: "result", agentId, method, snapshotId, sections, complete });
         } else if (method === "desktop.screenshot" && result && typeof result === "object" && "data" in result) {
           const screenshot = result as Record<string, unknown>;
           const name = `screens/${randomUUID()}.png`;
@@ -244,7 +290,30 @@ export class PlayerHost {
     const text = data.toString("utf8");
     return { name, content: text.slice(offset, offset + limit), offset, total: text.length, truncated: offset + limit < text.length };
   }
-  private async history(method: string, args: Arguments): Promise<unknown> {
+  /**
+   * Append a model-authored durable note to run history. This is the only writable channel that
+   * survives compaction, so it is bounded and rate-limited rather than free-form logging.
+   */
+  private async note(agentId: string, args: Arguments): Promise<unknown> {
+    const text = textArg(args, "text");
+    if (!text.trim()) throw new Error("text must contain non-whitespace characters");
+    if (Buffer.byteLength(text, "utf8") > MAX_NOTE_BYTES) throw new Error(`text must be at most ${MAX_NOTE_BYTES} bytes of UTF-8; write long material to an artifact and note its name`);
+    const now = Date.now();
+    const recent = (this.noteRate.get(agentId) ?? []).filter(at => now - at < NOTE_WINDOW_MS);
+    if (recent.length >= MAX_NOTES_PER_WINDOW) throw new Error(`history.note is limited to ${MAX_NOTES_PER_WINDOW} notes per agent per minute; the note was NOT recorded`);
+    recent.push(now);
+    this.noteRate.set(agentId, recent);
+    const record = {
+      at: new Date().toISOString(), kind: "note", agentId, text,
+      lastObservedTurn: this.lastObserved.turn, gameId: this.lastObserved.gameId,
+      lastObservedSnapshot: this.latestSnapshot ?? null,
+    };
+    this.log(record);
+    await this.eventQueue;
+    return { recorded: true, ...record, bytes: Buffer.byteLength(text, "utf8") };
+  }
+  private async history(method: string, args: Arguments, agentId = "main"): Promise<unknown> {
+    if (method === "history.note") return this.note(agentId, args);
     if (method !== "history.search" && method !== "history.read") throw new Error(`Unknown history method: ${method}`);
     const limit = Math.min(100, Math.max(1, Number(args.limit ?? 20)));
     const offset = args.offset === undefined ? undefined : Number(args.offset);
@@ -295,9 +364,10 @@ export class PlayerHost {
     } finally {
       options?.signal?.removeEventListener("abort", cancelDesktop);
     }
+    // Workspace file paths stay in the execution log, never in the model-visible result: the block was
+    // ~100 chars on every call and it baited re-reads of output the model already had.
     const workspaceFiles = result.artifacts ?? [];
     result.artifacts = [];
-    if (workspaceFiles.length) result.content.push({ type: "text", text: `files: ${workspaceFiles.join(", ")}` });
     const recorded = [];
     for (let i = 0; i < result.content.length; i++) {
       const block = result.content[i];

@@ -1,22 +1,11 @@
-/** Live run dashboard: regenerate DIR/viewer.html from a run's ledgers as they grow.
- *
- * Sources (all optional; missing ones are skipped):
- *  - player/agents/main/*.jsonl  Pi session transcripts, merged chronologically by filename
- *                                (a resumed run starts a new file); base64 image data is dropped at parse
- *  - usage.jsonl                 token ledger: run totals, compaction times, per-call zip fallback
- *  - history.jsonl               host RPC log: end_turn turn boundaries, display artifacts, method counts
- *  - player/agents/main/provider.jsonl or native.jsonl
- *                                optional provider journals: compaction sizes, failed HTTP statuses
- *
- * Per-call tokens prefer the session message's own usage (aligned by construction for every provider);
- * when absent they fall back to zipping usage.jsonl events (main agent, non-compaction) by order.
- * Rebuilds are incremental: each source is re-read only from the byte offset already consumed, so a
- * steady-state refresh reads only appended data. Output is written atomically (tmp + rename).
+/** Read-only LIVE run dashboard. Optional append-only journals feed an incremental
+ * loopback HTTP/SSE viewer; no sidecars, private provider state, or model scripts
+ * are served. Turns are attributed only to observations at or before a message.
  */
-import { existsSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { open } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { basename, join } from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 interface CallTokens { input: number; cacheRead: number; cacheWrite: number; output: number; reasoning: number; cost: number | null }
 type Block =
@@ -24,32 +13,35 @@ type Block =
   | { type: "thinking"; thinking: string }
   | { type: "toolCall"; name: string; code: string }
   | { type: "image" };
-interface Entry { ts: string; role: "user" | "assistant" | "toolResult"; blocks: Block[]; error: string | null; usage: CallTokens | null }
+interface Entry { ts: string; role: "user" | "assistant" | "toolResult"; toolCallId: string | null; blocks: Block[]; error: string | null; usage: CallTokens | null }
 interface Compaction { time: string; originalLen: number | null; summaryLen: number | null }
 interface Ledger { requests: number; input: number; cacheRead: number; cacheWrite: number; output: number; reasoning: number; usd: number; unpriced: number; present: boolean }
+interface TurnObservation { time: string; turn: number }
 type SourceKind = "transcript" | "usage" | "history" | "journal";
 
 const RESET = Symbol("source shrank; reparse everything");
 const INTERESTING: Record<SourceKind, Record<string, boolean>> = {
   transcript: { message: true, model_change: true },
   usage: { start: true, usage: true, end: true },
-  history: { request: true, execution_result: true },
+  history: { request: true, execution_result: true, result: true, execution: true, player: true, tool_start: true },
   journal: { compaction: true, request_end: true, http_error: true },
 };
 const ESCAPES: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
 const esc = (value: unknown): string => String(value ?? "").replace(/[&<>"]/g, character => ESCAPES[character]!);
-const hhmmss = (iso: string | null): string => iso ? iso.slice(11, 19) : "?";
+const hhmmss = (iso: string | null): string => iso ? esc(iso.slice(11, 19)) : "?";
 const num = (value: unknown): number => typeof value === "number" && Number.isFinite(value) ? value : 0;
 const str = (value: unknown): string => typeof value === "string" ? value : "";
 const lengthJson = (value: unknown): number => typeof value === "string" ? value.length : JSON.stringify(value ?? "").length;
+const byTime = (a: { time: string }, b: { time: string }): number => a.time < b.time ? -1 : a.time > b.time ? 1 : 0;
+const IMAGE_REFERENCE = /(?:workspaces\/main\/)?\.executions\/[\w-]+\/display-\d+\.(?:png|jpe?g)|(?:artifacts\/)?executions\/main\/[\w-]+\.(?:png|jpe?g)/gi;
 
 /** Narrow an unknown JSON value to a plain object (null/arrays rejected). */
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
-/** Cheap first-match kind/type tag from the line head; empty when absent (defensive full parse). */
+/** Skip large irrelevant journal rows only when a top-level tag is proven. */
 function headTag(line: string): string {
-  const match = /"(?:kind|type)":"([a-zA-Z_-]+)"/.exec(line.length > 220 ? line.slice(0, 220) : line);
+  const match = /^\s*\{(?:\s*"[^"\\]+"\s*:\s*(?:"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?|true|false|null)\s*,)*\s*"(?:kind|type)"\s*:\s*"([a-zA-Z_-]+)"/.exec(line.slice(0, 220));
   return match ? match[1]! : "";
 }
 function toolCode(block: Record<string, unknown>): string {
@@ -60,13 +52,40 @@ function toolCode(block: Record<string, unknown>): string {
     return typeof parsed?.code === "string" ? parsed.code : "";
   } catch { return str(block.arguments); }
 }
+/** Unknown until a game state has actually been observed. */
+function turnOf(ts: string, observations: TurnObservation[]): number | null {
+  let lo = 0, hi = observations.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (observations[mid]!.time <= ts) lo = mid + 1; else hi = mid;
+  }
+  return lo ? observations[lo - 1]!.turn : null;
+}
 
-interface Offset { offset: number }
+interface Offset { offset: number; size: number; mtime: number; ino: number; pending: Buffer[] }
+type StreamEvent = { kind: "turn" | "card"; key: string; turn: number | null; cls: string; html: string };
+export type TailEvent =
+  | { k: "gen"; gen: number }
+  | { k: "turn"; turn: number | null }
+  | { k: "card"; id: string; cls: string; b: string }
+  | { k: "spark"; b: string }
+  | { k: "side"; b: string };
+
 
 /** Accumulated run state; `refresh()` applies only bytes appended since the previous call. */
 export class RunView {
+  /** Changes on every reparse or chronological replay. */
+  generation: number;
+
+  constructor(generation = 1) {
+    this.generation = generation;
+  }
+
   entries: Entry[] = [];
-  endTurns: string[] = [];
+  /** Observed game-turn timeline (snapshots + RPC results), sorted by capture time. */
+  turns: TurnObservation[] = [];
+  /** end_turn submissions, kept as context only — never used to number turns. */
+  endTurns = 0;
   display: string[] = [];
   methods = new Map<string, number>();
   model = "?";
@@ -78,22 +97,57 @@ export class RunView {
   private offsets = new Map<string, Offset>();
   private kinds = new Map<string, { agent: string; kind: string }>();
   private usageEvents: { requestId: string; time: string; tokens: CallTokens; usd: number | null }[] = [];
+  private snapshotFiles = new Map<string, { size: number; mtime: number }>();
+  private tail = new Map<string, string>();
+  private singletons = new Map<string, string>();
+  private restart = true;
+  private dirty = true;
+  private sortedEntries: Entry[] = [];
+  private callList: Entry[] = [];
+  private tokensOf: (entry: Entry) => CallTokens | null = () => null;
+  private ctxPeak = { v: 0, i: 0 };
+  private attemptCount = 0;
+  private stubCount = 0;
+  private finalFailure: { time: string; status: string } | null = null;
+  private compactionTimes: Compaction[] = [];
+  private displayIndex = 0;
+  private imagePaths = new Set<string>();
+  private displaysByText = new Map<string, string[]>();
+  /** History links execution ids to the provider tool-call ids in the transcript. */
+  private executionToolCalls = new Map<string, string>();
+  private pendingToolCalls = new Map<string, string>();
+  private displaysByToolCall = new Map<string, string[]>();
+  private cardCache = new WeakMap<Entry, { signature: string; html: string }>();
+  private entryMetadata = new WeakMap<Entry, { text: string; paths: string[]; images: number }>();
 
   resetState(): void {
+    this.generation++;
+    this.offsets.clear();
     this.entries.length = 0;
-    this.endTurns.length = 0;
+    this.turns.length = 0;
+    this.endTurns = 0;
     this.display.length = 0;
     this.methods.clear();
     this.model = "?";
     this.compactions.length = 0;
     this.failures.length = 0;
     this.ledger = { requests: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0, usd: 0, unpriced: 0, present: false };
-    this.offsets.clear();
-    this.kinds.clear();
-    this.usageEvents.length = 0;
+    this.snapshotFiles.clear();
+    this.imagePaths.clear();
+    this.displaysByText.clear();
+    this.executionToolCalls.clear();
+    this.pendingToolCalls.clear();
+    this.displaysByToolCall.clear();
+    this.cardCache = new WeakMap();
+    this.entryMetadata = new WeakMap();
+    this.tail.clear();
+    this.singletons.clear();
+    this.restart = true;
+    this.dirty = true;
   }
 
   async refresh(runDir: string): Promise<void> {
+    if (this.runDir && this.runDir !== runDir) this.resetState();
     this.runDir = runDir;
     this.read = 0;
     const mainDir = join(runDir, "player", "agents", "main");
@@ -102,7 +156,9 @@ export class RunView {
       transcripts = readdirSync(mainDir)
         .filter(name => name.endsWith(".jsonl") && name !== "provider.jsonl" && name !== "native.jsonl")
         .sort().map(name => join(mainDir, name));
-    } catch { /* run directory not created yet */ }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
     const sources: { path: string; kind: SourceKind }[] = [
       ...transcripts.map(path => ({ path, kind: "transcript" as const })),
       { path: join(runDir, "usage.jsonl"), kind: "usage" },
@@ -111,40 +167,95 @@ export class RunView {
       { path: join(mainDir, "native.jsonl"), kind: "journal" },
     ];
     try {
+      const present = new Set(sources.map(source => source.path));
+      for (const [path, state] of this.offsets) {
+        if (state.size && !present.has(path)) throw RESET;
+      }
       for (const source of sources) await this.pump(source);
+      this.pumpSnapshots(join(runDir, "snapshots"));
     } catch (error) {
       if (error !== RESET) throw error;
       this.resetState();
       for (const source of sources) await this.pump(source);
+      this.pumpSnapshots(join(runDir, "snapshots"));
     }
-    this.endTurns.sort();
+    if (this.dirty) this.turns.sort(byTime);
   }
 
-  /** Read the byte range beyond the last consumed offset; an unterminated trailing line is re-read next time. */
+  /** Consume new bytes once, retaining incomplete lines without repeatedly reading base64. */
   private async pump(source: { path: string; kind: SourceKind }): Promise<void> {
     let state = this.offsets.get(source.path);
-    if (!state) this.offsets.set(source.path, state = { offset: 0 });
-    let size = 0;
-    try { size = statSync(source.path).size; } catch { return; } // absent yet: skip silently
-    if (size < state.offset) throw RESET;
-    if (size === state.offset) return;
+    let info;
+    try { info = statSync(source.path); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (state?.size) throw RESET;
+      return;
+    }
+    if (state && (info.size < state.size || info.ino !== state.ino ||
+      (info.size === state.size && info.mtimeMs !== state.mtime))) throw RESET;
+    if (!state) this.offsets.set(source.path, state = { offset: 0, size: 0, mtime: 0, ino: info.ino, pending: [] });
+    if (info.size === state.size) return;
     const handle = await open(source.path, "r");
     try {
-      const bytes = Buffer.allocUnsafe(size - state.offset);
-      const read = await handle.read(bytes, 0, bytes.length, state.offset);
-      const data = read.bytesRead < bytes.length ? bytes.subarray(0, read.bytesRead) : bytes;
-      this.read += data.length;
-      // state.offset stops after the last complete line, so the next read naturally re-reads any
-      // unterminated trailing line and parses it once it is complete.
-      let at = 0;
-      for (;;) {
-        const newline = data.indexOf(10, at);
-        if (newline === -1) break;
-        this.apply(data.subarray(at, newline).toString("utf8"), source.kind);
-        at = newline + 1;
+      while (state.offset < info.size) {
+        const bytes = Buffer.allocUnsafe(Math.min(1024 * 1024, info.size - state.offset));
+        const result = await handle.read(bytes, 0, bytes.length, state.offset);
+        if (!result.bytesRead) break;
+        const data = bytes.subarray(0, result.bytesRead);
+        this.read += data.length;
+        state.offset += data.length;
+        let at = 0;
+        for (;;) {
+          const newline = data.indexOf(10, at);
+          if (newline === -1) break;
+          let line = data.subarray(at, newline);
+          if (state.pending.length) {
+            state.pending.push(line);
+            line = Buffer.concat(state.pending);
+            state.pending = [];
+          }
+          this.apply(line.toString("utf8"), source.kind);
+          at = newline + 1;
+        }
+        if (at < data.length) state.pending.push(Buffer.from(data.subarray(at)));
       }
-      state.offset += at;
+      state.size = state.offset;
+      state.mtime = info.mtimeMs;
     } finally { await handle.close(); }
+  }
+
+  /** Snapshot files are written once by the host; (re)read a file only when its stat changes. */
+  private pumpSnapshots(dir: string): void {
+    let names: string[];
+    try { names = readdirSync(dir); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (this.snapshotFiles.size) throw RESET;
+      return;
+    }
+    const present = new Set(names);
+    for (const name of this.snapshotFiles.keys()) if (!present.has(name)) throw RESET;
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      const path = join(dir, name);
+      let info: { size: number; mtime: number };
+      try {
+        const stat = statSync(path);
+        info = { size: stat.size, mtime: stat.mtimeMs };
+      } catch { continue; }
+      const seen = this.snapshotFiles.get(name);
+      if (seen && seen.size === info.size && seen.mtime === info.mtime) continue;
+      if (seen) throw RESET;
+      let parsed: unknown;
+      try { parsed = JSON.parse(readFileSync(path, "utf8")); } catch { continue; } // mid-write: retried when the stat changes
+      this.snapshotFiles.set(name, info);
+      this.read += info.size;
+      const snapshot = record(parsed);
+      const turn = snapshot && typeof snapshot.turn === "number" && Number.isFinite(snapshot.turn) && snapshot.turn >= 0 ? snapshot.turn : -1;
+      if (!snapshot || turn < 0) continue;
+      const capturedAt = str(snapshot.capturedAt);
+      this.turns.push({ time: capturedAt || new Date(info.mtime).toISOString(), turn });
+      this.dirty = true;
+    }
   }
 
   private apply(line: string, kind: SourceKind): void {
@@ -155,6 +266,9 @@ export class RunView {
     const event = record(parsed);
     if (!event) return;
     const key = tag || str(event.type) || str(event.kind);
+    if (!INTERESTING[kind][key]) return;
+    if (kind === "history" && key === "player" && event.type !== "tool_start") return;
+    this.dirty = true;
     if (kind === "transcript") {
       if (key === "model_change") {
         const model = str(event.modelId);
@@ -178,8 +292,11 @@ export class RunView {
         const method = str(event.method);
         if (!method) return;
         this.methods.set(method, (this.methods.get(method) ?? 0) + 1);
-        if (method === "civ.action" && JSON.stringify(event.args ?? {}).includes("end_turn")) this.endTurns.push(str(event.at));
-      } else if (key === "execution_result") this.applyDisplay(event);
+        if (method === "civ.action" && JSON.stringify(event.args ?? {}).includes("end_turn")) this.endTurns++;
+      } else if (key === "result") this.applyObservation(event);
+      else if (key === "execution_result") this.applyDisplay(event);
+      else if (key === "tool_start") this.applyToolStart(event);
+      else if (key === "execution") this.applyExecution(event);
     } else {
       if (key === "compaction") {
         this.compactions.push({
@@ -191,6 +308,66 @@ export class RunView {
         const outcome = str(event.outcome);
         if (outcome && outcome !== "ok" && outcome !== "completed") this.failures.push({ time: str(event.time), status: String(event.httpStatus ?? "?") });
       } else if (key === "http_error") this.failures.push({ time: str(event.time), status: String(event.status ?? "?") });
+    }
+  }
+
+  private applyToolStart(event: Record<string, unknown>): void {
+    if (event.type !== "tool_start") return;
+    const data = record(event.data);
+    const toolCallId = str(data?.toolCallId);
+    const agentId = str(event.agentId) || "?";
+    if (toolCallId) this.pendingToolCalls.set(agentId, toolCallId);
+    else this.pendingToolCalls.delete(agentId);
+  }
+
+  private applyExecution(event: Record<string, unknown>): void {
+    const executionId = str(event.executionId);
+    if (!executionId) return;
+    const agentId = str(event.agentId) || "?";
+    const toolCallId = str(event.toolCallId) || this.pendingToolCalls.get(agentId) || "";
+    this.pendingToolCalls.delete(agentId);
+    if (toolCallId) this.executionToolCalls.set(executionId, toolCallId);
+  }
+
+  /** Observed game turn from one RPC result: civ.action turnState, civ.inspect turn, snapshot game. */
+  private applyObservation(event: Record<string, unknown>): void {
+    const result = record(event.result);
+    if (!result) return;
+    const at = str(event.at);
+    if (!at) return;
+    const state = record(result.turnState);
+    const game = record(result.game);
+    const turn = [state?.turn, result.turn, game?.turn].find(value =>
+      typeof value === "number" && Number.isFinite(value) && value >= 0) as number | undefined;
+    if (turn === undefined) return;
+    this.turns.push({ time: at, turn });
+  }
+
+  /** Only host-recorded main-agent display paths become browser-accessible images. */
+  private applyDisplay(event: Record<string, unknown>): void {
+    if (event.agentId !== undefined && event.agentId !== "main") return;
+    const paths: string[] = [];
+    if (Array.isArray(event.workspaceFiles)) {
+      for (const item of event.workspaceFiles) {
+        const path = str(item).replaceAll("\\", "/");
+        if (/^\.executions\/[\w-]+\/display-\d+\.(png|jpe?g)$/i.test(path)) paths.push(`workspaces/main/${path}`);
+      }
+    }
+    if (!paths.length && Array.isArray(event.artifacts)) {
+      for (const item of event.artifacts) {
+        const path = str(item).replaceAll("\\", "/").replace(/^artifacts\//, "");
+        if (/^executions\/main\/[\w-]+\.(png|jpe?g)$/i.test(path)) paths.push(`artifacts/${path}`);
+      }
+    }
+    for (const path of paths) { this.imagePaths.add(path); this.display.push(path); }
+    const executionId = str(event.executionId);
+    const toolCallId = this.executionToolCalls.get(executionId);
+    if (toolCallId && paths.length) this.displaysByToolCall.set(toolCallId, paths);
+    if (Array.isArray(event.content)) {
+      const text = event.content.map(item => record(item)).filter(item => item?.type === "text").map(item => str(item!.text)).join("\n");
+      // Ambiguous identical results must not silently borrow a different execution's image.
+      if (this.displaysByText.has(text)) this.displaysByText.set(text, []);
+      else this.displaysByText.set(text, paths);
     }
   }
 
@@ -221,26 +398,40 @@ export class RunView {
     this.entries.push({
       ts: str(event.timestamp) || str(message.timestamp),
       role,
+      toolCallId: role === "toolResult" ? str(message.toolCallId) || null : null,
       blocks,
       error: message.stopReason === "error" ? (str(message.errorMessage) || "error") : null,
       usage: tokens,
     });
   }
 
-  /** Display images from one execution: workspace copies first; artifact copies when the workspace has none. */
-  private applyDisplay(event: Record<string, unknown>): void {
-    let found = 0;
-    if (Array.isArray(event.workspaceFiles)) {
-      for (const item of event.workspaceFiles) {
-        const path = str(item).replaceAll("\\", "/");
-        if (/^\.executions\/[^/]+\/display-\d+\.(png|jpg)$/i.test(path)) { this.display.push(`workspaces/main/${path}`); found++; }
-      }
+  imagePath(path: string): string | null {
+    if (!this.imagePaths.has(path)) return null;
+    try {
+      const root = realpathSync(this.runDir);
+      const requested = join(root, path), file = realpathSync(requested);
+      // The run root itself may be a trusted junction; nothing below it may
+      // redirect a recorded display path to another file, even inside the run.
+      if (relative(requested, file) !== "") return null;
+      const inside = relative(root, file);
+      if (!inside || inside === ".." || inside.startsWith(`..${sep}`) || isAbsolute(inside)) return null;
+      return statSync(file).isFile() ? file : null;
+    } catch { return null; }
+  }
+
+
+  private metadata(entry: Entry): { text: string; paths: string[]; images: number } {
+    let value = this.entryMetadata.get(entry);
+    if (!value) {
+      const text = entry.blocks.filter(block => block.type === "text").map(block => block.text).join("\n");
+      const linked = entry.role === "assistant"
+        ? entry.blocks.map(block => block.type === "text" ? block.text : block.type === "toolCall" ? block.code : "").join("\n")
+        : text;
+      const paths = (linked.match(IMAGE_REFERENCE) ?? []).map(path => path.startsWith(".executions/") ? `workspaces/main/${path}` : path.startsWith("executions/") ? `artifacts/${path}` : path);
+      value = { text, paths, images: entry.blocks.reduce((count, block) => count + Number(block.type === "image"), 0) };
+      this.entryMetadata.set(entry, value);
     }
-    if (found || !Array.isArray(event.artifacts)) return;
-    for (const item of event.artifacts) {
-      const path = str(item).replaceAll("\\", "/");
-      if (/\.(png|jpg)$/i.test(path)) this.display.push(path.startsWith("artifacts/") ? path : `artifacts/${path}`);
-    }
+    return value;
   }
 
   /** Summarize the usage ledger into sidebar totals (main agent, compaction included). */
@@ -260,11 +451,12 @@ export class RunView {
     this.ledger = ledger;
   }
 
-  render(refreshSeconds: number, builtMs: number, runName = basename(this.runDir)): string {
-    this.summarizeLedger();
-    const entries = this.entries.slice().sort((a, b) => a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0);
+
+  /** Full card sequence (turn headers, compaction marks, cards) in chronological order. */
+  private computeCards(): StreamEvent[] {
+    const entries = this.sortedEntries = this.entries.slice().sort((a, b) => a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0);
     const isCall = (entry: Entry): boolean => entry.role === "assistant" && !(entry.error !== null && entry.blocks.length === 0);
-    const calls: Entry[] = [];
+    const calls: Entry[] = this.callList = [];
     const slots = new Map<Entry, number>();
     for (const entry of entries) if (isCall(entry)) { slots.set(entry, calls.length); calls.push(entry); }
     // Fallback tokens: usage.jsonl events of the main agent except compaction requests, by call order.
@@ -274,38 +466,22 @@ export class RunView {
         return meta?.kind !== "compact" && (meta === undefined || meta.agent === "main" || meta.agent === "?");
       })
       .map(event => event.tokens);
-    const tokensOf = (entry: Entry): CallTokens | null => entry.usage ?? zip[slots.get(entry) ?? -1] ?? null;
+    const tokensOf = this.tokensOf = (entry: Entry): CallTokens | null => entry.usage ?? zip[slots.get(entry) ?? -1] ?? null;
     const ctxOf = (tokens: CallTokens | null): number => tokens ? tokens.input + tokens.cacheRead : 0;
     const ctx = calls.map(tokensOf).map(ctxOf);
-    const peak = ctx.reduce((best, value, index) => value > best.v ? { v: value, i: index } : best, { v: 0, i: 0 });
+    this.ctxPeak = ctx.reduce((best, value, index) => value > best.v ? { v: value, i: index } : best, { v: 0, i: 0 });
     const attempts = entries.filter(entry => entry.role === "assistant");
+    this.attemptCount = attempts.length;
     const stubs = attempts.filter(entry => entry.error !== null);
+    this.stubCount = stubs.length;
     const lastStub = stubs[stubs.length - 1];
-    const finalFailure = this.failures.length
+    this.finalFailure = this.failures.length
       ? this.failures.reduce((last, failure) => failure.time > last.time ? failure : last)
       : lastStub ? { time: lastStub.ts, status: /HTTP (\d+)/.exec(lastStub.error ?? "")?.[1] ?? "?" } : null;
-    const compactionTimes = (this.compactions.length ? this.compactions : this.usageEvents
+    this.compactionTimes = (this.compactions.length ? this.compactions : this.usageEvents
       .filter(event => this.kinds.get(event.requestId)?.kind === "compact")
       .map(event => ({ time: event.time, originalLen: null as number | null, summaryLen: null as number | null })))
-      .slice().sort((a, b) => a.time < b.time ? -1 : 1);
-    const window = entries.length ? `${hhmmss(entries[0]!.ts)}–${hhmmss(entries[entries.length - 1]!.ts)}Z` : "?";
-    const activity = [...this.methods.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
-      .map(([method, count]) => `${esc(method)} ${count}`).join(" · ");
-
-    const sparkCard = (() => {
-      if (ctx.length < 2) return "";
-      const W = 560, H = 48, max = Math.max(...ctx);
-      const points = ctx.map((value, index) => `${(index / (ctx.length - 1) * W).toFixed(1)},${(H - 4 - value / max * (H - 8)).toFixed(1)}`).join(" ");
-      const marks = compactionTimes.map(compaction => {
-        const index = calls.findIndex(call => call.ts > compaction.time);
-        if (index < 1) return "";
-        const x = (index / (calls.length - 1) * W).toFixed(1);
-        return `<line x1="${x}" y1="2" x2="${x}" y2="${H - 2}" stroke="#f96" stroke-dasharray="3 3"/>`;
-      }).join("");
-      const svg = `<svg class="spark" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><polyline fill="none" stroke="#6cf" stroke-width="1.5" points="${points}"/>${marks}</svg>`;
-      return `<div class="card answers"><div class="head">CONTEXT GROWTH · fresh+cached per model call${marks ? " · dashed = compaction" : ""}</div>${svg}</div>`;
-    })();
-
+      .slice().sort(byTime);
     // The most recent thinking block renders expanded; every older one stays collapsed.
     let openEntry: Entry | undefined, openBlock = -1;
     for (let index = entries.length - 1; index >= 0 && !openEntry; index--) {
@@ -314,72 +490,156 @@ export class RunView {
         if (blocks[slot]!.type === "thinking") { openEntry = entries[index]; openBlock = slot; break; }
       }
     }
-    let body = "", sidebar = "", lastTurn = 0, displayIndex = 0, mark = 0;
+    const cards: StreamEvent[] = [];
+    let lastTurn: number | null | undefined;
+    this.displayIndex = 0;
+    let mark = 0;
+    const slotSeen = new Map<string, number>();
     for (const entry of entries) {
-      const turn = turnOf(entry.ts, this.endTurns);
-      if (turn !== lastTurn && entry.role !== "toolResult") {
-        body += `<h3 id="turn${turn}">— turn ${turn} —</h3>`;
-        sidebar += `<a class="toc" href="#turn${turn}">turn ${turn}</a>`;
+      const turn = turnOf(entry.ts, this.turns);
+      if (turn !== lastTurn) {
+        cards.push({ kind: "turn", key: `turn:${turn}:${cards.length}`, turn, cls: "", html: "" });
         lastTurn = turn;
       }
-      while (mark < compactionTimes.length && compactionTimes[mark]!.time < entry.ts) {
-        body += `<div class="mark">⋯ context compacted ${hhmmss(compactionTimes[mark]!.time)}Z ⋯</div>`;
+      while (mark < this.compactionTimes.length && this.compactionTimes[mark]!.time < entry.ts) {
+        const time = this.compactionTimes[mark]!.time;
+        cards.push({ kind: "card", key: `mark:${time}`, turn: 0, cls: "mark", html: `⋯ context compacted ${hhmmss(time)}Z ⋯` });
         mark++;
       }
+      const place = slotSeen.get(`${entry.ts}|${entry.role}`) ?? 0;
+      slotSeen.set(`${entry.ts}|${entry.role}`, place + 1);
+      const key = `card:${entry.ts}|${entry.role}|${place}`;
+      const own = tokensOf(entry);
+      const meta = this.metadata(entry);
+      const recorded = entry.role === "toolResult" && entry.toolCallId ? this.displaysByToolCall.get(entry.toolCallId) : undefined;
+      const paths = recorded ?? (meta.paths.length ? meta.paths : entry.role === "toolResult" ? this.displaysByText.get(meta.text) ?? [] : []);
+      const signature = `${own?.input},${own?.cacheRead},${own?.output}|${entry === openEntry ? openBlock : -1}|${paths.map(path => this.imagePaths.has(path) ? path : "").join(",")}`;
+      const cached = this.cardCache.get(entry);
+      this.displayIndex += meta.images;
+      if (cached?.signature === signature) {
+        cards.push({ kind: "card", key, turn: 0, cls: entry.role === "toolResult" ? "toolresult" : entry.role, html: cached.html });
+        continue;
+      }
       if (entry.role === "user") {
-        const text = entry.blocks.map(block => block.type === "text" ? block.text : "").join("\n");
-        body += `<div class="card user"><div class="head">USER PROMPT · ${hhmmss(entry.ts)}</div><div class="text">${esc(text.slice(0, 2500))}${text.length > 2500 ? " …[truncated]" : ""}</div></div>`;
+        const text = meta.text;
+        cards.push({ kind: "card", key, turn: 0, cls: "user", html: `<div class="head">USER PROMPT · ${hhmmss(entry.ts)}</div><div class="text">${esc(text.slice(0, 2500))}${text.length > 2500 ? " …[truncated]" : ""}</div>` });
       } else if (entry.role === "assistant") {
-        const own = tokensOf(entry);
         const tok = own
           ? `fresh ${own.input.toLocaleString()} · cached ${own.cacheRead.toLocaleString()} · out ${own.output.toLocaleString()} · ctx≈${ctxOf(own).toLocaleString()}`
           : `no usage — ${esc(entry.error ?? "no tokens reported")}`;
         if (!isCall(entry)) {
-          body += `<div class="card assistant"><div class="head">model call · ${hhmmss(entry.ts)} <span class="tok">${tok}</span></div><div class="text err">Request failed: ${esc(entry.error)}</div></div>`;
+          cards.push({ kind: "card", key, turn: 0, cls: "assistant", html: `<div class="head">model call · ${hhmmss(entry.ts)} <span class="tok">${tok}</span></div><div class="text err">Request failed: ${esc(entry.error)}</div>` });
+          this.cardCache.set(entry, { signature, html: cards[cards.length - 1]!.html });
           continue;
         }
         let inner = "";
         for (let index = 0; index < entry.blocks.length; index++) {
           const block = entry.blocks[index]!;
           if (block.type === "thinking") inner += `<details class="think"${entry === openEntry && index === openBlock ? " open" : ""}><summary>thinking</summary><pre>${esc(block.thinking)}</pre></details>`;
-          else if (block.type === "text") inner += `<div class="text">${linkify(block.text, this.runDir)}</div>`;
-          else if (block.type === "toolCall") inner += `<details class="tool"><summary>${esc(block.name)}</summary><pre>${linkify(block.code.length > 16000 ? `${block.code.slice(0, 16000)}\n…[truncated]` : block.code, this.runDir)}</pre></details>`;
+          else if (block.type === "text") inner += `<div class="text">${linkify(block.text, this.imagePaths)}</div>`;
+          else if (block.type === "toolCall") inner += `<details class="tool"><summary>${esc(block.name)}</summary><pre>${linkify(block.code.length > 16000 ? `${block.code.slice(0, 16000)}\n…[truncated]` : block.code, this.imagePaths)}</pre></details>`;
         }
-        body += `<div class="card assistant"><div class="head">model call · ${hhmmss(entry.ts)} <span class="tok">${tok}</span></div>${inner}</div>`;
+        cards.push({ kind: "card", key, turn: 0, cls: "assistant", html: `<div class="head">model call · ${hhmmss(entry.ts)} <span class="tok">${tok}</span></div>${inner}` });
       } else {
         let html = "";
+        let image = 0;
         for (const block of entry.blocks) {
           if (block.type === "image") {
-            const src = this.display[displayIndex++] ?? null;
-            html += src ? `<a href="${esc(src)}" target="_blank"><img class="shot" loading="lazy" src="${esc(src)}"></a>` : `<div class="text">🖼 (display artifact not recorded yet)</div>`;
+            const path = paths[image++];
+            const src = path && this.imagePaths.has(path) ? `/image?path=${encodeURIComponent(path)}` : null;
+            html += src ? `<a href="${esc(src)}" target="_blank" rel="noopener noreferrer"><img class="shot" loading="lazy" src="${esc(src)}"></a>` : `<div class="text">(display artifact not recorded or not uniquely matched yet)</div>`;
           } else if (block.type === "text") {
             html += `<pre class="res">${esc(block.text.slice(0, 6000))}${block.text.length > 6000 ? "\n…[truncated]" : ""}</pre>`;
           }
         }
-        body += `<div class="card toolresult"><div class="head">exec result · ${hhmmss(entry.ts)}</div>${html}</div>`;
+        cards.push({ kind: "card", key, turn: 0, cls: "toolresult", html: `<div class="head">exec result · ${hhmmss(entry.ts)}</div>${html}` });
+      }
+      this.cardCache.set(entry, { signature, html: cards[cards.length - 1]!.html });
+    }
+    return cards;
+  }
+
+  /** Context-growth sparkline card, empty until at least two model calls exist. */
+  private sparkHtml(): string {
+    const tokensOf = this.tokensOf;
+    const ctx = this.callList.map(tokensOf).map(tokens => tokens ? tokens.input + tokens.cacheRead : 0);
+    if (ctx.length < 2) return "";
+    const W = 560, H = 48, max = ctx.reduce((peak, value) => Math.max(peak, value), 1);
+    const points = ctx.map((value, index) => `${(index / (ctx.length - 1) * W).toFixed(1)},${(H - 4 - value / max * (H - 8)).toFixed(1)}`).join(" ");
+    const marks = this.compactionTimes.map(compaction => {
+      const index = this.callList.findIndex(call => call.ts > compaction.time);
+      if (index < 1) return "";
+      const x = (index / (this.callList.length - 1) * W).toFixed(1);
+      return `<line x1="${x}" y1="2" x2="${x}" y2="${H - 2}" stroke="#f96" stroke-dasharray="3 3"/>`;
+    }).join("");
+    const svg = `<svg class="spark" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><polyline fill="none" stroke="#6cf" stroke-width="1.5" points="${points}"/>${marks}</svg>`;
+    return `<div class="card answers"><div class="head">CONTEXT GROWTH · fresh+cached per model call${marks ? " · dashed = compaction" : ""}</div>${svg}</div>`;
+  }
+
+  /** Sidebar totals card; re-emitted only when its content changes so counters track the run live. */
+  private sidebarHtml(runName: string): string {
+    const entries = this.sortedEntries;
+    const window = entries.length ? `${hhmmss(entries[0]!.ts)}–${hhmmss(entries[entries.length - 1]!.ts)}Z` : "?";
+    const activity = [...this.methods.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
+      .map(([method, count]) => `${esc(method)} ${count}`).join(" · ");
+    const lastCompaction = this.compactionTimes[this.compactionTimes.length - 1];
+    const compactionNote = lastCompaction
+      ? `compaction ${hhmmss(lastCompaction.time)}Z${lastCompaction.originalLen !== null ? ` · ${(lastCompaction.originalLen / 1e6).toFixed(1)} MB → ${lastCompaction.summaryLen?.toLocaleString()} chars` : ""}${this.compactionTimes.length > 1 ? ` (${this.compactionTimes.length} total)` : ""}<br>`
+      : "";
+    const lastTurn = this.turns.length ? this.turns[this.turns.length - 1]!.turn : "unknown";
+    return `<b>${esc(runName)} run viewer</b><br>${esc(this.model)}<br>
+<b>${this.attemptCount}</b> model calls (${this.stubCount} failed) · observed turn <b>${lastTurn}</b> · ${this.endTurns} end_turn submissions<br>
+${this.ledger.present ? `main fresh ${this.ledger.input.toLocaleString()} · cached ${this.ledger.cacheRead.toLocaleString()} · out ${this.ledger.output.toLocaleString()} · reasoning ${this.ledger.reasoning.toLocaleString()}<br>
+${this.ledger.requests} requests · API estimate $${this.ledger.usd.toFixed(2)} (${this.ledger.unpriced} unpriced); not subscription charges<br>` : "usage ledger absent<br>"}
+ctx peak ${this.ctxPeak.v.toLocaleString()}${this.ctxPeak.v ? ` at call ${this.ctxPeak.i + 1}` : ""}<br>
+${compactionNote}final HTTP ${esc(this.finalFailure?.status ?? "—")}<br>
+${this.displayIndex} display images · window ${window}<br>${activity ? `activity: ${activity}<br>` : ""}<hr>`;
+  }
+
+  /** Drain tail events for this run state: appends in the steady state, a generation replay after a reparse. */
+  takeTail(runName = basename(this.runDir)): { events: TailEvent[]; restart: boolean } {
+    if (!this.dirty) return { events: [], restart: false };
+    this.dirty = false;
+    this.summarizeLedger();
+    const cards = this.computeCards();
+    const keys = [...this.tail.keys()];
+    let restart = this.restart;
+    if (!restart) {
+      restart = cards.length < keys.length;
+      for (let index = 0; !restart && index < keys.length; index++) {
+        if (keys[index] !== cards[index]?.key) restart = true;
       }
     }
-    if (!entries.length) {
-      body = `<div class="card answers"><div class="head">WAITING FOR RUN DATA</div><div class="text">No model transcript yet. Expected under ${esc(join(this.runDir, "player", "agents", "main"))}: *.jsonl session transcripts, plus usage.jsonl and history.jsonl. This page reloads itself while the dashboard runs.</div></div>`;
+    const events: TailEvent[] = [];
+    if (restart) {
+      if (!this.restart) this.generation++;
+      this.tail.clear(); this.singletons.clear();
+      events.push({ k: "gen", gen: this.generation });
     }
-    const surplus = this.display.length - displayIndex;
-    if (entries.length && surplus > 0) console.log(`[dashboard] ${surplus} display artifact(s) not yet matched to a tool result (run still growing?)`);
-    if (entries.length && surplus < 0) console.log(`[dashboard] ${-surplus} tool-result image(s) without a display artifact`);
+    for (const card of cards) {
+      if (!restart && this.tail.get(card.key) === card.html) continue;
+      this.tail.set(card.key, card.html);
+      if (card.kind === "turn") events.push({ k: "turn", turn: card.turn });
+      else events.push({ k: "card", id: card.key, cls: card.cls, b: card.html });
+    }
+    const side = this.sidebarHtml(runName);
+    if (restart || this.singletons.get("side") !== side) {
+      events.push({ k: "side", b: side });
+      this.singletons.set("side", side);
+    }
+    const spark = this.sparkHtml();
+    if (restart || this.singletons.get("spark") !== spark) {
+      events.push({ k: "spark", b: spark });
+      this.singletons.set("spark", spark);
+    }
+    this.restart = false;
+    return { events, restart };
+  }
 
-    const lastCompaction = compactionTimes[compactionTimes.length - 1];
-    const compactionNote = lastCompaction
-      ? `compaction ${hhmmss(lastCompaction.time)}Z${lastCompaction.originalLen !== null ? ` · ${(lastCompaction.originalLen / 1e6).toFixed(1)} MB → ${lastCompaction.summaryLen?.toLocaleString()} chars` : ""}${compactionTimes.length > 1 ? ` (${compactionTimes.length} total)` : ""}<br>`
-      : "";
-    const sidebarHead = `<b>${esc(runName)} run viewer</b><br>${esc(this.model)}<br>
-<b>${attempts.length}</b> model calls (${stubs.length} failed) · <b>${this.endTurns.length}</b> end_turns → ${this.endTurns.length + 1} turns<br>
-${this.ledger.present ? `main fresh ${this.ledger.input.toLocaleString()} · cached ${this.ledger.cacheRead.toLocaleString()} · out ${this.ledger.output.toLocaleString()} · reasoning ${this.ledger.reasoning.toLocaleString()}<br>
-${this.ledger.requests} requests · est $${this.ledger.usd.toFixed(2)} (${this.ledger.unpriced} unpriced)<br>` : "usage ledger absent<br>"}
-ctx peak ${peak.v.toLocaleString()}${peak.v ? ` at call ${peak.i + 1}` : ""}<br>
-${compactionNote}final HTTP ${esc(finalFailure?.status ?? "—")}<br>
-${displayIndex} display images · rebuilt in ${builtMs}ms<br>${activity ? `activity: ${activity}<br>` : ""}<hr>`;
-    sidebar = sidebarHead + sidebar;
-
-    return `<!doctype html><html><head><meta charset="utf-8">${refreshSeconds ? `<meta http-equiv="refresh" content="${refreshSeconds}">` : ""}<title>${esc(runName)} run viewer</title><style>
+  /** Static, same-origin EventSource viewer. Model content is escaped before insertion. */
+  shell(runName: string, nonce = ""): string {
+    const waiting = `<div id="waiting" class="card answers"><div class="head">WAITING FOR RUN DATA</div><div class="text">No model transcript yet. New content appears automatically while the dashboard runs.</div></div>`;
+    return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(runName)} run viewer</title><style>
 body{font-family:ui-monospace,Consolas,monospace;background:#111;color:#ddd;margin:0;display:flex}
 #side{width:250px;padding:10px;border-right:1px solid #333;height:100vh;overflow:auto;position:sticky;top:0;font-size:12px;line-height:1.5}
 #side a.toc{display:block;color:#8cf;text-decoration:none;padding:1px 4px}
@@ -404,121 +664,227 @@ a.imglink{color:#6cf;text-decoration:none;border-bottom:1px dotted #468}
 code{color:#9cd;background:#101010;padding:0 3px;border-radius:3px}
 #followbtn{position:fixed;right:12px;bottom:12px;z-index:9;padding:4px 10px;font:12px ui-monospace,Consolas,monospace;background:#223;color:#8cf;border:1px solid #556;border-radius:12px;cursor:pointer;opacity:.85}
 #followbtn:hover{opacity:1;background:#334}
-</style></head><body><div id="side">${sidebar}</div><div id="main">${sparkCard}${body}<div id="tail"></div></div>
-<script>(function(){
-var KEY="civ-viewer-follow",tail=document.getElementById("tail"),last=scrollY;
-var follow=function(){return sessionStorage.getItem(KEY)!=="0"};
-addEventListener("scroll",function(){
-  if(innerHeight+scrollY>=document.documentElement.scrollHeight-64)sessionStorage.setItem(KEY,"1");
-  else if(scrollY<last)sessionStorage.setItem(KEY,"0");
-  last=scrollY;
-  btn.textContent=follow()?"follow":"pinned";
-});
-var btn=document.createElement("button");
-btn.id="followbtn";
-btn.textContent=follow()?"follow":"pinned";
-btn.onclick=function(){
-  var next=!follow();
-  sessionStorage.setItem(KEY,next?"1":"0");
-  btn.textContent=next?"follow":"pinned";
-  if(next)tail.scrollIntoView({block:"end"});
-};
-document.body.appendChild(btn);
-onbeforeunload=function(){sessionStorage.setItem("civ-viewer-scroll",String(scrollY))};
-addEventListener("load",function(){
-  if(follow())tail.scrollIntoView({block:"end"});
-  else{var at=sessionStorage.getItem("civ-viewer-scroll");if(at!==null)scrollTo(0,+at)}
-  setTimeout(function(){if(follow()&&innerHeight+scrollY<document.documentElement.scrollHeight-64)tail.scrollIntoView({block:"end"})},400);
-});
-})();</script></body></html>`;
+</style></head><body><div id="side"><div id="status" role="status">connecting</div><div id="sidehead">loading…</div><div id="toc"></div></div><div id="main"><div id="sparkwrap"></div><div id="stream">${waiting}</div><div id="tail"></div></div>
+<script nonce="${esc(nonce)}">
+const stream=document.getElementById("stream"),sparkWrap=document.getElementById("sparkwrap"),sideHead=document.getElementById("sidehead"),toc=document.getElementById("toc"),tail=document.getElementById("tail"),status=document.getElementById("status");
+const nodes=new Map(),opened=new Map();
+let following=sessionStorage.getItem("civ-viewer-follow")!=="0",frame=0,lastY=scrollY,replay=false,pinnedY=0,turnIndex=0,applying=false;
+function schedule(){if(frame)return;frame=requestAnimationFrame(()=>{frame=0;if(following)tail.scrollIntoView({block:"end"});else if(replay)scrollTo(0,pinnedY);});}
+function remember(id,node){opened.set(id,Array.from(node.querySelectorAll("details"),d=>d.open));}
+function apply(x){
+  if(x.k==="gen"){
+    nodes.forEach((node,id)=>remember(id,node));
+    pinnedY=scrollY;replay=true;stream.innerHTML=${JSON.stringify(waiting)};nodes.clear();toc.replaceChildren();sparkWrap.replaceChildren();turnIndex=0;return;
   }
+  if(x.k==="turn"){
+    document.getElementById("waiting")?.remove();
+    const h=document.createElement("h3");h.id="turn-"+turnIndex++;h.textContent=x.turn===null?"— turn not yet observed —":"— turn "+x.turn+" —";stream.append(h);
+    const a=document.createElement("a");a.className="toc";a.href="#"+h.id;a.textContent=x.turn===null?"turn unknown":"turn "+x.turn;toc.append(a);
+  }else if(x.k==="card"){
+    document.getElementById("waiting")?.remove();
+    const old=nodes.get(x.id);if(old)remember(x.id,old);
+    const d=document.createElement("div");d.className="card "+x.cls;d.dataset.card=x.id;d.innerHTML=x.b;
+    const state=opened.get(x.id);if(state)d.querySelectorAll("details").forEach((detail,i)=>{if(i<state.length)detail.open=state[i];});
+    if(old)old.replaceWith(d);else stream.append(d);nodes.set(x.id,d);
+  }else if(x.k==="spark")sparkWrap.innerHTML=x.b;
+  else if(x.k==="side")sideHead.innerHTML=x.b;
 }
+const btn=document.createElement("button");btn.id="followbtn";
+function setFollow(value){following=value;sessionStorage.setItem("civ-viewer-follow",value?"1":"0");btn.textContent=value?"follow":"pinned";}
+setFollow(following);btn.onclick=()=>{setFollow(!following);if(following)schedule();};document.body.append(btn);
+addEventListener("wheel",event=>{if(event.deltaY<0)setFollow(false);},{passive:true});
+addEventListener("scroll",()=>{if(!applying&&!replay&&scrollY<lastY)setFollow(false);lastY=scrollY;},{passive:true});
+toc.addEventListener("click",()=>setFollow(false));
+stream.addEventListener("load",()=>{if(following)schedule();},true);
+const events=new EventSource("/events");
+events.addEventListener("tail",event=>{applying=true;JSON.parse(event.data).forEach(apply);applying=false;schedule();});
+events.addEventListener("status",event=>{const state=JSON.parse(event.data).state;status.textContent=state==="running"?"LIVE · running":state==="waiting"?"LIVE · waiting for run data":"LIVE · read error (retrying)";schedule();requestAnimationFrame(()=>{replay=false;for(const id of opened.keys())if(!nodes.has(id))opened.delete(id);});});
+events.onerror=()=>{status.textContent="disconnected · reconnecting";};
+addEventListener("beforeunload",()=>events.close());
+</script></body></html>`;
+  }
 
-function turnOf(ts: string, ends: string[]): number {
-  let turn = 1;
-  for (const at of ends) if (ts > at) turn++;
-  return turn;
 }
 
 /** Single-pass image-path linkifier: emitted markup is never rescanned. */
-function linkify(text: string, runDir: string): string {
+function linkify(text: string, images: Set<string>): string {
   let out = "";
-  const pattern = /(?:\.executions\/[^'"\\\s]+\/display-\d+\.(?:png|jpg))|(?:[\w-]+\.(?:png|jpg))/gi;
+  const pattern = IMAGE_REFERENCE;
+  pattern.lastIndex = 0;
   let last = 0, match: RegExpExecArray | null;
   while ((match = pattern.exec(text))) {
     out += esc(text.slice(last, match.index));
-    const path = match[0];
-    if (/^\.executions\//i.test(path)) out += `<a class="imglink" href="workspaces/main/${esc(path.replaceAll("\\", "/"))}" target="_blank">🖼 display</a>`;
-    else if (existsSync(join(runDir, "workspaces", "main", path))) out += `<a class="imglink" href="workspaces/main/${esc(path)}" target="_blank">🖼 ${esc(path)}</a>`;
-    else out += esc(path);
-    last = match.index + match[0].length;
+    const shown = match[0];
+    const path = shown.startsWith(".executions/") ? `workspaces/main/${shown}` : shown.startsWith("executions/") ? `artifacts/${shown}` : shown;
+    out += images.has(path)
+      ? `<a class="imglink" href="/image?path=${encodeURIComponent(path)}" target="_blank" rel="noopener noreferrer">${esc(shown)}</a>`
+      : esc(shown);
+    last = match.index + shown.length;
   }
   return out + esc(text.slice(last));
 }
 
-function writeAtomic(target: string, html: string): void {
-  const temporary = `${target}.${randomUUID()}.tmp`;
-  try {
-    writeFileSync(temporary, html);
-    renameSync(temporary, target);
-  } catch (error) {
-    try { renameSync(temporary, `${target}.${randomUUID()}.tmp`); } catch { /* nothing to clean */ }
-    throw error;
-  }
+interface DashboardClient {
+  send(frame: Uint8Array): void;
+  replay(frames: Uint8Array[]): void;
+  close(): void;
 }
 
-/** Poll the run's ledgers and regenerate viewer.html whenever they change. Returns on SIGINT. */
-export async function runDashboard(runDir: string, interval: number): Promise<void> {
+/** Loopback-only, read-only viewer. interval is in seconds; close is idempotent. */
+export async function startDashboard(runDir: string, interval: number): Promise<{ url: string; close(): Promise<void> }> {
+  if (!Number.isFinite(interval) || interval <= 0 || interval * 1000 > 2_147_483_647) throw new Error("Dashboard interval must be positive seconds within the timer range");
+  runDir = resolve(runDir);
   const view = new RunView();
-  const target = join(runDir, "viewer.html");
-  console.log(`Dashboard watching ${runDir} (poll every ${interval}s); Ctrl+C to stop.`);
-  let signature = "", stopped = false, lastWaiting: boolean | null = null;
-  let wake: (() => void) | undefined;
-  const namedInterrupt = (): void => { stopped = true; wake?.(); };
-  process.on("SIGINT", namedInterrupt);
-  const sleep = (ms: number): Promise<void> => {
-    const { promise, resolve } = Promise.withResolvers<void>();
-    const timer = setTimeout(() => { if (wake === stop) wake = undefined; resolve(); }, ms);
-    const stop = (): void => { clearTimeout(timer); if (wake === stop) wake = undefined; resolve(); };
-    wake = stop;
-    return promise;
-  };
-  const inputs = (): { sig: string; transcripts: number; dir: boolean } => {
-    const mainDir = join(runDir, "player", "agents", "main");
-    const stat = (path: string): string => {
-      try { const info = statSync(path); return `${info.size}:${info.mtimeMs}`; } catch { return "-"; }
-    };
-    const parts: string[] = [];
-    let transcripts = 0;
+  const encoder = new TextEncoder();
+  const frames = new Map<string, Uint8Array>();
+  const clients = new Set<DashboardClient>();
+  let state = "waiting", stopped = false, turnKey = 0;
+  let timer: NodeJS.Timeout | undefined;
+  let active: Promise<void> = Promise.resolve();
+  const statusFrame = (): Uint8Array => encoder.encode(`event: status\ndata: ${JSON.stringify({ state })}\n\n`);
+  frames.set("gen", encoder.encode(`event: tail\ndata: [{"k":"gen","gen":${view.generation}}]\n\n`));
+  const cycle = async (): Promise<void> => {
+    let tail: { events: TailEvent[]; restart: boolean } = { events: [], restart: false };
+    const previous = state;
     try {
-      for (const name of readdirSync(mainDir).sort()) {
-        if (!name.endsWith(".jsonl") || name === "provider.jsonl" || name === "native.jsonl") continue;
-        parts.push(name, stat(join(mainDir, name)));
-        transcripts++;
+      await view.refresh(runDir);
+      tail = view.takeTail();
+      state = view.entries.length ? "running" : "waiting";
+    } catch {
+      // Do not send raw filesystem/provider error text to the browser.
+      state = "error";
+    }
+    if (stopped) return;
+    if (tail.restart) { frames.clear(); turnKey = 0; }
+    const changed: Uint8Array[] = [];
+    for (const event of tail.events) {
+      const frame = encoder.encode(`event: tail\ndata: ${JSON.stringify([event])}\n\n`);
+      const key = event.k === "card" ? event.id : event.k === "turn" ? `turn:${turnKey++}` : event.k;
+      frames.set(key, frame);
+      changed.push(frame);
+    }
+    if (tail.restart) {
+      const full = [...frames.values(), statusFrame()];
+      for (const client of clients) client.replay(full);
+    } else {
+      for (const frame of changed) for (const client of clients) client.send(frame);
+      if (changed.length || previous !== state) {
+        const status = statusFrame();
+        for (const client of clients) client.send(status);
       }
-    } catch { /* missing directory */ }
-    parts.push(stat(join(runDir, "usage.jsonl")), stat(join(runDir, "history.jsonl")));
-    for (const journal of ["provider.jsonl", "native.jsonl"]) parts.push(stat(join(mainDir, journal)));
-    return { sig: parts.join("|"), transcripts, dir: existsSync(runDir) };
+    }
   };
-  while (!stopped) {
-    const state = inputs();
-    const waiting = !state.dir || state.transcripts === 0;
-    const changed = state.sig !== signature;
-    signature = state.sig;
-    if (waiting !== lastWaiting) {
-      lastWaiting = waiting;
-      console.log(waiting ? `[dashboard] waiting for run data in ${runDir}` : `[dashboard] run data found`);
-    }
-    if (state.dir && changed) {
-      const started = performance.now();
-      try {
-        await view.refresh(runDir);
-        writeAtomic(target, view.render(interval, Math.round(performance.now() - started)));
-        console.log(`[dashboard] viewer.html ${waiting ? "waiting page" : "rebuilt"} in ${Math.round(performance.now() - started)}ms · ${view.read.toLocaleString()} bytes read`);
-      } catch (error) { console.error(`[dashboard] rebuild failed: ${error instanceof Error ? error.message : String(error)}`); }
-    }
-    await sleep(interval * 1000);
+  await cycle();
+  const nonce = randomUUID();
+  const shell = view.shell(basename(runDir), nonce);
+  const security = {
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`,
+  };
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    idleTimeout: 0,
+    fetch(request, server) {
+      const url = new URL(request.url);
+      const origin = request.headers.get("origin");
+      if (request.headers.get("host") !== server.url.host || (origin && origin !== server.url.origin) ||
+        request.headers.get("sec-fetch-site") === "cross-site") return new Response("Forbidden", { status: 403, headers: security });
+      if (request.method !== "GET") return new Response("Method not allowed", { status: 405, headers: { ...security, Allow: "GET" } });
+      if (url.pathname === "/") return new Response(shell, { headers: { ...security, "Content-Type": "text/html; charset=utf-8" } });
+      if (url.pathname === "/image") {
+        const path = url.searchParams.get("path") ?? "";
+        const file = view.imagePath(path);
+        if (!file) return new Response("Not found", { status: 404, headers: security });
+        return new Response(Bun.file(file), { headers: { ...security, "Content-Type": /\.jpe?g$/i.test(path) ? "image/jpeg" : "image/png" } });
+      }
+      if (url.pathname !== "/events") return new Response("Not found", { status: 404, headers: security });
+      if (clients.size >= 16) return new Response("Too many viewers", { status: 503, headers: security });
+      let client: DashboardClient;
+      let controller: ReadableStreamDefaultController<Uint8Array>;
+      let initial = [...frames.values(), statusFrame()], index = 0, offset = 0;
+      let pending: Uint8Array[] = [], pendingBytes = 0, ended = false;
+      const flush = (): void => {
+        if (ended || !controller || (controller.desiredSize ?? 0) <= 0) return;
+        if (index >= initial.length) {
+          initial = pending; pending = []; pendingBytes = 0; index = 0; offset = 0;
+        }
+        const frame = initial[index];
+        if (!frame) return;
+        const end = Math.min(offset + 64 * 1024, frame.length);
+        const chunk = frame.subarray(offset, end);
+        offset = end;
+        if (offset === frame.length) { index++; offset = 0; }
+        // Bun can pull synchronously from enqueue: publish the new cursor first.
+        controller.enqueue(chunk);
+      };
+      const abort = (): void => client.close();
+      client = {
+        send(frame) {
+          if (ended) return;
+          // A slow viewer may reconnect, but may never accumulate unbounded updates.
+          if (pendingBytes + frame.length > 4 * 1024 * 1024) { client.close(); return; }
+          pending.push(frame); pendingBytes += frame.length; flush();
+        },
+        replay(next) {
+          if (ended) return;
+          // Never splice a generation into the middle of an in-flight SSE frame.
+          if (offset !== 0) { client.close(); return; }
+          initial = next; index = 0; pending = []; pendingBytes = 0; flush();
+        },
+        close() {
+          if (ended) return;
+          ended = true; clients.delete(client); initial = []; pending = [];
+          request.signal.removeEventListener("abort", abort);
+          try { controller.close(); } catch { /* consumer already cancelled */ }
+        },
+      };
+      const stream = new ReadableStream<Uint8Array>({
+        start(value) {
+          controller = value; clients.add(client);
+          request.signal.addEventListener("abort", abort, { once: true });
+          if (request.signal.aborted) client.close(); else flush();
+        },
+        pull() { flush(); },
+        cancel() { client.close(); },
+      }, { highWaterMark: 1 });
+      return new Response(stream, { headers: { ...security, "Content-Type": "text/event-stream", Connection: "keep-alive", "X-Accel-Buffering": "no" } });
+    },
+  });
+  const schedule = (): void => {
+    timer = setTimeout(() => {
+      active = cycle().finally(() => { if (!stopped) schedule(); });
+    }, interval * 1000);
+  };
+  schedule();
+  const heartbeat = setInterval(() => {
+    const frame = encoder.encode(": keepalive\n\n");
+    for (const client of clients) client.send(frame);
+  }, 15_000);
+  let closing: Promise<void> | undefined;
+  return {
+    url: server.url.href,
+    close() {
+      if (closing) return closing;
+      stopped = true; clearTimeout(timer); clearInterval(heartbeat);
+      for (const client of clients) client.close();
+      closing = (async () => { await active; await server.stop(true); })();
+      return closing;
+    },
+  };
+}
+
+/** Keep the read-only viewer alive until terminal shutdown. */
+export async function runDashboard(runDir: string, interval: number): Promise<void> {
+  const dashboard = await startDashboard(runDir, interval);
+  console.log(`Dashboard: ${dashboard.url}\nWatching ${runDir} every ${interval}s; Ctrl+C to stop.`);
+  const { promise, resolve: stop } = Promise.withResolvers<void>();
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  try { await promise; } finally {
+    process.off("SIGINT", stop); process.off("SIGTERM", stop);
+    await dashboard.close();
   }
-  process.off("SIGINT", namedInterrupt);
 }

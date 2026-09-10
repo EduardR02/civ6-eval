@@ -95,3 +95,23 @@ test("streamed native items survive a Codex terminal response with empty output"
   expect(state.items.slice(0, 2)).toEqual([reasoning, call]);
   expect(state.completedCalls).toEqual(["call_fixture"]);
 });
+
+test("request journal records only newly appended items, not the whole input each call", async () => {
+  const { create, runDir } = fixture(() => sse([{ type: "response.completed", response: { status: "completed", output: [] } }]));
+  const native = create();
+  const first = { role: "user" as const, content: "first observation", timestamp: 1 };
+  const second = { role: "user" as const, content: "second observation", timestamp: 2 };
+  expect((await native.stream({ messages: [first] }).result()).stopReason).toBe("stop");
+  expect((await native.stream({ messages: [first, second] }).result()).stopReason).toBe("stop");
+  const requests = readFileSync(join(runDir, "player", "agents", "main", "native.jsonl"), "utf8")
+    .trimEnd().split("\n").map(line => JSON.parse(line) as Record<string, unknown>)
+    .filter(entry => entry.kind === "request");
+  expect(requests).toHaveLength(2);
+  // The second call must not re-journal the first turn: that squared the log with run length.
+  expect(requests[1]!.appendedFrom).toBe(requests[0]!.items);
+  expect(JSON.stringify(requests[1]!.appended)).not.toContain("first observation");
+  expect(JSON.stringify(requests[1]!.appended)).toContain("second observation");
+  // The envelope still reports the true request size so accounting stays auditable.
+  expect(requests[1]!.items).toBeGreaterThan(requests[0]!.items as number);
+  expect(requests[1]!.bytes).toBeGreaterThan(0);
+});

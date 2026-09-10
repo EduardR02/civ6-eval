@@ -1,24 +1,35 @@
 """Persistent Astra Python runtime. The OS sandbox, not Python restrictions, is the boundary.
 
-Namespace and files in /workspace survive executions; reset loses only the namespace.
+Namespace and files in /workspace survive executions and model compaction; process restart loses the namespace.
 Top-level await works. A final expression is displayed, and display(image) emits a compressed JPEG (full=True for lossless PNG).
 All live interaction is synchronous, permission-checked host RPC (no sandbox network):
+
+    state = civ.snapshot(include=["core", "units", "cities"])  # omitted sections are absent
+    pending = civ.decisions()                     # bounded choices; distinguish required/optional/UI
+    choices = civ.options(unitId=unit_id)         # use an observed owned unit's id
+    detail = civ.options(unitId=unit_id, operation="BUILD_IMPROVEMENT", targets=True)
+    path = civ.path(unitId=unit_id, x=target_x, y=target_y)  # native path, not promised success
+    # After choosing and checking parameters:
+    # civ.decide(id=decision_id, choice=chosen_value)
+    # civ.action(actions=chosen_actions, expectedTurn=state["turn"])
+    # Observations after submission may still be pending; branch/reobserve when needed.
+    history.note(text="An optional model-authored observation or reminder.")
+    capabilities = civ.probe()                    # schemas, ruleset presence and bridge support
 
     import pyautogui as pg
     image = pg.screenshot()              # PIL.Image, Civ client area only
     display(image.crop((0, 0, 600, 400)))
     pg.click(300, 250)                    # always client-relative coordinates
-    state = civ.snapshot()
-    help(civ)                            # discovery: bridge defines argument schemas
     child = agent.spawn("Inspect the shared screenshot", name="observer")
     result = agent.wait(id=child["id"], timeoutMs=60000)
     artifact.write(name="notes.txt", content="observations")
-    rpc("history.search", query="previous turn")
 
-civ.snapshot/inspect/rules/action and artifact/history methods accept keyword args.
+civ, artifact and history methods accept keyword args; help(civ) and dir(civ) list them.
 Use rpc(method, dict) for every host method, including future discovery operations.
 RPC can be awaited via asyncio.to_thread(rpc, method, args); calls are serialized.
 No code is automatically retried. Python exceptions preserve prior side effects.
+A submitted action is not a completed one, and a batch is never replayed for you.
+Each execution's full stdout/stderr are saved under /workspace/.executions/<id>/.
 """
 import ast
 import asyncio
@@ -100,9 +111,9 @@ def _read():
 def rpc(method, args=None, **kwargs):
     """Call a permission-checked host method synchronously; failures raise RuntimeError.
 
-    rpc('civ.inspect', {'kind': 'unit', 'id': 12})
+    rpc('civ.inspect', {'id': '<gameId>:unit:0:196608'})
     rpc('artifact.read', name='notes.txt')
-    Host schemas are authoritative; use civ.rules()/civ.inspect() for discovery.
+    Host schemas are authoritative; civ.probe() publishes them and the live action catalog.
     """
     global _rpc_sequence
     if not isinstance(method, str) or not method:
@@ -318,10 +329,11 @@ def _install_pyautogui():
 _namespace = {
     "__name__": "__astra__", "__builtins__": builtins,
     "rpc": rpc, "display": display,
-    "civ": Service("civ", ("snapshot", "inspect", "rules", "action", "keybinds", "dismiss_notifications")),
+    "civ": Service("civ", ("probe", "snapshot", "inspect", "options", "path", "decisions", "decide",
+                           "action", "rules", "keybinds", "dismiss_notifications")),
     "agent": Agents(),
     "artifact": Service("artifact", ("read", "write", "list")),
-    "history": Service("history", ("search", "read")),
+    "history": Service("history", ("search", "read", "note")),
     "pyautogui": _install_pyautogui(),
 }
 

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Player } from "../player.ts";
 import { createRuntime } from "./auth.ts";
+import { NativeResponses } from "./native.ts";
 import { ProviderCompletions } from "./provider.ts";
 import type { PlayerEvent, PlayerOptions } from "../contracts.ts";
 
@@ -135,6 +136,44 @@ test("profile changes and unsupported effort reject before transport", async () 
   await expect(createRuntime({ ...options, model: "glm-5.1" })).rejects.toThrow();
   await expect(createRuntime({ ...options, baseUrl: "http://127.0.0.1:1/v1" })).rejects.toThrow("new run");
   expect(bodies).toHaveLength(1);
+});
+
+test("muse responses model binds catalog data and rejects unsupported max effort", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civ-muse-"));
+  cleanups.push(async () => rmSync(runDir, { recursive: true, force: true }));
+  const options: PlayerOptions = { runDir, projectRoot: process.cwd(), provider: "opencode-go", apiKey: "fixture-only", model: "muse-spark-1.3-contributor", effort: "high", rpc: async () => ({ files: [] }), execute: async () => ({ content: [] }) };
+  const { runtime, model } = await createRuntime(options);
+  expect(model.api).toBe("openai-responses");
+  expect(model.baseUrl).toBe("https://opencode.ai/zen/go/v1");
+  expect(model.contextWindow).toBe(1048576);
+  expect(model.maxTokens).toBe(131072);
+  expect(model.cost).toEqual({ input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 });
+  expect(model.thinkingLevelMap?.high).toBe("high");
+  expect(model.thinkingLevelMap?.max).toBe(null);
+  expect(runtime.getModel("opencode-go", "glm-5.3-flash")?.api).toBe("openai-completions");
+  await expect(createRuntime({ ...options, effort: "max" })).rejects.toThrow("does not support reasoning effort max");
+  await expect(createRuntime({ ...options, model: "muse-spark-1.2-contributor" })).rejects.toThrow("new run");
+  expect(JSON.parse(readFileSync(join(runDir, "player", "profile.json"), "utf8"))).toMatchObject({ provider: "opencode-go", model: "muse-spark-1.3-contributor", baseUrl: "https://opencode.ai/zen/go/v1", effort: "high", pricingKnown: true });
+});
+
+test("opencode-go native requests carry stable session attribution", async () => {
+  const seen: { url: string; headers: Record<string, string> }[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request) {
+    seen.push({ url: request.url, headers: Object.fromEntries(request.headers) });
+    return new Response(`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [], usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4 } } })}\n\n`, { headers: { "content-type": "text/event-stream" } });
+  } });
+  cleanups.push(async () => server.stop(true));
+  const runDir = mkdtempSync(join(tmpdir(), "civ-session-"));
+  cleanups.push(async () => rmSync(runDir, { recursive: true, force: true }));
+  const options: PlayerOptions = { runDir, projectRoot: process.cwd(), provider: "opencode-go", apiKey: "fixture-only", model: "muse-spark-1.3-contributor", effort: "high", baseUrl: `http://127.0.0.1:${server.port}/v1`, rpc: async () => ({ files: [] }), execute: async () => ({ content: [] }) };
+  const { runtime, model } = await createRuntime(options);
+  const native = new NativeResponses("main", options, runtime, model, () => {}, () => {});
+  await native.stream({ messages: [{ role: "user", content: "reply ok", timestamp: 1 }] }).result();
+  expect(seen[0]!.url.endsWith("/responses")).toBe(true);
+  expect(seen[0]!.headers["x-opencode-session"]).toMatch(/^main-[0-9a-f]{24}$/);
+  expect(seen[0]!.headers["x-opencode-client"]).toBe("pi");
+  expect(seen[0]!.headers["user-agent"]).toBe("civ6-player/pi-0.84.4");
+  expect(seen[0]!.headers.authorization).toBe("Bearer fixture-only");
 });
 
 test("absent primary counters remain unknown while explicit zeros are reported", async () => {

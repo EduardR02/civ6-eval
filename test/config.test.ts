@@ -36,6 +36,18 @@ test("unknown options and non-object configuration fail rather than silently cha
   await expect(loadConfig(directory)).rejects.toThrow("JSON object");
 });
 
+test("unlimited calls require an explicit opt-in rather than an invalid numeric ceiling", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "civ-calls-"));
+  directories.push(directory);
+  const file = join(directory, "civ6.config.json");
+  await writeFile(file, JSON.stringify({ maxModelCalls: "unlimited" }));
+  expect((await loadConfig(directory)).maxModelCalls).toBe("unlimited");
+  for (const value of [0, -1, 1.5, null, "Infinity", "unlimted"]) {
+    await writeFile(file, JSON.stringify({ maxModelCalls: value }));
+    await expect(loadConfig(directory)).rejects.toThrow("maxModelCalls");
+  }
+});
+
 test("per-provider compaction thresholds must be positive integers keyed by known providers", async () => {
   const directory = await mkdtemp(join(tmpdir(), "civ-config-"));
   directories.push(directory);
@@ -67,6 +79,8 @@ test("CLI rejects invalid arguments before opening a run", async () => {
   for (const [args, message] of [
     [["play", "--unknown"], "Unknown option"],
     [["play", "--calls"], "--calls requires a value"],
+    [["play", "--calls", "0"], "--calls must be a positive integer or unlimited"],
+    [["play", "--calls", "Infinity"], "--calls must be a positive integer or unlimited"],
     [["usage"], "usage requires --run"],
     [["usage", "--run", "unused", "--json", "true"], "Unexpected argument"],
     [["play", "--run", "a", "--resume", "b"], "mutually exclusive"],

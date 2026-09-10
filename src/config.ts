@@ -15,7 +15,7 @@ export interface Config {
   tunerHost: string;
   tunerPort: number;
   maxConcurrentAgents: number;
-  maxModelCalls: number;
+  maxModelCalls: number | "unlimited";
   compactThreshold: number;
   compactThresholds?: Record<string, number>;
   runsDir: string;
@@ -41,8 +41,11 @@ export async function loadConfig(projectRoot: string, filename?: string): Promis
   for (const key of ["model", "authPath", "pythonPath", "distro", "tunerHost", "runsDir"] as const) {
     if (typeof config[key] !== "string" || !config[key].trim()) throw new Error(`${key} must be a nonempty string`);
   }
-  for (const key of ["tunerPort", "maxConcurrentAgents", "maxModelCalls", "compactThreshold"] as const) {
+  for (const key of ["tunerPort", "maxConcurrentAgents", "compactThreshold"] as const) {
     if (!Number.isSafeInteger(config[key]) || config[key] <= 0) throw new Error(`${key} must be a positive integer`);
+  }
+  if (config.maxModelCalls !== "unlimited" && (!Number.isSafeInteger(config.maxModelCalls) || config.maxModelCalls <= 0)) {
+    throw new Error("maxModelCalls must be a positive integer or unlimited");
   }
   if (config.compactThresholds !== undefined) {
     const thresholds = config.compactThresholds;
