@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, writeFile, rm, readdir, readFile } from "node:fs/promises";
+import { mkdtemp, writeFile, rm, readdir, readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { pathToFileURL } from "node:url";
@@ -7,6 +7,33 @@ import { loadConfig } from "../src/config.ts";
 
 const directories: string[] = [];
 afterEach(async () => { for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true }); });
+
+test("request limits are validated at load and absent means no added retention policy", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "civ-limits-"));
+  directories.push(directory);
+  const file = join(directory, "civ6.config.json");
+  expect((await loadConfig(directory)).requestLimits).toBeUndefined();
+  await writeFile(file, JSON.stringify({ requestLimits: { maxImages: 12, retainedImages: 3, maxBytes: 8_000_000 } }));
+  expect((await loadConfig(directory)).requestLimits).toEqual({ maxImages: 12, retainedImages: 3, maxBytes: 8_000_000 });
+  for (const limits of [{ maxImages: 0 }, { maxBytes: 1.5 }, { maxImages: -1 }, { retainedImages: 3 }, { maxImages: 2, retainedImages: 3 }, { maxBytes: "9000" }, []]) {
+    await writeFile(file, JSON.stringify({ requestLimits: limits }));
+    await expect(loadConfig(directory)).rejects.toThrow("requestLimits");
+  }
+  await writeFile(file, JSON.stringify({ requestLimits: { maxImage: 45 } }));
+  await expect(loadConfig(directory)).rejects.toThrow("Unknown requestLimits key");
+});
+
+test("the default expert guide path is the canonical guide that exists", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "civ-guide-"));
+  directories.push(directory);
+  const file = join(directory, "empty.json");
+  await writeFile(file, "{}");
+  // The default is relative to the project root, so load an empty configuration from the real one.
+  const root = resolve(import.meta.dir, "..");
+  const config = await loadConfig(root, file);
+  expect(config.expertGuidePath).toBe(resolve(root, "guides", "herson-bbg", "SKILL.md"));
+  expect((await stat(config.expertGuidePath)).isFile()).toBe(true);
+});
 
 test("ambient API credentials cannot switch a subscription player to API billing", async () => {
   const directory = await mkdtemp(join(tmpdir(), "civ-config-"));
@@ -65,6 +92,17 @@ test("per-provider compaction thresholds must be positive integers keyed by know
   await expect(loadConfig(directory)).rejects.toThrow("compactThresholds must be an object");
 });
 
+test("completion mode defaults to explicit and rejects unknown values", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "civ-config-"));
+  directories.push(directory);
+  const file = join(directory, "civ6.config.json");
+  expect((await loadConfig(directory)).completionMode).toBe("explicit");
+  await writeFile(file, JSON.stringify({ completionMode: "response" }));
+  expect((await loadConfig(directory)).completionMode).toBe("response");
+  await writeFile(file, JSON.stringify({ completionMode: "always" }));
+  await expect(loadConfig(directory)).rejects.toThrow("completionMode must be explicit or response");
+});
+
 async function cli(args: string[]) {
   const child = Bun.spawn([process.execPath, resolve(import.meta.dir, "../src/cli.ts"), ...args], {
     stdout: "pipe", stderr: "pipe", env: { ...process.env, OPENAI_API_KEY: "" },
@@ -81,6 +119,8 @@ test("CLI rejects invalid arguments before opening a run", async () => {
     [["play", "--calls"], "--calls requires a value"],
     [["play", "--calls", "0"], "--calls must be a positive integer or unlimited"],
     [["play", "--calls", "Infinity"], "--calls must be a positive integer or unlimited"],
+    [["play", "--completion"], "--completion requires a value"],
+    [["play", "--completion", "always"], "--completion must be explicit or response"],
     [["usage"], "usage requires --run"],
     [["usage", "--run", "unused", "--json", "true"], "Unexpected argument"],
     [["play", "--run", "a", "--resume", "b"], "mutually exclusive"],
@@ -92,6 +132,115 @@ test("CLI rejects invalid arguments before opening a run", async () => {
     expect(result.stderr).toContain(message);
     expect(result.stdout).not.toContain("Run:");
   }
+});
+
+
+test("CLI play treats a progress-only turn as undeclared and reports the durable declaration", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "civ-play-cli-"));
+  directories.push(directory);
+  const bodies: string[] = [];
+  const sse = (payloads: unknown[]) => new Response(payloads.map(payload => `data: ${JSON.stringify(payload)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "Content-Type": "text/event-stream" } });
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    bodies.push(await request.text());
+    const declare = bodies.length === 2;
+    const delta = declare
+      ? { tool_calls: [{ index: 0, id: "call_finish", type: "function", function: { name: "finish_task", arguments: JSON.stringify({ status: "completed", reason: "Turn 70 held; next turn queued" }) } }] }
+      : { content: "Turn 70 progress report; the game is still active." };
+    return sse([
+      { id: "fixture", object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: null }] },
+      { id: "fixture", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: declare ? "tool_calls" : "stop" }] },
+    ]);
+  } });
+  try {
+    const runDir = join(directory, "run");
+    const configPath = join(directory, "config.json");
+    await writeFile(configPath, JSON.stringify({
+      provider: "opencode-go", model: "glm-5.3-flash", effort: "high", completionMode: "explicit", maxModelCalls: 2,
+      baseUrl: `http://127.0.0.1:${server.port}/v1`, authPath: join(directory, "missing-auth.json"),
+      pythonPath: join(directory, "missing-python.exe"), distro: "no-live-sandbox", runsDir: join(directory, "runs"),
+    }));
+    const child = Bun.spawn([process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "play", "--config", configPath, "--run", runDir, "--prompt", "play the game"], {
+      stdout: "pipe", stderr: "pipe", env: { ...process.env, OPENCODE_API_KEY: "fixture-only", OPENAI_API_KEY: "" },
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe("");
+    // The progress report bought exactly one reminder, and the declaration ended the run.
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toContain("[harness protocol]");
+    expect(stdout).toContain("No task declaration in that turn; sending the single protocol reminder.");
+    expect(stdout).toContain("Task completed: Turn 70 held; next turn queued");
+    const registry = JSON.parse(await readFile(join(runDir, "player", "agents.json"), "utf8")) as { agents: { id: string; status: string; task?: { outcome: string; repair: boolean } }[] };
+    expect(registry.agents.find(agent => agent.id === "main")).toMatchObject({ status: "completed", task: { outcome: "completed", repair: true } });
+  } finally { server.stop(true); }
+});
+
+test("CLI play --completion response keeps the one-shot contract", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "civ-play-cli-"));
+  directories.push(directory);
+  const bodies: string[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    bodies.push(await request.text());
+    const payloads = [
+      { id: "fixture", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: "Still playing; report later." }, finish_reason: null }] },
+      { id: "fixture", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ];
+    return new Response(payloads.map(payload => `data: ${JSON.stringify(payload)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "Content-Type": "text/event-stream" } });
+  } });
+  try {
+    const runDir = join(directory, "run");
+    const configPath = join(directory, "config.json");
+    await writeFile(configPath, JSON.stringify({
+      provider: "opencode-go", model: "glm-5.3-flash", effort: "high", maxModelCalls: 2,
+      baseUrl: `http://127.0.0.1:${server.port}/v1`, authPath: join(directory, "missing-auth.json"),
+      pythonPath: join(directory, "missing-python.exe"), distro: "no-live-sandbox", runsDir: join(directory, "runs"),
+    }));
+    const child = Bun.spawn([process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "play", "--config", configPath, "--run", runDir, "--completion", "response", "--prompt", "play the game"], {
+      stdout: "pipe", stderr: "pipe", env: { ...process.env, OPENCODE_API_KEY: "fixture-only", OPENAI_API_KEY: "" },
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    // Response mode is the explicit opt-out: one request, no reminder, no declaration, exit 0.
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe("");
+    expect(bodies).toHaveLength(1);
+    expect(stdout).toContain("Still playing; report later.");
+    const registry = JSON.parse(await readFile(join(runDir, "player", "agents.json"), "utf8")) as { agents: { id: string; task?: unknown }[] };
+    expect(registry.agents.find(agent => agent.id === "main")?.task).toBeUndefined();
+  } finally { server.stop(true); }
+});
+
+test("CLI play fails loudly when explicit mode never receives a declaration", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "civ-play-cli-"));
+  directories.push(directory);
+  const bodies: string[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    bodies.push(await request.text());
+    const payloads = [
+      { id: "fixture", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: "Turn 70 report; the game is still active." }, finish_reason: null }] },
+      { id: "fixture", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ];
+    return new Response(payloads.map(payload => `data: ${JSON.stringify(payload)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "Content-Type": "text/event-stream" } });
+  } });
+  try {
+    const runDir = join(directory, "run");
+    const configPath = join(directory, "config.json");
+    await writeFile(configPath, JSON.stringify({
+      provider: "opencode-go", model: "glm-5.3-flash", effort: "high", maxModelCalls: 2, completionMode: "explicit",
+      baseUrl: `http://127.0.0.1:${server.port}/v1`, authPath: join(directory, "missing-auth.json"),
+      pythonPath: join(directory, "missing-python.exe"), distro: "no-live-sandbox", runsDir: join(directory, "runs"),
+    }));
+    const child = Bun.spawn([process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "play", "--config", configPath, "--run", runDir, "--prompt", "play the game"], {
+      stdout: "pipe", stderr: "pipe", env: { ...process.env, OPENCODE_API_KEY: "fixture-only", OPENAI_API_KEY: "" },
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Explicit task protocol failure");
+    // One report bought exactly one reminder; nothing claimed the task was completed.
+    expect(bodies).toHaveLength(2);
+    expect(stdout).not.toContain("Task completed");
+    const registry = JSON.parse(await readFile(join(runDir, "player", "agents.json"), "utf8")) as { agents: { id: string; status: string; task?: { outcome: string } }[] };
+    expect(registry.agents.find(agent => agent.id === "main")).toMatchObject({ status: "failed", task: { outcome: "protocol_failure" } });
+  } finally { server.stop(true); }
 });
 
 test("offline usage reports absent accounting honestly and leaves the run untouched", async () => {

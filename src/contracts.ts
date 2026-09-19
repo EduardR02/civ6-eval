@@ -46,6 +46,25 @@ export interface PlayerEvent {
   text?: string;
   data?: unknown;
 }
+/**
+ * How an operator-dispatched task ends. `response` ends it when the model stops calling
+ * tools, which is the right contract for one-shot analyses and children. `explicit` requires
+ * the model to declare an outcome through the finish_task tool, so a progress report can
+ * never silently end a running game.
+ */
+export type CompletionMode = "response" | "explicit";
+export type TaskOutcome = "completed" | "blocked" | "protocol_failure" | "unfinished";
+/** Durable record of the last concluded dispatch on one agent, written only in explicit mode. */
+export interface TaskRecord {
+  /** Dispatch identity; a declaration never carries over to a later dispatch. */
+  dispatch: string;
+  outcome: TaskOutcome;
+  /** Declared evidence or blocker, or the harness diagnostic for a protocol failure. */
+  reason: string;
+  /** True when the bounded protocol reminder was sent for this dispatch. */
+  repair: boolean;
+  at: string;
+}
 export interface PlayerOptions {
   projectRoot: string;
   runDir: string;
@@ -58,6 +77,14 @@ export interface PlayerOptions {
   maxConcurrentAgents?: number;
   maxModelCalls?: number;
   compactThreshold?: number;
+  /** Transport and presentation limits for this run. Absent means each ledger applies only a
+   * measured cap for its own route (see player/limits.ts); an unmeasured route keeps its history. */
+  requestLimits?: RequestLimits;
+  /** Supplied external reference for the expert-informed knowledge track. Absent on an uncoached
+   * run. Given only to the main player; children receive bounded tasks, not the whole document. */
+  expertGuide?: string;
+  /** Defaults to "response": generic players and children end when the model stops. */
+  completionMode?: CompletionMode;
   execute: (agentId: string, code: string, options?: ExecuteOptions) => Promise<ExecutionResult>;
   rpc: AgentRpc;
   onEvent?: (event: PlayerEvent) => void;

@@ -93,6 +93,33 @@ function A.typeName(tableName, index, field)
   if row == A.null then return A.null end
   return row[field] or A.null
 end
+-- ---------------------------------------------------------------------------
+-- Submission truth for mutations.
+--
+-- "civ.action/civ.decide returned an error" means two very different things: our own validation
+-- or phase check refused before anything was sent (nothing happened, retrying is pointless) or a
+-- request already reached the engine and then threw (the outcome is genuinely unknown and must
+-- never be replayed). Only the code that performs the native call knows which, so every native
+-- mutation goes through A.mutate and the entry points tag a thrown error accordingly. A tag that
+-- is wrong in the "refused" direction would be dangerous, so A.mutate is applied at the request
+-- wrappers, not at individual handlers.
+-- ---------------------------------------------------------------------------
+A.nativeIssued = false
+function A.mutate(fn, ...)
+  A.nativeIssued = true
+  return fn(...)
+end
+
+--- Run one mutation entry point, tagging a thrown error: ASTRA_REFUSED when nothing reached the
+--- engine, ASTRA_UNKNOWN when a request was already sent. The traceback is not model-facing.
+function A.entry(fn)
+  A.nativeIssued = false
+  local ok, result = pcall(fn)
+  if ok then return result end
+  local text = tostring(result):match('^[^\r\n]*') or 'Native call failed'
+  error((A.nativeIssued and 'ASTRA_UNKNOWN: ' or 'ASTRA_REFUSED: ')..text, 0)
+end
+
 function A.emit(marker, fn)
   A.begin()
   local ok, result = pcall(fn)
@@ -120,6 +147,22 @@ function A.loc(key)
   local ok, text = pcall(Locale.Lookup, key)
   if ok and type(text) == 'string' and text ~= '' then return text end
   return key -- Ruleset has no string for this key; the raw key is still an honest identifier.
+end
+
+--- Localized strings carry the screen's own layout and icon markup. The words are the fact; the
+--- [SIZE_16]/[NEWLINE]/[ICON_*] wrappers are how the game draws them, and they cost real context on
+--- every option label the bridge reports. Returns A.null when nothing is left.
+function A.plainText(text)
+  if text == nil or text == A.null or type(text) ~= 'string' then return A.null end
+  local out = text
+  out = out:gsub('%[NEWLINE%]', ' ')
+  out = out:gsub('%[ICON_[^%]]*%]', ' ')
+  out = out:gsub('%[/?[Ss][Ii][Zz][Ee][^%]]*%]', '')
+  out = out:gsub('%[/?[Cc][Oo][Ll][Oo][Rr][^%]]*%]', '')
+  out = out:gsub('%s+', ' ')
+  out = out:gsub('^%s+', ''):gsub('%s+$', '')
+  if out == '' then return A.null end
+  return out
 end
 
 --- Plot index <-> coordinates. Engine lookup, never assumed row-major arithmetic.
@@ -223,9 +266,43 @@ function A.typeFromHash(tableName, keyField, hash)
   return cache[hash] or A.null
 end
 
+--- Strictly resolve a raw engine id (kind, owner, index) to a live entity.
+--
+-- FindID is keyed by the entity id, but the engine reuses slots: a stale id can still resolve to a
+-- LIVE entity whose current id differs. This verifies the object's own GetOwner/GetID before any
+-- read or advertisement and never remaps: a mismatch returns (nil, reason).
+function A.resolveEntity(kind, owner, index)
+  assert(kind == 'unit' or kind == 'city', 'Entity kind must be unit or city')
+  if type(owner) ~= 'number' or type(index) ~= 'number' then
+    return nil, 'entity owner/id was not a number'
+  end
+  local player = Players and Players[owner]
+  if not player then return nil, 'player '..tostring(owner)..' is unavailable' end
+  local hasCollection, collection = pcall(function()
+    return kind == 'unit' and player:GetUnits() or player:GetCities()
+  end)
+  if not hasCollection or not collection then return nil, 'owned '..kind..' collection is unavailable' end
+  local found, entity = pcall(function() return collection:FindID(index) end)
+  if not found or entity == nil then return nil, 'entity '..owner..':'..index..' no longer exists' end
+  local actualId = A.call('identity', entity, 'GetID')
+  local actualOwner = A.call('identity', entity, 'GetOwner')
+  if actualId ~= index or actualOwner ~= owner then
+    return nil, 'id '..owner..':'..index..' resolved to owner '..tostring(actualOwner)..', id '..tostring(actualId)..
+      '; the reference is stale and is never remapped'
+  end
+  return entity
+end
+
+--- The game-qualified entity id state.lua emits and A.ownedEntity parses, so a module that has to
+--- name an engine-reported entity produces the same identity string instead of a private format.
+function A.entityId(kind, owner, index)
+  if index == nil then return A.session..':'..kind..':'..owner end
+  return A.session..':'..kind..':'..owner..':'..index
+end
+
 --- Resolve the game-qualified id emitted by state.lua to a live owned object.
--- Keeping this in common.lua gives action and decision modules one authority for
--- ownership/session checks; an id from another game or player cannot be used.
+-- Ownership and session are checked from the id itself and the object's identity is verified exactly
+-- (A.resolveEntity), so an id from another game/player or a stale reference is refused, never remapped.
 function A.ownedEntity(kind, value, pid)
   assert(kind == 'unit' or kind == 'city', 'Entity kind must be unit or city')
   assert(type(value) == 'string', 'Use a game-qualified '..kind..'Id from a fresh snapshot')
@@ -233,13 +310,95 @@ function A.ownedEntity(kind, value, pid)
   local session, actualKind, owner, index = value:match('^([^:]+):([^:]+):(%d+):(%d+)$')
   assert(session == A.session and actualKind == kind and tonumber(owner) == pid,
     'Entity ID is from another game/player or is not an owned '..kind)
-  local player = Players and Players[pid]
-  assert(player, 'Owning player is unavailable; refresh the game state')
-  local collection = kind == 'unit' and player:GetUnits() or player:GetCities()
-  assert(collection, 'Owned '..kind..' collection is unavailable')
-  local entity = collection:FindID(tonumber(index))
-  assert(entity, 'Owned entity no longer exists; refresh the snapshot')
+  assert(Players and Players[pid], 'Owning player is unavailable; refresh the game state')
+  local entity, mismatch = A.resolveEntity(kind, tonumber(owner), tonumber(index))
+  assert(entity, 'Entity ID '..value..' does not resolve to a live, exactly matching owned '..kind..': '..
+    tostring(mismatch)..'. Nothing was submitted. Refresh the snapshot and use the current id.')
   return entity
+end
+
+--- Native research/civic queue observation, read by state.lua at call time.
+--
+-- Both reads are the native trees': GetTechs():GetResearchQueue()/GetResearchingTech() and
+-- GetCulture():GetCivicQueue()/GetProgressingCivic(). The queue's values are Technologies/Civics row
+-- Indices -- the native comment calls them "index, IDs", and both consumers compare them against
+-- row.Index (TechTree.lua:264-277 `node.Index == nodeNumber`; ResearchChooser.lua:63-77
+-- `techNum == iTech` where iTech = kTech.Index). An unavailable read is reported as known=false with
+-- a reason, never as an empty queue.
+function A.researchQueue(player, kind)
+  assert(kind == 'research' or kind == 'civic', "kind must be 'research' or 'civic'")
+  local own = kind == 'research'
+  local out = {known = false, current = A.null, items = A.array()}
+  if player == nil or player == A.null then
+    out.reason = 'Player is unavailable; the '..kind..' queue is unknown, not empty.'
+    return out
+  end
+  local subsystem = A.call('researchQueue', player, own and 'GetTechs' or 'GetCulture')
+  if subsystem == nil or subsystem == A.null then
+    out.reason = 'Player '..(own and 'technology' or 'culture')..
+      ' subsystem is unavailable in this context; the '..kind..' queue is unknown, not empty.'
+    return out
+  end
+  -- A.call maps both a thrown read and a nil return to A.null, and A.null is a table, so the
+  -- unavailable case must be compared explicitly: `type(queue) ~= 'table'` alone would report a
+  -- failed read as known=true with an empty queue, i.e. "nothing is queued" instead of unknown.
+  local queue = A.call('researchQueue', subsystem, own and 'GetResearchQueue' or 'GetCivicQueue')
+  if queue == nil or queue == A.null or type(queue) ~= 'table' then
+    out.reason = 'Native '..(own and 'GetResearchQueue' or 'GetCivicQueue')..
+      ' returned no queue; the '..kind..' queue is unknown, not empty.'
+    return out
+  end
+  out.known = true
+  local tableName, field = own and 'Technologies' or 'Civics', own and 'TechnologyType' or 'CivicType'
+  local current = A.call('researchQueue', subsystem, own and 'GetResearchingTech' or 'GetProgressingCivic')
+  if type(current) == 'number' and current >= 0 then out.current = A.typeName(tableName, current, field) end
+  for position, index in pairs(queue) do
+    if type(position) == 'number' and type(index) == 'number' then
+      local row = A.row(tableName, index)
+      -- A queue entry the ruleset cannot name keeps its position with null type/name rather than
+      -- being dropped: the queue really does hold an entry there.
+      if row == A.null then
+        out.items[#out.items + 1] = {type = A.null, name = A.null, index = position}
+      else
+        out.items[#out.items + 1] = {type = row[field], name = A.loc(row.Name), index = position}
+      end
+    end
+  end
+  table.sort(out.items, function(left, right) return left.index < right.index end)
+  return out
+end
+
+--- Exact native purchase price, current balance and faith enablement for one item/currency.
+--
+-- cost is CityGold:GetPurchaseCost(yieldIndex, hash[, formation]) -- the call the native panel prints
+-- as the buy price (ProductionPanel.lua:1673,1770,1820); balance is the player's own treasury/faith
+-- balance; enabled is the native Is*FaithPurchaseEnabled flag or the row's PurchaseYield
+-- (ProductionPanel.lua:2092,2196). Purchase legality stays with CanStartCommand.
+function A.purchasePrice(city, kind, row, currency, formation, player)
+  assert(currency == 'gold' or currency == 'faith', 'currency must be gold or faith')
+  local yield = GameInfo.Yields and GameInfo.Yields['YIELD_'..currency:upper()]
+  local gold = A.call('purchase', city, 'GetGold')
+  local out = {currency = currency, cost = A.null, balance = A.null, covers = A.null}
+  if yield ~= nil then
+    if type(formation) == 'number' then
+      out.cost = A.call('purchase', gold, 'GetPurchaseCost', yield.Index, row.Hash, formation)
+    else
+      out.cost = A.call('purchase', gold, 'GetPurchaseCost', yield.Index, row.Hash)
+    end
+  end
+  if player ~= nil and player ~= A.null then
+    if currency == 'gold' then
+      out.balance = A.call('purchase', A.call('purchase', player, 'GetTreasury'), 'GetGoldBalance')
+    else
+      out.balance = A.call('purchase', A.call('purchase', player, 'GetReligion'), 'GetFaithBalance')
+    end
+  end
+  if type(out.cost) == 'number' and type(out.balance) == 'number' then out.covers = out.cost <= out.balance end
+  if currency == 'faith' and (kind == 'unit' or kind == 'building') then
+    out.enabled = A.call('purchase', gold, kind == 'unit' and 'IsUnitFaithPurchaseEnabled' or 'IsBuildingFaithPurchaseEnabled', row.Hash)
+    if row.PurchaseYield == 'YIELD_FAITH' then out.enabled = true end
+  end
+  return out
 end
 
 --- Parameter key from an engine namespace, with a message the model can act on.
@@ -365,6 +524,9 @@ A.unitCommandSpecs = {
   DELETE              = {fields={}},
   EXIT_FORMATION      = {fields={}},
   UPGRADE             = {fields={}},
+  -- PARAM_PROMOTION_TYPE takes the UnitPromotions row *Index*, not its Hash: the native promotion UI
+  -- matches the CanStartCommand results against row.Index and submits that (UnitPromotionPopup.lua:81-82,286-291).
+  PROMOTE             = {fields={promotion='UnitPromotion'}},
   FORM_CORPS          = {fields={targetUnitId='unitId'}},
   FORM_ARMY           = {fields={targetUnitId='unitId'}},
   ENTER_FORMATION     = {fields={targetUnitId='unitId'}},
@@ -373,6 +535,9 @@ A.unitCommandSpecs = {
   WONDER_PRODUCTION   = {fields={}},
   HARVEST_WONDER      = {fields={}},
   PET_THE_DOG         = {fields={}},
+  -- In-place activation with no parameters (UnitPanel.lua:2493-2531); the engine answers with its own
+  -- LOC_UNITCOMMAND_ACTIVATE_GREAT_PERSON_* reasons when the unit's tile is wrong.
+  ACTIVATE_GREAT_PERSON = {fields={}},
 }
 
 local ruleTables = {

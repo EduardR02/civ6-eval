@@ -86,6 +86,20 @@ This is why persistent execution and subagents are central. Do not turn every pl
 
 Keep queries composable. Ten tiny calls can cost more than one rich scene that settles a decision. Optimize total computation, context, interaction, and error cost to make and execute good decisions—not individual response length alone.
 
+## Routine controls without routine click work
+
+Discovery must describe the actual supported argument codecs, native costs, current legality and unavailable information. A catalog entry is not a guarantee of success. Displayable production choices may be disabled; expose their reasons rather than hiding alternatives or describing every failure as an unmet prerequisite. Resolve entity references by exact current owner and ID; never silently substitute whatever a stale native lookup returns.
+
+Multi-turn movement and research/civic queues are optional native execution mechanisms. The model chooses the destination or research target; the engine computes its ordinary route or prerequisite path. Expose queued state separately from completion and readiness, allow replacement/cancellation through native controls, and do not reissue or strategically replan interrupted orders. A queued unit may still need attention; annotations must not erase genuine blockers.
+
+Congress and diplomacy should expose the choices, terms and legal controls available in their native screens. Explicit Congress submission includes the native Accept lifecycle; voting preferences remain entirely model-owned. A deal-balancing request asks the AI for a counteroffer, not a mathematically minimum price, and does not accept it. Draft edits, proposals and acceptance must remain distinguishable; the model reviews and chooses commitments.
+
+Known informational popups may be dismissed automatically **after their information is preserved durably**. Capture relevant labels, values and icon tooltips; incomplete capture leaves the popup pending. Deliver newly captured content with execution results and keep it searchable in public history. Revalidate the exact displayed content in the same native invocation that closes it, so a successor notification is never acknowledged unseen. Use the screen's native cleanup, not generic Escape or popup-queue removal.
+
+Graphical presentation alone is not a reason to require another screenshot/model turn. Preserve equivalent player-observable native state when available: an era-rollover frame carries the local player's age result, which can be captured with the era score and thresholds. Include those values in the same revalidation as the rendered text before automatic closure; unavailable state must not be mistaken for a Normal Age or zero score.
+
+Automatic presentation cleanup runs at fresh observation and turn-advance boundaries, never immediately before a coordinate click derived from an earlier screenshot. It does not choose responses, vote, accept deals, or dismiss game-over screens. Closing a screen as part of an explicitly requested native action is different from choosing that action automatically. Screenshots remain usable when the structured bridge fails.
+
 # Harness and provider contracts
 
 ## Pi host and executable memory
@@ -102,6 +116,8 @@ Astra defaults to the user's ChatGPT/Codex subscription via OMP's read-only cred
 
 GLM 5.3 Flash and Muse Spark through opencode-go are cheaper/faster iteration targets and alternate players. Keep the same game/runtime contract, but use each model's supported provider transport, vision conversion, reasoning levels, and compaction. Muse's Responses support does not imply support for `/responses/compact`: context reduction uses a model-generated continuation summary through the ordinary Responses endpoint, with no tools exposed. Complete original native items remain in the private journal; new operator instructions enter after successful summarization. Failed or incomplete summaries must not replace context or authorize actions. This is not Astra's native opaque compaction. A saved run must not silently switch model/provider/account and replay incompatible state.
 
+DeepSeek V4.1 Flash is available through `opencode-go/deepseek-flash`, with vision and literal `max` reasoning effort. Capabilities follow the current catalog and verified route requirements. For tool-bearing Chat Completions requests, preserve prior assistant `reasoning_content`, including turns without tool calls; a new user message does not erase it. No-tool summaries have different context semantics. Keep private reasoning out of player-visible artifacts and verify vision, effort, replay, restart and summary continuation on the actual gateway route.
+
 Read credentials privately at the trusted boundary. Never mount them into player workspaces, include them in artifacts, or expose token-bearing refresh errors. Do not rotate shared subscription refresh tokens behind another harness. Do not switch accounts automatically after rate limits or retry quota failures indefinitely.
 
 ## Execution and recovery
@@ -112,9 +128,15 @@ Player code runs in a real OS sandbox. The current Windows implementation uses n
 
 Actions use normal legal game requests or native UI input. Do not bypass costs or substitute simulation mutations. Report submission, rejection, pending processing, and observed completion accurately. Batches may interleave queries and conditionals; never silently replay a partly executed batch.
 
+A batch is not a transaction. Ordinary known rejection can follow `stopOnError`; unknown outcomes always stop further admission. Turn-ending requests, including Congress submission, belong last. Native getters also have lifecycle prerequisites: catching Lua exceptions cannot prevent native access violations. Do not probe Congress or escaping-spy collections outside the native UI's readiness gates.
+
+All FireTuner exchanges, including popup context loading and probing, share one single-flight gate. A positively identified pre-submission refusal is distinct from a lost acknowledgement with unknown outcome. Congress requests use their native turn-segment prerequisites rather than the ordinary strategic/tactical command gate. Native submission state, not a persistent client latch, governs whether an end-turn request is outstanding. These mechanisms do not authorize automatic replay or prove that an accepted request completed.
+
 Files, observations, artifacts, and provider history are durable. In-memory Python bindings are not restored by restarting a process. An interrupted request or action has unknown outcome until reobserved. Failed or cancelled transports must stop admitting new work and release held inputs.
 
 The operator may set a finite saved-run model-call ceiling or explicitly choose `--calls unlimited` (`maxModelCalls: "unlimited"` in configuration). Unlimited disables only the harness's call-admission ceiling, including children and compaction; it does not bypass provider quota, authentication expiry, transport limits, or the need to stop after an uncertain failure. A full-game task need not have a harness turn limit.
+
+CLI play defaults to explicit task outcomes: the operator's agent declares `completed` or `blocked` with a reason through `finish_task`. The model owns the goal and evidence; this declaration is not host-verified victory. A progress-only final receives at most one protocol reminder, then stops as a protocol failure if still undeclared. Unresolved execution failure suppresses automatic protocol repair, and calls after a declaration are not executed. Outcomes are recorded per dispatch, never inherited as completion of a later task. Generic Player callers and delegated analyses retain response-mode completion; `--completion response` selects that behavior explicitly for CLI play.
 
 ## Usage accounting
 
@@ -140,6 +162,10 @@ Our current Astra path replays native items with `store: false`; it does **not**
 
 Prefer stable already-sent representations during ordinary continuation. Compaction is a convenient default boundary for deliberate history reduction, **not** the only API-permitted time to change history. Evaluate cache-prefix effects, valid tool/result pairing, preserved reasoning, and access to original observations independently. Retain original captures and make any lossy model-facing representation explicit. Do not blindly shrink the newest evidence or drop arbitrary tool messages to get under a limit.
 
+`requestLimits` configures optional `maxImages`, `retainedImages` and serialized UTF-8 `maxBytes` bounds for the selected run. Only the measured Muse Spark route has a default image watermark (45, retaining five); do not impose that default on Astra or DeepSeek. Preserve fresh unseen images, original captures, reasoning, text and tool identities. If permitted removal of older already-sent images cannot satisfy a bound, refuse before transport without consuming a model call or authorizing a replay. An unknown sent-history boundary is not proof that images were seen.
+
+Record explicit omission markers and recoverable original-image references. Model-generated compaction retains the supplied system prompt and uses a transient no-tool summary request; this does not promise a cache hit or native opaque compaction. Native request-size accounting measures actual UTF-8 serialized bytes, including compaction, rather than internal ledger metadata.
+
 Transport limits need their own measured/configurable guard and recoverable failure handling. Token-threshold compaction alone is insufficient, and a compaction request can itself be too large. Raising a provider's token threshold is an experiment, not a remedy for HTTP 413. Native API-equivalent pricing tiers also do not establish how a ChatGPT subscription meters its quota.
 
 When reviewing an experiment, distinguish no recursive delegation from no useful computational memory: a model may build and reuse in-namespace helpers, query external state, and crop images without spawning a subagent or saving a Python module. Likewise, fewer explicit planning notes do not by themselves prove that no planning occurred. Fix misleading mechanics and broken affordances; test behavioral hypotheses before turning them into process rules.
@@ -156,7 +182,11 @@ Maintain two knowledge tracks when evaluating:
 
 “Uncoached” does not mean the model has never seen Civ strategy in training. Guides can be useful and interesting without being executable strategy scripts. Preserve their ruleset, mod, speed, and multiplayer assumptions. Do not silently mix supplied guide knowledge, supplied procedures, and model-authored skills.
 
+The Herson BBG guide corpus is an explicit expert-informed experiment: `guides/herson-bbg/SKILL.md` synthesizes the complete source playlist into original strategy teaching intended for the player's initial context in full. Per-video notes, publication dates and a conflict record preserve provenance. Prefer newer advice when it revises the same assumptions, not merely because it was published later; distinguish BBG patches, game speed, multiplayer placement incentives and Deity-AI objectives. Source-era advice remains useful when clearly labeled. The model may adapt or reject it; it is not a runtime build-order controller, mandatory checklist or change to the uncoached baseline. Record which guide revision a run received.
+
 Declare mods, map settings, speed, difficulty, seeds, model/effort, knowledge track, and human interventions. BBG/BBM interface smoke is not an unmodified Gathering Storm benchmark. Development saves and scenario probes are useful for diagnosis; full games are necessary evidence for winning ability. Do not discard early defeats or automation failures from evaluation results.
+
+Archive the exact supplied guide and sanitized configuration, not merely a path/hash that depends on future workspace contents. Archive each effective system-prompt revision and its tool definitions privately; retain operator tasks in durable history. New launches/resumptions must not overwrite earlier experimental inputs. These archives are not permissions to expose provider reasoning or credentials to player code.
 
 Useful observations include actual outcome, decision/action errors, missed facts, repeated work, query rounds, context growth, token usage, subagent cost, and elapsed time. Avoid constructing a large benchmark apparatus before the player works.
 

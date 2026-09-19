@@ -54,6 +54,31 @@ local function operationTargets(unit, row)
   return decoded.plots, decoded.plotResults
 end
 
+--- What the player can actually ask for right now. The full ruleset list is fifty operations and
+--- twenty-six commands of which two or three are ever legal, and every ruled-out entry carries its
+--- own sentence: a fixed catalog priced as a situation report. At the default detail this keeps the
+--- entries the bridge can submit and that are legal or target-dependent, and names the rest in
+--- `ruledOut` so nothing is hidden - detail='full', or naming the operation, still returns everything.
+local function currentlyRelevant(entries, key, detail, requested)
+  if detail == 'full' or requested ~= nil then return entries, nil end
+  local kept, ruled = {}, A.array()
+  for _, entry in ipairs(entries) do
+    if entry.supported == true and entry.available ~= false then
+      -- Everything that survives the filter is in the ruleset and submittable by this bridge, so
+      -- those two flags say the same thing on every row. `available=null` plus `needs` already
+      -- states that legality follows the target; the sentence repeating it per row does not.
+      entry.ruleset, entry.supported = nil, nil
+      if entry.available == A.null and entry.needs ~= nil then entry.reason = nil end
+      kept[#kept + 1] = entry
+    else
+      ruled[#ruled + 1] = entry[key]
+    end
+  end
+  if #ruled == 0 then return kept, nil end
+  table.sort(ruled)
+  return kept, ruled
+end
+
 local function unitOptions(args, pid, detail, offset, limit, wantTargets)
   local unit = A.ownedEntity('unit', args.unitId, pid)
   local requested = args.operation
@@ -71,7 +96,8 @@ local function unitOptions(args, pid, detail, offset, limit, wantTargets)
         entry.reason = 'Present in this ruleset but this bridge has no verified parameter handling; use the native GUI.'
       elseif spec.nativeUiOnly then
         entry.available = false
-        entry.reason = 'Deliberately routed to the native GUI in this bridge.'
+        entry.reason = 'No verified request codec in the shipped Lua (VisibleInUI=false, interface mode with no Lua handler), '..
+          'so this bridge never submits a guess. A plain move already performs a multi-turn native order; unit_command CANCEL clears one.'
       elseif targetedOperation(spec) then
         entry.needs = A.array()
         for field in pairs(spec.fields) do entry.needs[#entry.needs + 1] = field end
@@ -87,8 +113,21 @@ local function unitOptions(args, pid, detail, offset, limit, wantTargets)
           end
         end
       else
+        -- Declared fields are unit_operation arguments (same spec the dispatcher reads).
+        if next(spec.fields) ~= nil then
+          entry.needs = A.array()
+          for field in pairs(spec.fields) do entry.needs[#entry.needs + 1] = field end
+          table.sort(entry.needs)
+        end
+        -- Same parameters as the native check: the unit's own tile for current-plot operations
+        -- (UnitPanel.lua:346-351), otherwise no parameters (`false`, UnitPanel.lua:676-678).
         local parameters = {}
-        local legal, results = UnitManager.CanStartOperation(unit, row.Hash, nil, parameters, true)
+        if spec.currentPlot and type(UnitOperationTypes) == 'table'
+          and UnitOperationTypes.PARAM_X ~= nil and UnitOperationTypes.PARAM_Y ~= nil then
+          parameters[UnitOperationTypes.PARAM_X] = unit:GetX()
+          parameters[UnitOperationTypes.PARAM_Y] = unit:GetY()
+        end
+        local legal, results = UnitManager.CanStartOperation(unit, row.Hash, nil, next(parameters) and parameters or false, true)
         local decoded = A.results(UnitOperationResults, results)
         entry.available = legal == true
         if not entry.available then entry.reasons = decoded.reasons end
@@ -107,34 +146,109 @@ local function unitOptions(args, pid, detail, offset, limit, wantTargets)
   end
   for row in GameInfo.UnitCommands() do
     local shortName = A.shortName(row.CommandType, 'UNITCOMMAND_')
-    if row.VisibleInUI or A.unitCommandSpecs[shortName] or shortName == 'PROMOTE' then
+    if row.VisibleInUI or A.unitCommandSpecs[shortName] then
       local short = shortName
       local spec = A.unitCommandSpecs[short]
       local entry = {cmd = short, category = row.CategoryInUI, ruleset = true, supported = spec ~= nil}
-      if not spec and short ~= 'PROMOTE' then
+      if spec then
+        -- Declared fields are unit_command arguments (same spec the dispatcher reads).
+        local needs = A.array()
+        for field in pairs(spec.fields) do needs[#needs + 1] = field end
+        table.sort(needs)
+        entry.needs = needs
+      end
+      if not spec then
         entry.available = A.null
         entry.reason = 'Present in this ruleset but this bridge has no verified parameter handling; use the native GUI.'
       else
-        local legal, results = UnitManager.CanStartCommand(unit, row.Hash, {}, false, true)
+        -- Four-argument check with `false` for a parameterless command (UnitPanel.lua:471-479); the
+        -- formation family asks with nil and reads UnitCommandResults.UNITS (:396-431).
+        local targetFamily = short == 'FORM_CORPS' or short == 'FORM_ARMY' or short == 'ENTER_FORMATION'
+        local legal, results = UnitManager.CanStartCommand(unit, row.Hash, targetFamily and nil or false, true)
         local decoded = A.results(UnitCommandResults, results)
         entry.available = legal == true
         if not entry.available then entry.reasons = decoded.reasons end
-        if short == 'PROMOTE' then
-          entry.supported = true
-          -- UnitPromotionPopup reads the valid promotions from the test-only overload.
+        if targetFamily and results and UnitCommandResults and UnitCommandResults.UNITS then
+          local units = results[UnitCommandResults.UNITS]
+          if type(units) == 'table' then
+            local owner = unit:GetOwner()
+            entry.targets = A.array()
+            for _, item in ipairs(units) do
+              -- {player=, id=} entries resolved the way UnitPanel.lua:421-431 does, through the
+              -- strict resolver: an id that does not verify exactly is reported, never remapped.
+              if type(item) == 'table' and type(item.id) == 'number' and item.player == owner then
+                local target, mismatch = A.resolveEntity('unit', item.player, item.id)
+                if target then
+                  entry.targets[#entry.targets + 1] = {
+                    unitId = A.entityId('unit', item.player, item.id),
+                    unitType = A.typeName('Units', A.call('units', target, 'GetUnitType'), 'UnitType'),
+                  }
+                else
+                  entry.unresolvedTargets = entry.unresolvedTargets or A.array()
+                  entry.unresolvedTargets[#entry.unresolvedTargets + 1] = {
+                    owner = item.player, id = item.id, reason = mismatch,
+                  }
+                end
+              end
+            end
+          end
+        elseif short == 'PROMOTE' then
+          -- UnitPromotionPopup.lua:81-82 reads the valid promotions from the test-only overload; the
+          -- submitted value is the row Index.
           local ok, canStart, promotionResults = pcall(UnitManager.CanStartCommand, unit, row.Hash, true, true)
           if ok and canStart then
             local promotions = A.results(UnitCommandResults, promotionResults)
             entry.promotions = promotions.promotions
             entry.available = entry.promotions ~= nil and #entry.promotions > 0
           end
-        elseif short == 'UPGRADE' and results and UnitCommandResults and UnitCommandResults.UNIT_TYPE then
-          entry.unitType = A.typeFromHash('Units', 'UnitType', results[UnitCommandResults.UNIT_TYPE])
+        elseif short == 'UPGRADE' then
+          if results and UnitCommandResults and UnitCommandResults.UNIT_TYPE then
+            entry.unitType = A.typeFromHash('Units', 'UnitType', results[UnitCommandResults.UNIT_TYPE])
+          end
+          -- The native tooltip's two numbers: gold price and strategic resource amount
+          -- (UnitPanel.lua:474-486; Expansion2 AddUpgradeResourceCost reads both returns).
+          entry.upgrade = {gold = A.call('upgrade', unit, 'GetUpgradeCost')}
+          local gotResource, resource, amount = pcall(function() return unit:GetUpgradeResourceCost() end)
+          if gotResource and type(resource) == 'number' and resource >= 0 then
+            local resourceRow = A.row('Resources', resource)
+            entry.upgrade.resource = {amount = amount}
+            if resourceRow ~= A.null then
+              entry.upgrade.resource.type = resourceRow.ResourceType
+              entry.upgrade.resource.name = A.loc(resourceRow.Name)
+            end
+          end
+        elseif short == 'ACTIVATE_GREAT_PERSON' then
+          -- Activation plots are the engine's own (SelectedUnit.lua:118-140); the bridge reports them
+          -- and never picks one.
+          local greatPerson = A.call('greatPerson', unit, 'GetGreatPerson')
+          if greatPerson ~= nil and greatPerson ~= A.null and A.call('greatPerson', greatPerson, 'IsGreatPerson') == true then
+            local class = A.call('greatPerson', greatPerson, 'GetClass')
+            entry.greatPerson = {
+              class = type(class) == 'string' and class or A.typeName('GreatPersonClasses', class, 'GreatPersonClassType'),
+              charges = A.call('greatPerson', greatPerson, 'GetActionCharges'),
+              passive = A.call('greatPerson', greatPerson, 'HasPassiveEffect') == true
+                and A.call('greatPerson', greatPerson, 'GetPassiveNameText') or A.null,
+              activationPlots = A.plots(A.call('greatPerson', greatPerson, 'GetActivationHighlightPlots')),
+            }
+            local individual = A.call('greatPerson', greatPerson, 'GetIndividual')
+            if type(individual) == 'number' and individual >= 0 then
+              local individualRow = A.row('GreatPersonIndividuals', individual)
+              if individualRow ~= A.null then
+                entry.greatPerson.individual = individualRow.GreatPersonIndividualType
+                entry.greatPerson.name = A.loc(individualRow.Name)
+              end
+            end
+          end
+        elseif short == 'CANCEL' then
+          entry.note = 'Clears a queued or automated order for this unit; the engine answers whether anything was pending.'
         end
       end
       if requested == nil or requested == short then commands[#commands + 1] = entry end
     end
   end
+  local operationsRuledOut, commandsRuledOut
+  operations, operationsRuledOut = currentlyRelevant(operations, 'op', detail, requested)
+  commands, commandsRuledOut = currentlyRelevant(commands, 'cmd', detail, requested)
   local ops, opTotal, opMore = page(operations, offset, limit)
   local cmds, cmdTotal, cmdMore = page(commands, offset, limit)
   local movement = A.section('movement', function()
@@ -142,16 +256,24 @@ local function unitOptions(args, pid, detail, offset, limit, wantTargets)
     local attackable, attackTotal, attackCut = bounded(UnitManager.GetReachableTargets(unit), MAX_PLOTS)
     local zoc = A.array()
     if detail == 'full' then zoc = bounded(UnitManager.GetReachableZonesOfControl(unit, true), MAX_PLOTS) end
+    -- A multi-turn order already queued in the engine is native state, not harness state:
+    -- GetQueuedDestination is a static call returning the destination plot the unit is still walking
+    -- to (WorldInput.lua:821,907,1165). unit_command CANCEL is the native way to drop it.
+    local queued = A.static('movement', UnitManager, 'GetQueuedDestination', unit)
+    local destination = type(queued) == 'number' and A.plotXY(queued) or A.null
     return {
       reachable = reachable, reachableTotal = reachTotal, reachableTruncated = reachCut,
       attackable = attackable, attackableTotal = attackTotal, attackableTruncated = attackCut,
       zoneOfControl = zoc,
-      note = 'Reachable plots come from the engine for this turn only and follow the same visibility limits as the native UI.',
+      queuedDestination = destination,
     }
   end)
   return {
     scope = 'unit', unit = A.unitRecord(unit, true), movement = movement,
     operations = ops, commands = cmds,
+    -- Named, not described: ask for one by name, or detail='full', for its reasons.
+    ruledOut = (operationsRuledOut or commandsRuledOut)
+      and {operations = operationsRuledOut or A.array(), commands = commandsRuledOut or A.array()} or A.null,
     total = opTotal + cmdTotal, offset = offset, more = opMore or cmdMore,
   }
 end
@@ -176,24 +298,42 @@ local function districtPlots(city, row)
   return list
 end
 
-local function purchasePrice(city, kind, row)
+--- Per-currency purchase facts, checked the way the native purchase button is checked:
+--- CityManager.CanStartCommand(city, PURCHASE, false, parameters, true) with PARAM_YIELD_TYPE
+--- (ProductionPanel.lua ComposeUnitForPurchase / ComposeBuildingForPurchase).
+local function purchaseOptions(city, kind, row, player)
+  local out = {
+    note = 'cost = the exact native price for that currency (CityGold:GetPurchaseCost), balance = this player\'s treasury/faith, '..
+      'covers = cost <= balance, legal = the engine\'s CanStartCommand answer for that currency (so locked or unaffordable '..
+      'alternatives stay visible), reasons = the engine\'s failure reasons when legal is false, enabled = the native '..
+      'Is*FaithPurchaseEnabled flag (faith, units/buildings).',
+  }
+  local formation = kind == 'unit' and MilitaryFormationTypes.STANDARD_MILITARY_FORMATION or nil
   for _, currency in ipairs({'gold', 'faith'}) do
+    local entry = A.purchasePrice(city, kind, row, currency, formation, player)
     local ok, legal, results = pcall(function()
       local parameters = {}
       parameters[A.param(CityCommandTypes, 'PARAM_'..kind:upper()..'_TYPE')] = row.Hash
       parameters[A.param(CityCommandTypes, 'PARAM_YIELD_TYPE')] = GameInfo.Yields['YIELD_'..currency:upper()].Index
-      if kind == 'unit' then
-        parameters[A.param(CityCommandTypes, 'PARAM_MILITARY_FORMATION_TYPE')] = MilitaryFormationTypes.STANDARD_MILITARY_FORMATION
+      if formation ~= nil then
+        parameters[A.param(CityCommandTypes, 'PARAM_MILITARY_FORMATION_TYPE')] = formation
       end
       return CityManager.CanStartCommand(city, CityCommandTypes.PURCHASE, false, parameters, true)
     end)
-    if ok and legal then return currency, A.results(CityCommandResults, results) end
+    entry.legal = ok and legal == true
+    if not entry.legal then
+      local decoded = A.results(CityCommandResults, ok and results or nil)
+      entry.reasons = decoded.reasons or A.array()
+      if decoded.notes then entry.notes = decoded.notes end
+    end
+    out[currency] = entry
   end
-  return nil
+  return out
 end
 
 local function cityOptions(args, pid, detail, offset, limit, wantTargets)
   local city = A.ownedEntity('city', args.cityId, pid)
+  local player = Players[pid]
   local queue = city:GetBuildQueue()
   local requested = args.operation
   local wantPlacement = wantTargets or requested == 'place_district' or detail == 'full'
@@ -201,6 +341,10 @@ local function cityOptions(args, pid, detail, offset, limit, wantTargets)
   for _, definition in ipairs(productionTables) do
     local tableName, keyField, kind, prefix = definition[1], definition[2], definition[3], definition[4]
     for row in GameInfo[tableName]() do
+      -- Two native answers, as the production panel uses them: CanProduce(hash,true) decides whether
+      -- the item is offered at all, CanProduce(hash,false,true) is current legality plus reasons
+      -- (ProductionPanel.lua:1911-1913,1943-1955,2214-2216). Listing only legal items would hide what
+      -- the engine knows is blocked and why.
       if A.call('production', queue, 'CanProduce', row.Hash, true) == true then
         local item = row[keyField]
         if requested == nil or requested == item or requested == 'place_district' or requested == 'purchase' then
@@ -210,6 +354,32 @@ local function cityOptions(args, pid, detail, offset, limit, wantTargets)
             progress = A.call('production', queue, 'Get'..prefix..'Progress', row.Index),
             turns = A.call('production', queue, 'GetTurnsLeft', item),
           }
+          -- Both returns matter, so this is a direct protected call (A.call keeps only the first).
+          local checked, producible, produceResults = pcall(function() return queue:CanProduce(row.Hash, false, true) end)
+          if not checked then
+            entry.available = A.null
+            entry.reason = 'The engine build queue could not be asked whether this item is producible now; availability is unknown here, not false.'
+          else
+            entry.available = producible == true
+            if not entry.available then
+              local decoded = A.results(CityCommandResults, produceResults)
+              entry.reasons = decoded.reasons or A.array()
+              if decoded.notes then entry.notes = decoded.notes end
+            end
+          end
+          if kind == 'unit' then
+            -- Strategic resource cost of producing this unit, as the Expansion2 tooltip prints it
+            -- (ToolTipLoader_Expansion2.lua:105-121).
+            local amount = A.call('production', queue, 'GetUnitResourceCost', row.Index)
+            if type(amount) == 'number' and amount > 0 then
+              entry.resource = {amount = amount}
+              local resourceRow = A.row('Resources', row.StrategicResource)
+              if resourceRow ~= A.null then
+                entry.resource.type = resourceRow.ResourceType
+                entry.resource.name = A.loc(resourceRow.Name)
+              end
+            end
+          end
           if kind == 'district' and (wantPlacement or requested == item) then
             entry.plots = districtPlots(city, row)
             if entry.plots ~= nil then entry.placementRequired = true end
@@ -217,9 +387,10 @@ local function cityOptions(args, pid, detail, offset, limit, wantTargets)
             entry.placementRequired = true
             entry.note = 'Needs a plot; request operation="place_district" or targets=true for legal locations.'
           end
-          if requested == 'purchase' or requested == item then
-            local currency, results = purchasePrice(city, kind, row)
-            if currency then entry.purchase = {currency = currency, notes = results and results.notes} end
+          -- Native PURCHASE covers units, buildings and districts only (ProductionPanel's purchase
+          -- tabs); a project is listed as production but has no price to report.
+          if kind ~= 'project' and (requested == 'purchase' or requested == item) then
+            entry.purchase = purchaseOptions(city, kind, row, player)
           end
           if requested ~= 'place_district' or kind == 'district' then production[#production + 1] = entry end
         end
@@ -242,7 +413,11 @@ local function cityOptions(args, pid, detail, offset, limit, wantTargets)
     end)
   end
   result.unsupported = {
-    tile_purchase = 'Plot purchase, MANAGE and SWAP_TILE_OWNER take their parameter values from the native interface mode, so this bridge does not submit them. Use the native GUI.',
+    tile_purchase = 'Buying a map tile is a native city command whose plot comes from the interface mode '..
+      '(CityCommandTypes.PARAM_PLOT_PURCHASE), so this bridge does not submit it: use the native GUI. '..
+      'Unit/building/district purchases are the civ.action type="purchase" action with an exact price from this record.',
+    manage_citizens = 'MANAGE and SWAP_TILE_OWNER read their parameter values from the native interface mode; SET_FOCUS is the '..
+      'submitted citizen command (see the citizens block).',
   }
   return result
 end
@@ -262,6 +437,9 @@ local function playerOptions(args, pid, player, detail, offset, limit)
       end
     end
     result.research, result.researchTotal = page(list, offset, limit)
+    -- The native queue itself, so the caller sees what the engine accepted rather than assuming the
+    -- last submission landed.
+    result.researchQueue = A.researchQueue(player, 'research')
   end
   if requested == nil or requested == 'civic' then
     local list = {}
@@ -272,14 +450,23 @@ local function playerOptions(args, pid, player, detail, offset, limit)
       end
     end
     result.civics, result.civicsTotal = page(list, offset, limit)
+    result.civicQueue = A.researchQueue(player, 'civic')
   end
   if requested == nil or requested == 'government' then
-    local canChange = A.call('government', civics, 'CanChangeGovernmentAtAll')
-    local list = {}
+    -- The same flags the native GovernmentScreen predicates read (GovernmentScreen.lua:848,859-880).
+    result.governments = {
+      canChange = A.call('government', civics, 'CanChangeGovernmentAtAll'),
+      current = A.typeName('Governments', A.call('government', civics, 'GetCurrentGovernment'), 'GovernmentType'),
+      changeMade = A.call('government', civics, 'GovernmentChangeMade'),
+      civicCompletedThisTurn = A.call('government', civics, 'CivicCompletedThisTurn'),
+      anarchy = A.call('government', civics, 'IsInAnarchy'),
+      available = A.array(),
+    }
     for row in GameInfo.Governments() do
-      if A.call('government', civics, 'IsGovernmentUnlocked', row.Index) == true then list[#list + 1] = {item = row.GovernmentType} end
+      if A.call('government', civics, 'IsGovernmentUnlocked', row.Index) == true then
+        result.governments.available[#result.governments.available + 1] = {item = row.GovernmentType}
+      end
     end
-    result.governments = {canChange = canChange, current = A.typeName('Governments', A.call('government', civics, 'GetCurrentGovernment'), 'GovernmentType'), available = A.array(list)}
   end
   if requested == nil or requested == 'policies' then
     result.policies = A.section('policies', function()
@@ -299,11 +486,21 @@ local function playerOptions(args, pid, player, detail, offset, limit)
             active = A.call('policies', civics, 'IsPolicyActive', row.Index)}
         end
       end
+      local cost = A.call('policies', civics, 'GetCostToUnlockPolicies')
+      local changeMade = A.call('policies', civics, 'PolicyChangeMade')
+      local completed = A.call('policies', civics, 'CivicCompletedThisTurn')
+      local open = A.call('policies', civics, 'GetNumPolicySlotsOpen')
       return {
-        canChange = (civics:CivicCompletedThisTurn() or civics:GetNumPolicySlotsOpen() > 0) and not civics:PolicyChangeMade(),
-        unlockCost = A.call('policies', civics, 'GetCostToUnlockPolicies'),
+        -- The native eligibility predicate, flag by flag (GovernmentScreen.lua:848).
+        canChange = (completed == true or (type(open) == 'number' and open > 0)) and changeMade == false,
+        changeMade = changeMade,
+        civicCompletedThisTurn = completed,
+        slotsOpen = open,
+        unlockCost = cost,
+        freeUnlock = type(cost) == 'number' and cost == 0 or A.null,
         slots = slots, unlocked = unlocked,
-        note = 'policies takes only the slots you are changing; untouched slots keep their current policy. policy=nil clears a slot.',
+        note = 'slots[] is the committed assignment the engine reports; cards staged in the native screen are not engine state. '..
+          'policies takes only the slots you are changing; policy=nil clears one. unlock_policies is the separate paid request.',
       }
     end)
   end
@@ -334,9 +531,16 @@ function A.path(args)
   assert(args.x >= 0 and args.x < width and args.y >= 0 and args.y < height, 'Destination is outside the map')
   local destination = A.plotIndex(args.x, args.y)
   assert(destination ~= A.null, 'Destination plot is unavailable')
+  -- The native movement UI skips path work while the game core is busy (WorldInput.lua:818,884,1163
+  -- guard the same helpers), so this reports the deferral instead of querying during a busy frame.
+  if A.static('path', UI, 'IsGameCoreBusy') == true then
+    return {plots = A.array(), turns = A.array(), obstacles = A.array(), totalTurns = A.null,
+      blocked = A.null, deferred = true,
+      reason = 'The game core is busy, so path computation is deferred the way the native UI defers it. Nothing was queried; ask again when the turn is ready.'}
+  end
   local ok, info = pcall(UnitManager.GetMoveToPathEx, unit, destination)
   if not ok or type(info) ~= 'table' or type(info.plots) ~= 'table' then
-    return {blocked = true, plots = A.array(), turns = A.array(),
+    return {blocked = true, deferred = false, plots = A.array(), turns = A.array(),
       reason = 'The engine returned no path for this unit and destination.'}
   end
   local plots, total, truncated = bounded(info.plots, MAX_PLOTS)
@@ -351,6 +555,7 @@ function A.path(args)
     turns = turns, obstacles = obstacles,
     totalTurns = (type(info.turns) == 'table' and #info.turns > 0) and info.turns[#info.turns] or A.null,
     blocked = total < 2,
+    deferred = false,
     busy = A.call('path', unit, 'GetMovesRemaining') == 0,
     note = 'turns is the native per-plot cumulative array matched to plots; a path may cross plots outside current visibility, so arrival is not guaranteed.',
   }
@@ -387,9 +592,22 @@ function A.capabilities(args)
   for row in GameInfo.UnitCommands() do
     local short = A.shortName(row.CommandType, 'UNITCOMMAND_')
     local spec = A.unitCommandSpecs[short]
-    if verbose or spec or short == 'PROMOTE' then
-      commands[#commands + 1] = {cmd = short, category = row.CategoryInUI, visibleInUI = row.VisibleInUI == true,
-        ruleset = true, supported = spec ~= nil or short == 'PROMOTE'}
+    if verbose or spec then
+      local entry = {cmd = short, category = row.CategoryInUI, visibleInUI = row.VisibleInUI == true,
+        ruleset = true, supported = spec ~= nil}
+      if spec then
+        entry.fields = A.array()
+        for field in pairs(spec.fields) do entry.fields[#entry.fields + 1] = field end
+        table.sort(entry.fields)
+        if short == 'PROMOTE' then
+          entry.note = 'promotion takes a UnitPromotions type; the request carries that row\'s Index in PARAM_PROMOTION_TYPE.'
+        elseif short == 'ACTIVATE_GREAT_PERSON' then
+          entry.note = 'No fields: the Great Person activates in place. civ.options(unitId=...).commands reports the engine\'s valid plots and reasons.'
+        elseif next(spec.fields) == nil then
+          entry.note = 'No fields; submitted as UnitManager.RequestCommand(unit, command) exactly as the native action list does.'
+        end
+      end
+      commands[#commands + 1] = entry
     end
   end
   -- Adjacency is measured from the live map rather than assumed, so the model can stop paying for
@@ -412,6 +630,21 @@ function A.capabilities(args)
     out.note = 'Direction index 0..5 maps to these [dx,dy] offsets; rows alternate. Measured from this map, not assumed.'
     return out
   end)
+  -- Action schemas come from the dispatcher's own publication (A.actionSpecs), so a listed type is a
+  -- type whose arguments are known.
+  local actions = A.array()
+  if type(A.actionSpecs) == 'table' then
+    for name in pairs(A.actionTypes or {}) do
+      local spec = A.actionSpecs[name]
+      if spec then
+        actions[#actions + 1] = {type = name, fields = spec.fields or A.array(),
+          native = spec.native or A.null, note = spec.note or A.null}
+      else
+        actions[#actions + 1] = {type = name, fields = A.array(), native = A.null}
+      end
+    end
+    table.sort(actions, function(left, right) return left.type < right.type end)
+  end
   -- Decision families come from the decision module's own published table, so the probe cannot
   -- advertise a kind it does not handle.
   local decisions = A.null
@@ -420,12 +653,15 @@ function A.capabilities(args)
     decisions = A.array()
     for kind, spec in pairs(A.decisionActionTypes) do
       decisions[#decisions + 1] = {kind = kind, operations = type(spec) == 'table' and spec.operations or A.null,
+        fields = type(spec) == 'table' and spec.fields or A.null,
+        help = type(spec) == 'table' and spec.help or A.null,
         native = type(spec) == 'table' and spec.native or A.null}
     end
     table.sort(decisions, function(left, right) return left.kind < right.kind end)
   end
   return {
     actionTypes = types,
+    actions = actions,
     unitOperations = operations,
     unitCommands = commands,
     decisionKinds = decisions,
@@ -434,6 +670,10 @@ function A.capabilities(args)
       ruleset = 'The operation exists in the loaded ruleset (mods included).',
       supported = 'This bridge has verified parameter handling and will submit it.',
       legality = 'Whether it can be done right now comes from civ.options, never from this catalog.',
+      actions = 'actions[] gives each dispatched action type\'s arguments; unitOperations/unitCommands add the per-operation fields.',
+      movement = 'A move past this turn\'s movement is a native multi-turn order answered by MOVE_TO; '..
+        'civ.options(unitId=...).movement.queuedDestination reports the pending destination and unit_command CANCEL clears it. '..
+        'Nothing is reissued or planned automatically.',
     },
   }
 end

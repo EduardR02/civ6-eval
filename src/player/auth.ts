@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { clampThinkingLevel, getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { Api, Model, OAuthCredential, CredentialStore } from "@earendil-works/pi-ai";
 import type { PlayerOptions } from "../contracts.ts";
 import { loadJson, privateDirectory, saveJson } from "./storage.ts";
@@ -101,10 +102,15 @@ export async function createRuntime(options: PlayerOptions): Promise<{ runtime: 
   }
   const id = options.model ?? (provider === "opencode-go" ? "glm-5.3-flash" : "gpt-6-astra");
   const registered = runtime.getModel(provider, id);
-  if (provider === "opencode-go" && (!registered || (registered.api !== "openai-completions" && registered.api !== "openai-responses"))) throw new Error("Select a registered opencode-go completions or responses model, such as glm-5.3-flash or muse-spark-1.3-contributor.");
-  if (provider === "opencode-go" && registered && registered.thinkingLevelMap?.[effort] === null) {
-    const supported = (["low", "high", "max"] as const).filter(level => registered.thinkingLevelMap?.[level] !== null);
-    throw new Error(`${id} does not support reasoning effort ${effort}; supported opencode-go efforts: ${supported.join(", ")}.`);
+  if (provider === "opencode-go" && (!registered || (registered.api !== "openai-completions" && registered.api !== "openai-responses"))) throw new Error("Select a registered opencode-go completions or responses model, such as deepseek-flash or muse-spark-1.3-contributor.");
+  // The transport clamps any level the catalog does not map to an equal-or-higher one, so a missing or null
+  // entry would run a cheaper effort than the run was configured for. Compare with the SDK's own clamp and
+  // fail instead of letting max quietly become high.
+  const clamped = provider === "opencode-go" && registered ? clampThinkingLevel(registered, effort) : effort;
+  if (provider === "opencode-go" && registered && clamped !== effort) {
+    const levels = getSupportedThinkingLevels(registered);
+    const supported = (["minimal", "low", "medium", "high", "xhigh", "max"] as const).filter(level => levels.includes(level));
+    throw new Error(`${id} does not support reasoning effort ${effort}; the transport would silently run ${clamped}. Supported opencode-go efforts: ${supported.join(", ") || "none"}.`);
   }
   // Explicit profile avoids registry staleness; catalog profiles are authoritative for opencode-go.
   const model: Model<Api> = {

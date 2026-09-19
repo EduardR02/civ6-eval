@@ -268,7 +268,7 @@ test("native image budget purges to the watermark in one batch and stays append-
     if (index === 0 || index === 23 || index === 46) items.push({ role: "user", content: [{ type: "input_text", text: `turn ${index}` }, { type: "input_image", image_url: `data:image/png;base64,user-${index}`, detail: "original" }] });
     completedCalls.push(`call_${index}`);
   }
-  saveJson(join(agentDir, "native.json"), { version: 1, items, seenInputs: [], completedCalls, inputTokens: 0, compactions: 0, totalUsage: emptyUsage() });
+  saveJson(join(agentDir, "native.json"), { version: 1, items, seenInputs: [], completedCalls, inputTokens: 0, compactions: 0, totalUsage: emptyUsage(), sentItems: items.length });
   const native = new NativeResponses("main", options, runtime, model, () => {}, () => {});
   expect((await native.stream({ messages: [] }).result()).stopReason).toBe("stop");
   expect((await native.stream({ messages: [] }).result()).stopReason).toBe("stop");
@@ -323,7 +323,7 @@ test("native image budget leaves a ledger at the trigger threshold untouched", a
     items.push({ type: "function_call_output", call_id: `call_${index}`, output: [{ type: "input_image", image_url: `data:image/png;base64,tool-${index}`, detail: "original" }] });
     completedCalls.push(`call_${index}`);
   }
-  saveJson(join(agentDir, "native.json"), { version: 1, items, seenInputs: [], completedCalls, inputTokens: 0, compactions: 0, totalUsage: emptyUsage() });
+  saveJson(join(agentDir, "native.json"), { version: 1, items, seenInputs: [], completedCalls, inputTokens: 0, compactions: 0, totalUsage: emptyUsage(), sentItems: items.length });
   const native = new NativeResponses("main", options, runtime, model, () => {}, () => {});
   expect((await native.stream({ messages: [] }).result()).stopReason).toBe("stop");
   expect(countParts(bodies[0]!.input, "input_image")).toBe(45);

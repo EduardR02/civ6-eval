@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { NativeResponses, emptyUsage } from "./native.ts";
+import { COMPACTION_INSTRUCTIONS, COMPACTION_REQUEST, NativeResponses, emptyUsage } from "./native.ts";
 import { saveJson } from "./storage.ts";
 
 const cleanups: (() => void)[] = [];
@@ -122,12 +122,26 @@ test("Go summarizes through Responses and resumes the failed boundary without re
   expect(JSON.stringify(f.requests[0]!.body)).not.toContain(warning.content);
   expect(f.requests[0]!.body.tools).toBeUndefined();
   expect(f.requests[0]!.body).toMatchObject({ model: "muse-spark-1.3-contributor", reasoning: { effort: "xhigh" }, stream: true, store: false });
+  // The summary request extends the ordinary prompt prefix instead of replacing its head: the
+  // previously observed 266-byte compaction instructions replaced the whole system prompt, so
+  // every summary request was a fresh full-size prompt from the provider's point of view.
+  expect(f.requests[0]!.body.instructions).toBe("original-system");
+  expect(f.requests[0]!.body.instructions).toBe(f.requests[1]!.body.instructions);
+  const summaryInput = f.requests[0]!.body.input as NativeItem[];
+  expect(summaryInput.slice(0, -1)).toEqual(f.original);
+  expect(summaryInput.at(-1)).toEqual({ role: "user", content: [{ type: "input_text", text: COMPACTION_INSTRUCTIONS }, { type: "input_text", text: COMPACTION_REQUEST }] });
   const continuation = f.requests[1]!.body.input as NativeItem[];
   expect(JSON.stringify(continuation)).toContain(summaryItem.content[0]!.text);
   expect(continuation.at(-1)).toEqual({ role: "user", content: [{ type: "input_text", text: warning.content }] });
   expect(JSON.stringify(continuation)).not.toContain("old-history-marker");
+  // The transient ask is a request-time tail only: it must never become durable ledger content.
+  expect(JSON.stringify(continuation)).not.toContain(COMPACTION_REQUEST);
+  expect(JSON.stringify(f.saved().items)).not.toContain(COMPACTION_REQUEST);
   expect(continuation.some(item => item.type === "function_call" || item.type === "compaction")).toBe(false);
   expect(f.requests[1]!.body.instructions).toBe("original-system");
+  const requestRecords = f.journalEntries().filter(entry => entry.kind === "request");
+  expect(requestRecords[0].instructionsBytes).toBe(Buffer.byteLength("original-system"));
+  expect(requestRecords[1].instructionsHash).toBe(requestRecords[0].instructionsHash);
   expect(f.requests[0]!.session).toBe(f.requests[1]!.session);
   expect(f.reserved.map(request => request.kind)).toEqual(["compact", "responses"]);
   expect(f.accounted).toEqual([{ ...f.reserved[0]!, totalTokens: 121 }]);

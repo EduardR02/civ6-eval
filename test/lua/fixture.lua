@@ -32,6 +32,20 @@
 --   * Culture:RequestPolicyChanges(clearList, addList) takes an array of slot indices to
 --     clear and a table of policy hashes KEYED BY SLOT INDEX
 --     (Base/Assets/UI/Screens/GovernmentScreen.lua:1558-1570).
+--   * BuildQueue:CanProduce answers its two native questions (ProductionPanel.lua:1911-1913,
+--     :2026-2038): (hash,true) is the panel visibility filter and (hash,false,true) is current
+--     startability plus a results table; only that second form returns two values.
+--   * District pillage is answered per instance (pDistrict:IsPillaged(),
+--     WorldBuilderPlayerEditor.lua:732) and through the city collection as (districtType, plotId)
+--     (CitySupport.lua:665, MapSearchPanel.lua:617). The optional district's instance method can be
+--     made to fail so the collection fallback is exercised.
+--   * Own-unit order reads are separate calls: UnitManager.GetActivityType (UnitPanel.lua:2147),
+--     Unit:GetOperationType / HasPendingOperations / IsAutomated (Objects.csv Q-Unit rows) and
+--     UnitManager.GetQueuedDestination (WorldInput.lua:821, :907, :1165). A trader is a type row with
+--     MakeTradeRoute and its route is matched by route.TraderUnitID (UnitPanel.lua:2165, :2170-2190).
+--   * Queues are position -> row index tables from the calls the native trees use:
+--     PlayerTechs:GetResearchQueue/GetResearchingTech (TechTree.lua:264, ResearchChooser.lua:63) and
+--     PlayerCulture:GetCivicQueue/GetProgressingCivic (CivicsTree.lua:252).
 --
 -- SIMPLIFICATIONS -- every one of these is a place where a passing test proves less than
 -- it looks like it proves:
@@ -64,6 +78,15 @@
 --      (unit, cmd, tParameters, bool, bool) form our actions.lua/options.lua send.  The C++
 --      binding appears to dispatch on argument type, but that could not be confirmed from
 --      static files, so this fixture is MORE PERMISSIVE than the engine may be.
+--  10. Order, route, production and queue state are single knobs, never derived. Nothing here runs
+--      an operation, walks a route or consumes production, so the fixture cannot show that a queued
+--      order is still queued next turn, that an active route ends, or that a pillaged district
+--      becomes repaired. It shows only that the module reads and reports the engine's own answers.
+--      The city has at most one district, and that district's type, pillage and completion state are
+--      the STUB_DISTRICT_* values.
+--  11. copyTable keeps scalar values only, so a traced parameter table omits nested tables (for
+--      example a native path array) instead of showing them. Tests that must observe a table-valued
+--      argument wrap the entry point instead of reading the trace.
 -- =====================================================================================
 
 AstraCiv = AstraCiv or {}
@@ -91,6 +114,11 @@ STUB_GOVERNOR_PROMOTABLE = false
 STUB_GOVERNOR_ASSIGNABLE = true
 STUB_GOVERNOR_ASSIGN_RESULTS = {}
 STUB_MINOR_MET = true
+STUB_TOKENS_TO_GIVE = 0
+STUB_CAN_GIVE_INFLUENCE = true
+STUB_CAN_GIVE_TOKENS_TO = true
+STUB_TOKENS_RECEIVED = 0
+STUB_TOKENS_CONSIDERED = false
 STUB_POLICY_CHANGE_AVAILABLE = true
 STUB_OPERATION_LEGAL = true
 STUB_COMMAND_LEGAL = true
@@ -114,6 +142,40 @@ STUB_REACHABLE_TARGETS = {}
 STUB_REACHABLE_ZOC = {}
 -- GetMoveToPathEx result, or nil to make the call fail the way an unreachable destination does.
 STUB_PATH = nil
+-- Own-unit order state. These are the native reads state.lua reports truthfully; nil means "the
+-- engine records nothing" and is NOT the same as a failed read (tests make a read fail by replacing
+-- the method). ActivityTypes.ACTIVITY_AWAKE is 0.
+STUB_UNIT_ACTIVITY = 0
+STUB_UNIT_OPERATION = nil
+STUB_UNIT_PENDING = nil
+STUB_UNIT_AUTOMATED = nil
+STUB_UNIT_QUEUED_DESTINATION = nil
+-- GameInfo.Units index for the single own unit's type (1 = the fixture's trader row).
+STUB_UNIT_TYPE = 0
+-- Own outgoing trade routes, in the shape UnitPanel.lua:2176-2185 walks
+-- (OriginCityPlayer/OriginCityID/DestinationCityPlayer/DestinationCityID/TraderUnitID), or nil for
+-- none. STUB_ROUTES_BROKEN makes GetOutgoingRoutes return a non-table, the unreadable-list case.
+STUB_OUTGOING_ROUTES = nil
+STUB_ROUTES_BROKEN = false
+-- Production asks two different questions on one native method
+-- (ProductionPanel.lua:1911-1912 CanProduce(hash,true) and :2038 CanProduce(hash,false,true)):
+-- panel visibility, then current startability plus the engine's own results table.
+STUB_PRODUCTION_IN_PANEL = true
+STUB_PRODUCTION_AVAILABLE = true
+STUB_PRODUCTION_RESULTS = {}
+-- One optional own-city district (GameInfo.Districts index). nil means the city has none, so
+-- scenarios that assume no districts keep their meaning.
+STUB_DISTRICT_TYPE = nil
+STUB_DISTRICT_PILLAGED = false
+STUB_DISTRICT_COMPLETE = true
+-- Makes district:IsPillaged() throw so the collection read (CitySupport.lua:665) is exercised.
+STUB_DISTRICT_INSTANCE_READ_FAILS = false
+-- Research/civic queue observations, as the native queue methods return them: queue position ->
+-- row index (TechTree.lua:264, CivicsTree.lua:252).
+STUB_RESEARCH_QUEUE = {}
+STUB_CIVIC_QUEUE = {}
+STUB_RESEARCHING_TECH = -1
+STUB_PROGRESSING_CIVIC = -1
 -- Current policy assignment as GameInfo.Policies indices keyed by zero-based slot.
 STUB_POLICY_SLOTS = {}
 -- Recorded Events/LuaEvents subscriptions: {event = 'NotificationAdded', bus = 'Events'}.
@@ -251,7 +313,7 @@ function ownUnit:GetOwner() return 0 end
 function ownUnit:GetID() return 7 end
 function ownUnit:GetX() return 1 end
 function ownUnit:GetY() return 1 end
-function ownUnit:GetUnitType() return 0 end
+function ownUnit:GetUnitType() return STUB_UNIT_TYPE end
 function ownUnit:GetName() return 'LOC_TEST_WARRIOR' end
 function ownUnit:GetDamage() return 5 end
 function ownUnit:GetMaxDamage() return 100 end
@@ -268,6 +330,12 @@ function ownUnit:GetFortifyTurns() return 0 end
 function ownUnit:GetExperience() return experience end
 function ownUnit:IsReadyToMove() return true end
 function ownUnit:GetPlotId() return 4 end
+-- Native order state. Each read answers exactly one documented question
+-- (Objects.csv Q-UnitGetOperationType, Q-UnitHasPendingOperations, Q-UnitIsAutomated): no pending
+-- operations, no automation and no operation in progress unless a scenario configures them.
+function ownUnit:GetOperationType() return STUB_UNIT_OPERATION end
+function ownUnit:HasPendingOperations() return STUB_UNIT_PENDING == true end
+function ownUnit:IsAutomated() return STUB_UNIT_AUTOMATED == true end
 
 local foreignUnit = {}
 function foreignUnit:GetOwner() return 1 end
@@ -288,7 +356,15 @@ function buildQueue:GetCurrentProductionTypeHash() return 0 end
 function buildQueue:GetCurrentProductionTypeModifier() return 0 end
 function buildQueue:GetSize() return 0 end
 function buildQueue:GetAt() return nil end
-function buildQueue:CanProduce() return true end
+-- One native method, two questions (ProductionPanel.lua:1911-1912, :2026-2038):
+--   CanProduce(hash, true)            -> panel visibility, bare boolean
+--   CanProduce(hash, false, true)     -> startability plus the engine's own results table
+function buildQueue:CanProduce(hash, inPanel, returnResults)
+  trace('BuildQueue.CanProduce', { hash = hash, inPanel = inPanel, returnResults = returnResults })
+  if inPanel == true then return STUB_PRODUCTION_IN_PANEL end
+  if returnResults == true then return STUB_PRODUCTION_AVAILABLE, STUB_PRODUCTION_RESULTS end
+  return STUB_PRODUCTION_AVAILABLE
+end
 function buildQueue:GetUnitCost() return 40 end
 function buildQueue:GetBuildingCost() return 100 end
 function buildQueue:GetDistrictCost() return 60 end
@@ -326,6 +402,36 @@ function citizens:IsFavoredYield() return false end
 function citizens:IsDisfavoredYield() return false end
 
 local cityDistricts = collection({})
+-- The optional own-city district. Its method set is the shipped District query set used by the
+-- observation path: GetType/GetX/GetY/IsComplete/IsPillaged/GetYield plus the defense reads
+-- (Objects.csv Q-CityGetDistrictsGetDistrict*; WorldBuilderPlayerEditor.lua:732 calls
+-- district:IsPillaged() directly).
+local district = {}
+function district:GetType() return STUB_DISTRICT_TYPE end
+function district:GetID() return 1 end
+function district:GetX() return 1 end
+function district:GetY() return 1 end
+function district:IsComplete() return STUB_DISTRICT_COMPLETE == true end
+function district:IsPillaged()
+  if STUB_DISTRICT_INSTANCE_READ_FAILS then error('fixture district pillage read failed') end
+  return STUB_DISTRICT_PILLAGED == true
+end
+function district:GetYield(index) if index == 0 then return 1 end return 0 end
+function district:GetDamage(defenseType) return defenseType == DefenseTypes.DISTRICT_GARRISON and 20 or 0 end
+function district:GetMaxDamage(defenseType) return defenseType == DefenseTypes.DISTRICT_GARRISON and 200 or 100 end
+function district:GetDefenseStrength() return 10 end
+local districtCollection = collection({ district })
+-- The city's district collection answers IsPillaged for a district type index (ProductionPanel.lua:1996)
+-- or for (districtType, plotId) (CitySupport.lua:665, MapSearchPanel.lua:617): only the configured
+-- district is pillaged, and only while this city has it. Both the empty collection and the one with
+-- the district answer the same way, exactly as the engine's collection does.
+local function districtPillaged(districtType, plotId)
+  trace('CityDistricts.IsPillaged', { districtType = districtType, plotId = plotId })
+  if STUB_DISTRICT_TYPE == nil or districtType == nil then return false end
+  return districtType == STUB_DISTRICT_TYPE and STUB_DISTRICT_PILLAGED == true
+end
+function cityDistricts:IsPillaged(districtType, plotId) return districtPillaged(districtType, plotId) end
+function districtCollection:IsPillaged(districtType, plotId) return districtPillaged(districtType, plotId) end
 local ownCity = {}
 function ownCity:GetOwner() return 0 end
 function ownCity:GetID() return 3 end
@@ -337,10 +443,17 @@ function ownCity:GetGrowth() return cityGrowth end
 function ownCity:GetCulturalIdentity() return cityLoyalty end
 function ownCity:GetBuildQueue() return buildQueue end
 function ownCity:GetBuildings() return collection({}) end
-function ownCity:GetDistricts() return cityDistricts end
+-- None unless a scenario installs one, matching every scenario written before districts existed.
+function ownCity:GetDistricts() return STUB_DISTRICT_TYPE == nil and cityDistricts or districtCollection end
 function ownCity:GetReligion() return cityReligion end
 function ownCity:GetCitizens() return citizens end
-function ownCity:GetTrade() return { GetOutgoingRoutes = function() return {} end } end
+-- The route list is what a trader's own unit record joins against (UnitPanel.lua:2170-2190).
+function ownCity:GetTrade()
+  return { GetOutgoingRoutes = function()
+    if STUB_ROUTES_BROKEN then return 'unreadable route list' end
+    return STUB_OUTGOING_ROUTES or {}
+  end }
+end
 function ownCity:GetDistrictID() return -1 end
 
 local units = collection({ ownUnit })
@@ -360,6 +473,9 @@ function culture:GetCultureYield() return 5 end
 function culture:GetCultureNeeded() return 20 end
 function culture:GetCivicProgress() return 4 end
 function culture:GetCivicType() return 0 end
+function culture:GetProgressingCivic() return STUB_PROGRESSING_CIVIC end
+-- Queue position -> Civics row index (CivicsTree.lua:252), same contract as the research queue.
+function culture:GetCivicQueue() return STUB_CIVIC_QUEUE or {} end
 function culture:GetNumPolicySlots() return 2 end
 function culture:GetNumPolicySlotsOpen() return STUB_POLICY_CHANGE_AVAILABLE and 1 or 0 end
 function culture:CivicCompletedThisTurn() return STUB_POLICY_CHANGE_AVAILABLE end
@@ -387,8 +503,11 @@ local techs = {}
 function techs:GetScienceYield() return 6 end
 function techs:GetResearchCost() return 20 end
 function techs:GetResearchProgress() return 4 end
-function techs:GetResearchingTech() return -1 end
+function techs:GetResearchingTech() return STUB_RESEARCHING_TECH end
 function techs:CanResearch() return true end
+-- Queue position -> Technologies row index (TechTree.lua:264). An empty queue is a real answer, not
+-- an unavailable one; a scenario making the read fail replaces this method.
+function techs:GetResearchQueue() return STUB_RESEARCH_QUEUE or {} end
 
 local treasury = {}
 function treasury:GetGoldBalance() return 100 end
@@ -444,6 +563,29 @@ function minorCity:GetPopulation() return 2 end
 
 local minorInfluence = {}
 function minorInfluence:CanReceiveInfluence() return true end
+function minorInfluence:GetTokensReceived(pid) return STUB_TOKENS_RECEIVED end
+
+-- The local player's Influence object is the authority for envoy tokens: how many may still be
+-- given (TopPanel.lua:245), whether giving is allowed at all, and which city-state may receive one
+-- (CityStates.lua:1499 CanGiveTokensToPlayer). Setting the "considered" flag is what the native
+-- City-States screen does when it closes (CityStates.lua:446-455).
+local influence = {}
+function influence:GetTokensToGive() return STUB_TOKENS_TO_GIVE end
+function influence:CanGiveInfluence() return STUB_CAN_GIVE_INFLUENCE end
+function influence:GetTokensReceived(pid)
+  trace('Influence.GetTokensReceived', { player = pid })
+  return STUB_TOKENS_RECEIVED
+end
+function influence:CanGiveTokensToPlayer(pid)
+  trace('Influence.CanGiveTokensToPlayer', { player = pid })
+  return STUB_CAN_GIVE_TOKENS_TO
+end
+function influence:IsGivingTokensConsidered() return STUB_TOKENS_CONSIDERED end
+function influence:SetGivingTokensConsidered(value)
+  trace('Influence.SetGivingTokensConsidered', { value = value and true or false })
+  STUB_TOKENS_CONSIDERED = value and true or false
+  return true
+end
 
 local minorPlayer = {}
 function minorPlayer:GetID() return 2 end
@@ -470,6 +612,7 @@ function player:GetResources() return resources end
 function player:GetGovernors() return governors end
 function player:GetTrade() return { GetOutgoingRouteCapacity = function() return 1 end } end
 function player:GetDiplomacy() return diplomacyApi end
+function player:GetInfluence() return influence end
 function player:GetStats() return {} end
 function player:GetScore() return 10 end
 function player:GetFavor() return 0 end
@@ -525,7 +668,13 @@ UnitManager = {
     if owner == 1 and id == 9 then return foreignUnit end
     return nil
   end,
-  GetActivityType = function() return 0 end,
+  GetActivityType = function() return STUB_UNIT_ACTIVITY end,
+  -- The queued move destination, or nil when the engine records none. The native UI uses this to
+  -- know a move is still queued and to redraw that path (WorldInput.lua:821,907,1165).
+  GetQueuedDestination = function(unit)
+    trace('UnitManager.GetQueuedDestination', {})
+    return STUB_UNIT_QUEUED_DESTINATION
+  end,
   -- Plain plot-index arrays; SelectedUnit.lua:47-54 passes them straight to the lens layers.
   GetReachableMovement = function(unit)
     trace('UnitManager.GetReachableMovement', {})
@@ -633,6 +782,13 @@ PlayerConfigurations = { [0] = {
   GetCivilizationTypeName = function() return 'CIVILIZATION_TEST' end,
   GetLeaderTypeName = function() return 'LEADER_TEST' end,
   GetHandicapTypeID = function() return 0 end,
+},
+-- City-state (minor) player 2: the envoy decision labels its options from here, and a diplomacy
+-- session with a city-state would read its leader name the same way.
+[2] = {
+  GetCivilizationShortDescription = function() return 'LOC_TEST_CITY_STATE_NAME' end,
+  GetCivilizationTypeName = function() return 'CIVILIZATION_TEST_CITY_STATE' end,
+  GetLeaderTypeName = function() return 'LEADER_TEST_CITY_STATE' end,
 } }
 
 Map = {
@@ -708,9 +864,37 @@ EndTurnBlockingTypes = {
   ENDTURN_BLOCKING_UNITS = 1,
   ENDTURN_BLOCKING_PRODUCTION = 2,
   ENDTURN_BLOCKING_SPY_CHOOSE_ESCAPE_ROUTE = 3,
+  ENDTURN_BLOCKING_GIVE_INFLUENCE_TOKEN = 4,
+  -- The rest of the installed enum. Names are the engine's own (every one appears in shipped Lua,
+  -- e.g. ActionPanel.lua:100-114 and ActionPanel_Expansion2.lua for the two congress blockers);
+  -- the numbers are fixture-local identities, exactly like the hash simplification above, so a
+  -- scenario can select one by name without claiming its engine value. state.lua builds its
+  -- name->blocker table at load time, so these must exist before it is loaded.
+  ENDTURN_BLOCKING_UNIT_NEEDS_ORDERS = 5,
+  ENDTURN_BLOCKING_STACKED_UNITS = 6,
+  ENDTURN_BLOCKING_RESEARCH = 7,
+  ENDTURN_BLOCKING_CIVIC = 8,
+  ENDTURN_BLOCKING_FILL_CIVIC_SLOT = 9,
+  ENDTURN_BLOCKING_CONSIDER_GOVERNMENT_CHANGE = 10,
+  ENDTURN_BLOCKING_CONSIDER_RAZE_CITY = 11,
+  ENDTURN_BLOCKING_PANTHEON = 12,
+  ENDTURN_BLOCKING_RELIGION = 13,
+  ENDTURN_BLOCKING_BELIEF = 14,
+  ENDTURN_BLOCKING_CLAIM_GREAT_PERSON = 15,
+  ENDTURN_BLOCKING_SPY_CHOOSE_DRAGNET_PRIORITY = 16,
+  ENDTURN_BLOCKING_ARTIFACT = 17,
+  ENDTURN_BLOCKING_COMMEMORATION_AVAILABLE = 18,
+  ENDTURN_BLOCKING_CONSIDER_DISLOYAL_CITY = 19,
+  ENDTURN_BLOCKING_EMERGENCY_NEEDS_ATTENTION = 20,
+  ENDTURN_BLOCKING_GOVERNOR_APPOINTMENT = 21,
+  ENDTURN_BLOCKING_GOVERNOR_PROMOTION = 22,
+  ENDTURN_BLOCKING_GOVERNOR_IDLE = 23,
+  ENDTURN_BLOCKING_GOVERNOR_OPPORTUNITY = 24,
+  ENDTURN_BLOCKING_WORLD_CONGRESS_SESSION = 25,
+  ENDTURN_BLOCKING_WORLD_CONGRESS_LOOK = 26,
 }
 ActionTypes = { ACTION_ENDTURN = 900 }
-ActivityTypes = { ACTIVITY_AWAKE = 0 }
+ActivityTypes = { ACTIVITY_AWAKE = 0, ACTIVITY_OPERATION = 1, ACTIVITY_SLEEP = 2, ACTIVITY_HOLD = 3 }
 MilitaryFormationTypes = { STANDARD_MILITARY_FORMATION = 0 }
 UnitOperationMoveModifiers = { NONE = 0, ATTACK = 1, MOVE_IGNORE_UNEXPLORED_DESTINATION = 2 }
 UnitOperationResults = {
@@ -728,6 +912,12 @@ CityOperationResults = { FAILURE_REASONS = 1, ADDITIONAL_DESCRIPTION = 2, ACTION
 CityCommandResults = { FAILURE_REASONS = 1, ADDITIONAL_DESCRIPTION = 2, ACTION_NAME = 3, PLOTS = 4, MODIFIERS = 5 }
 FlowDirectionTypes = { FLOW_DIRECTION_NORTHWEST = 0 }
 DefenseTypes = { DISTRICT_GARRISON = 0, DISTRICT_OUTER = 1 }
+-- The installed enum also carries PRODUCTION, SCIENCE and CULTURE; this fixture models the three
+-- yields its GameInfo.Yields rows carry, with values that are fixture-local identities matching
+-- those rows' Index (the hash note above applies), so GameInfo.Yields[YieldTypes.GOLD] resolves to
+-- the gold row here. Native call sites pass these values as YieldTypes parameters
+-- (Objects.csv Q-UnitGetGreatPerson..., Q-CityGetYield; GreatPeoplePopup.lua:913, :925).
+YieldTypes = { FOOD = 0, GOLD = 1, FAITH = 2 }
 
 -- DELIBERATELY INCOMPLETE, exactly as the engine's global is.  HEAL, SLEEP and SKIP_TURN have
 -- GameInfo.UnitOperations rows but are absent here, so any name-based dispatch through this
@@ -762,15 +952,49 @@ PlayerOperations = {
   RESEARCH = 50, PROGRESS_CIVIC = 51, UNLOCK_POLICIES = 52,
   FOUND_PANTHEON = 53, PARAM_TECH_TYPE = 500, PARAM_CIVIC_TYPE = 501,
   PARAM_BELIEF_TYPE = 502, PARAM_INSERT_MODE = 503, VALUE_EXCLUSIVE = 3,
+  -- Queue vs. replace for PARAM_INSERT_MODE: TechTree.lua:241-243 and CivicsTree.lua:241-243 send
+  -- VALUE_APPEND when queueing and VALUE_EXCLUSIVE when replacing. Fixture-local identities.
+  VALUE_APPEND = 4,
   PARAM_GOVERNOR_TYPE = 504, PARAM_PLAYER_ONE = 505, PARAM_CITY_DEST = 506,
   APPOINT_GOVERNOR = 54, ASSIGN_GOVERNOR = 55, PROMOTE_GOVERNOR = 56,
   PARAM_GOVERNOR_PROMOTION_TYPE = 507,
+  -- Envoy tokens: Base/Assets/UI/PartialScreens/CityStates.lua:749-765 sends one request per token
+  -- with PARAM_PLAYER_ONE set to the city-state player id.
+  GIVE_INFLUENCE_TOKEN = 57,
+  -- The rest of the installed PlayerOperations enum, named by the engine. Values are fixture-local
+  -- identities (see the hash note above). Call sites: COMMEMORATE and PARAM_COMMEMORATION_TYPE
+  -- (Expansion2/UI/Additions/DedicationPopup.lua:213-214); GREAT PERSON operations with
+  -- PARAM_GREAT_PERSON_INDIVIDUAL_TYPE and PARAM_YIELD_TYPE
+  -- (Base/Assets/UI/Popups/GreatPeoplePopup.lua:890-928); congress operations with
+  -- PARAM_RESOLUTION_TYPE/PARAM_RESOLUTION_OPTION/PARAM_RESOLUTION_SELECTION/
+  -- PARAM_WORLD_CONGRESS_VOTES/PARAM_DISCUSSION_TYPE
+  -- (Expansion2/UI/Additions/WorldCongressPopup.lua:2242-2402); SET_ESCAPE_ROUTE, ADD_BELIEF,
+  -- FOUND_RELIGION, LEVY_MILITARY, the clan operations, MOVE_GREAT_WORK and NAME_CORPORATION appear
+  -- in the same shipped screen set.
+  COMMEMORATE = 58, SET_ESCAPE_ROUTE = 59, CHOOSE_ARTIFACT_PLAYER = 60, ADD_BELIEF = 61,
+  FOUND_RELIGION = 62, RECRUIT_GREAT_PERSON = 63, REJECT_GREAT_PERSON = 64, PATRONIZE_GREAT_PERSON = 65,
+  WORLD_CONGRESS_RESOLUTION_VOTE = 66, WORLD_CONGRESS_DISCUSSION_VOTE = 67,
+  WORLD_CONGRESS_DISCUSSION_SELECTION = 68, WORLD_CONGRESS_SUBMIT_TURN = 69,
+  WORLD_CONGRESS_LOOKED_AT_AVAILABLE = 70, ACCEPT_EMERGENCY = 71, REJECT_EMERGENCY = 72,
+  MOVE_GREAT_WORK = 73, NAME_CORPORATION = 74, DIPLOMACY_DECLARE_WAR = 75, DIPLOMACY_MAKE_PEACE = 76,
+  LEVY_MILITARY = 77, INCITE_CLAN = 78, HIRE_CLAN = 79, RANSOM_CLAN = 80, BRIBE_CLAN = 81,
+  START_OBSERVER_MODE = 82, EXECUTE_SCRIPT = 83,
+  PARAM_COMMEMORATION_TYPE = 508, PARAM_GREAT_PERSON_INDIVIDUAL_TYPE = 509, PARAM_YIELD_TYPE = 510,
+  PARAM_RESOLUTION_TYPE = 511, PARAM_WORLD_CONGRESS_VOTES = 512, PARAM_RESOLUTION_OPTION = 513,
+  PARAM_RESOLUTION_SELECTION = 514, PARAM_OTHER_PLAYER = 515, PARAM_DISCUSSION_TYPE = 516,
+  PARAM_PLAYER_TWO = 517, PARAM_DISTRICT_TYPE = 518, PARAM_BUILDING_SRC = 519,
+  PARAM_BUILDING_DEST = 520, PARAM_CITY_SRC = 521, PARAM_RELIGION_TYPE = 522,
+  PARAM_RELIGION_CUSTOM_NAME = 523, PARAM_EMERGENCY_TYPE = 524, PARAM_GREAT_WORK_INDEX = 525,
+  PARAM_SLOT = 526, PARAM_RESOURCE_TYPE = 527, PARAM_CORPORATION_CUSTOM_NAME = 528,
 }
 PlayerOperationResults = { FAILURE_REASONS = 1, ADDITIONAL_DESCRIPTION = 2 }
 
 GameInfo = {
   Units = rows({
     { Index = 0, Hash = 1000, UnitType = 'UNIT_WARRIOR', Name = 'LOC_TEST_WARRIOR' },
+    -- The trader marker is a unit-type column, and trader detection is a type-row lookup
+    -- (UnitPanel.lua:2165, :3975). The fixture's own unit takes this type when STUB_UNIT_TYPE = 1.
+    { Index = 1, Hash = 1001, UnitType = 'UNIT_TRADER', Name = 'LOC_TEST_TRADER', MakeTradeRoute = true },
   }),
   -- Real column set: OperationType, Description, VisibleInUI, CategoryInUI (no Name column).
   -- HEAL/SLEEP/SKIP_TURN exist here while UnitOperationTypes omits them, which is the whole
@@ -847,8 +1071,17 @@ GameInfo = {
     { Index = 1, Hash = 3501, GovernorType = 'GOVERNOR_MAGNUS', Name = 'LOC_MAGNUS', Title = 'LOC_MAGNUS_TITLE', Description = 'LOC_MAGNUS_DESC' },
   }),
   GovernorPromotions = rows({
-    { Index = 0, Hash = 3600, GovernorPromotionType = 'GOVERNOR_PROMOTION_TEST', GovernorType = 'GOVERNOR_AMANI', Name = 'LOC_GOV_PROMO', Description = 'LOC_GOV_PROMO_DESC' },
+    { Index = 0, Hash = 3600, GovernorPromotionType = 'GOVERNOR_PROMOTION_TEST', Name = 'LOC_GOV_PROMO',
+      Description = 'LOC_GOV_PROMO_DESC', Level = 1, Column = 0, BaseAbility = 0 },
   }),
+  -- The promotion -> governor relationship is GovernorPromotionSets, and GovernorPromotions carries
+  -- no GovernorType column at all (DLC/Expansion2/Data/Expansion2_Schema.sql:372-379 and :402-407).
+  -- Shipped panels walk this table before looking the promotion row up by type
+  -- (GovernorPanel.lua:203-208, GovernorDetailsPanel.lua:159-166).
+  GovernorPromotionSets = rows({
+    { GovernorType = 'GOVERNOR_AMANI', GovernorPromotion = 'GOVERNOR_PROMOTION_TEST' },
+  }),
+  GovernorPromotionPrereqs = rows({}),
   GameSpeeds = rows({ { Index = 0, GameSpeedType = 'GAMESPEED_STANDARD' } }),
   Difficulties = rows({ { Index = 0, DifficultyType = 'DIFFICULTY_PRINCE' } }),
   Maps = rows({ { Index = 0, MapSizeType = 'MAPSIZE_DUEL' } }),
@@ -879,6 +1112,11 @@ function STUB_INSTALL(name)
   STUB_GOVERNOR_ASSIGNABLE = true
   STUB_GOVERNOR_ASSIGN_RESULTS = {}
   STUB_MINOR_MET = true
+  STUB_TOKENS_TO_GIVE = 0
+  STUB_CAN_GIVE_INFLUENCE = true
+  STUB_CAN_GIVE_TOKENS_TO = true
+  STUB_TOKENS_RECEIVED = 0
+  STUB_TOKENS_CONSIDERED = false
   STUB_POLICY_CHANGE_AVAILABLE = true
   STUB_OPERATION_LEGAL = true
   STUB_COMMAND_LEGAL = true
@@ -899,6 +1137,28 @@ function STUB_INSTALL(name)
   STUB_REACHABLE = { 4, 1, 3, 5, 7 }
   STUB_REACHABLE_TARGETS = { 2 }
   STUB_REACHABLE_ZOC = { 5 }
+  -- Own-unit order state, trade routes, production answers, optional district and queue
+  -- observations: every scenario starts from "the engine records nothing and the city has no
+  -- districts", so scenarios that predate these reads keep their exact meaning.
+  STUB_UNIT_ACTIVITY = 0
+  STUB_UNIT_OPERATION = nil
+  STUB_UNIT_PENDING = nil
+  STUB_UNIT_AUTOMATED = nil
+  STUB_UNIT_QUEUED_DESTINATION = nil
+  STUB_UNIT_TYPE = 0
+  STUB_OUTGOING_ROUTES = nil
+  STUB_ROUTES_BROKEN = false
+  STUB_PRODUCTION_IN_PANEL = true
+  STUB_PRODUCTION_AVAILABLE = true
+  STUB_PRODUCTION_RESULTS = {}
+  STUB_DISTRICT_TYPE = nil
+  STUB_DISTRICT_PILLAGED = false
+  STUB_DISTRICT_COMPLETE = true
+  STUB_DISTRICT_INSTANCE_READ_FAILS = false
+  STUB_RESEARCH_QUEUE = {}
+  STUB_CIVIC_QUEUE = {}
+  STUB_RESEARCHING_TECH = -1
+  STUB_PROGRESSING_CIVIC = -1
   -- Plot 4 (1,1) -> 5 (2,1) -> 2 (2,0): two turns, one river obstacle at plot 5.
   STUB_PATH = { plots = { 4, 5, 2 }, turns = { 1, 1, 2 }, obstacles = { 5 } }
   -- Slot 0 (SLOT_MILITARY) holds POLICY_DISCIPLINE, slot 1 (SLOT_WILDCARD) holds POLICY_SURVEY.

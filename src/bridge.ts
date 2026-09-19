@@ -2,16 +2,55 @@ import { randomUUID, createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { Arguments, BridgeOptions } from "./contracts";
 import {
+  closeSubmittedCongress,
   dismissPopup,
   observePopups,
   popupCatalog,
+  sameContent,
+  type CongressCloseResult,
+  type PopupContent,
   type PopupInvoker,
   type PopupObservation,
-  type PopupSelector,
 } from "./bridge/popups";
 import { TunerTransport } from "./bridge/transport";
 
 export type { BridgeOptions } from "./contracts";
+
+/**
+ * Constructor options owned by this file: the host callback is part of the presentation boundary,
+ * not of the transport contract. contracts.ts stays host-owned.
+ */
+export interface PopupBridgeOptions {
+  /**
+   * Awaited with the full captured observation before any automatic dismissal. The host archives
+   * the observation durably here; throwing aborts the whole boundary before anything is closed.
+   * It must not call back into this bridge: the boundary holds the bridge's serialization queue.
+   * When it is absent, nothing informational is ever dismissed automatically.
+   */
+  onInformationalPopup?: (observation: PopupObservation) => Promise<void>;
+}
+
+/** What one presentation boundary did, and what it deliberately left alone. */
+export interface PresentationReport {
+  /** Every popup that was active or visible while the boundary ran, latest observation per id. */
+  observed: PopupObservation[];
+  /** Full observations handed to the host callback before their screen was closed. */
+  presented: PopupObservation[];
+  /** Popup ids closed through their exact native handler. */
+  dismissed: string[];
+  /** Popup ids whose native handler acknowledged one item and immediately raised the next from the same screen. */
+  advanced: string[];
+  /** Popup ids that left the screen by themselves (native auto-close) while the boundary ran. */
+  resolved: string[];
+  /** Popup ids still on screen, each with the reason it was not closed. */
+  remaining: Array<{ id: string; reason: string }>;
+  /** The host callback threw; the boundary stopped immediately and closed nothing further. */
+  callbackFailures: Array<{ id: string; error: string }>;
+  /** Contexts that could not be probed; an unavailable context is never an absent popup. */
+  unavailable: Record<string, unknown>;
+  /** The bounded drain ran out of rounds with an informational screen still presenting. */
+  more: boolean;
+}
 
 interface Envelope {
   ok: boolean;
@@ -71,8 +110,38 @@ const MAX_RECORD_BYTES = 1024 * 1024;
 /** The complete model-facing bridge surface. Nothing outside this list is reachable. */
 export const BRIDGE_METHODS = [
   "civ.probe", "civ.snapshot", "civ.inspect", "civ.options", "civ.path", "civ.decisions", "civ.decide",
-  "civ.action", "civ.rules", "civ.keybinds", "civ.dismiss_notifications",
+  "civ.action", "civ.rules", "civ.civilopedia", "civ.keybinds", "civ.dismiss_notifications",
 ] as const;
+
+/**
+ * Host-owned admission check for one call: it runs after every awaited connection, context load
+ * and probe, and immediately before each native exchange is admitted, so an abort that arrives
+ * while the bridge is still setting up or observing prevents any native mutation. It must be
+ * cheap and synchronous; throwing aborts the call.
+ */
+type RequestGuard = () => void;
+
+/**
+ * Wraps a guard failure so it can never be mistaken for a screen problem: the popup observers
+ * rethrow this instead of reporting a degraded resource, because an aborted call must stop, not
+ * continue with fewer popups.
+ */
+export class AuthorizationAborted extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "AuthorizationAborted";
+  }
+}
+
+/** Runs the host guard, keeping an abort distinguishable from a screen failure. */
+function admit(authorize?: RequestGuard): void {
+  if (authorize === undefined) return;
+  try {
+    authorize();
+  } catch (error) {
+    throw new AuthorizationAborted(error);
+  }
+}
 
 /** Snapshot sections. The Lua owns what each contains; the host owns rejecting unknown names cheaply. */
 const SECTIONS = ["core", "economy", "units", "cities", "map", "research", "culture", "resources",
@@ -81,6 +150,27 @@ const DEFAULT_SECTIONS = ["core", "units", "cities", "notifications"];
 const REGION_KEYWORDS = ["owned", "visible", "all"];
 const MAX_BATCH = 64;
 const COVERAGE_LEVELS = ["complete", "partial", "omitted"] as const;
+/** InGame Lua modules, loaded in order: primitives, then observations, actions, options, diplomacy, decisions. */
+const UI_MODULES = ["common", "state", "actions", "options", "diplomacy", "decisions"] as const;
+/** Bounded rounds of the presentation drain; a native close can raise its next queued item instantly. */
+const MAX_PRESENTATION_ROUNDS = 4;
+
+/**
+ * True when THIS call's own result reports the congress ballot submission: either directly, or as
+ * an item of a batch (the submit may be anywhere in `results`, and the close is about the submit
+ * that just happened, never about a later review surface).
+ */
+function congressSubmitted(result: Record<string, unknown>): boolean {
+  if (result.sessionSubmitted === true) return true;
+  for (const key of ["results", "items"]) {
+    const list = result[key];
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      if (item && typeof item === "object" && !Array.isArray(item) && (item as Record<string, unknown>).sessionSubmitted === true) return true;
+    }
+  }
+  return false;
+}
 
 /** Validated Lua-declared coverage, or undefined when this response predates coverage declarations. */
 function declaredCoverage(value: unknown): Coverage | undefined {
@@ -96,6 +186,29 @@ function declaredCoverage(value: unknown): Coverage | undefined {
 }
 
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+
+/** Lua tags a mutation error with what is known about submission (lua/common.lua A.entry). */
+const REFUSED_MARKER = "ASTRA_REFUSED: ";
+const UNKNOWN_MARKER = "ASTRA_UNKNOWN: ";
+
+/** Lua errors carry a `[string "..."]:line:` chunk reference; it is not part of the reason. The
+ *  chunk name can itself contain escaped quotes, so escaping is part of the match. */
+function luaReason(text: string): string {
+  return text.replaceAll(REFUSED_MARKER, "").replaceAll(UNKNOWN_MARKER, "")
+    .replace(/\[string "(?:[^"\\]|\\.)*"\]:\d+:\s*/g, "").trim();
+}
+
+/**
+ * A refusal is an error the trusted Lua tagged as raised before any native request was sent, so the
+ * outcome is known: nothing happened. Anything else (transport failure, a request that already
+ * reached the engine, a Lua error after one did) stays an unknown outcome and is never replayed.
+ */
+function refusalReason(error: unknown): string | undefined {
+  const text = message(error);
+  const at = text.indexOf(REFUSED_MARKER);
+  if (at < 0) return undefined;
+  return luaReason(text.slice(at + REFUSED_MARKER.length)) || "The request was refused before submission.";
+}
 
 function requireInteger(value: unknown, label: string, min: number, max: number): number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
@@ -169,20 +282,24 @@ function luaLiteral(value: unknown, depth = 0): string {
 }
 
 /**
- * Host-enforced argument bounds, published by civ.probe. This describes what the bridge validates.
- * What actions and operations exist is never written here: civ.probe takes that from the Lua-side
- * runtime generator, so the probe cannot advertise something the ruleset will reject.
+ * Host-enforced argument bounds, published by civ.probe. This describes only what the bridge
+ * validates and what a method returns; presence, codec support and current legality are three
+ * different things and are never collapsed here. Action and operation catalogues come from the
+ * Lua-side runtime generator, so the probe reports what that call advertised - an advertised
+ * action can still be refused by the ruleset, and an action missing from one call is missing from
+ * that call, not proven absent from the ruleset.
  */
 const METHOD_SCHEMA: Record<string, string> = {
-  "civ.probe": "{verbose?:boolean}; capabilities generated from the live ruleset, popup catalog from the fixed adapters, contexts only with verbose=true",
+  "civ.probe": "{verbose?:boolean}; capabilities as advertised by the runtime generator on this call (not a ruleset claim), popup catalog from the fixed reviewed screen adapters, contexts only with verbose=true",
   "civ.snapshot": `{include?:string|string[] of ${SECTIONS.join("|")}|all (default ${DEFAULT_SECTIONS.join(",")}), region?:"owned"|"visible"|"all"|{x,y,radius<=128}|{x0,y0,x1,y1}, edges?:boolean, detail?:"summary"|"full", mapOffset?:integer>=0, mapLimit?:1..100000}; omitted sections are absent, not empty; coverage={units,cities,map} says complete|partial|omitted per queried collection; region and mapOffset/mapLimit make map partial`,
   "civ.inspect": "{id:string} or {x:integer,y:integer} (+kind?:string, edges?:boolean); single-record lookup, never a full-map read; a live miss returns the remembered record with lastSeenTurn and remembered=true instead of scanning the map",
   "civ.options": `{unitId?:string} | {cityId?:string} | {}; operation?:string (unit: short name from its list; city: item name, place_district, citizens or tile_purchase; player scope: research, civic, government or policies), targets?:boolean, detail?:"summary"|"full", offset?:integer>=0, limit?:1..500`,
   "civ.path": "{unitId:string,x:integer,y:integer}; engine-authorised per-plot path and turn data with busy=true and honest truncation when the engine or bounds cut it",
-  "civ.decisions": `{kind?:string, id?:string, popups?:"all"|"none", detail?:"summary"|"full", offset?:integer>=0, limit?:1..500}; pending gameplay decisions with stable ids plus fixed-context popup observations; popups:"none" skips popup-context probing on list calls; popup ids resolve against the adapter registry only`,
-  "civ.decide": `{id:string,choice?:scalar,choices?:array of <=${MAX_BATCH} selections}; answers one gameplay decision, or dismisses one informational popup by its popup: id (choice/choices rejected for popups); submission is not completion and a thrown-away acknowledgement is never replayed`,
-  "civ.action": `{type:string,...} or {actions:[{type,...}] (<=${MAX_BATCH}, end_turn last only), expectedTurn?:integer, stopOnError?:boolean}; submission is not completion and a batch is never replayed`,
+  "civ.decisions": `{kind?:string, id?:string, popups?:"all"|"none", detail?:"summary"|"full", offset?:integer>=0, limit?:1..500}; pending gameplay decisions with stable ids plus fixed-context popup observations; popups:"none" skips popup-context probing on list calls; popup ids resolve against the adapter registry only; every rendered popup reports its captured text (content/contentStatus) and whether a lossless automatic close is possible (autoDismissible, autoDismissReason)`,
+  "civ.decide": `{id:string,choice?:scalar,choices?:array of <=${MAX_BATCH} selections}; answers one gameplay decision, or closes one reviewed popup by its popup: id (choice/choices rejected for popups). A popup close runs only that screen's own native close handler: it chooses nothing, and gameplay choosers (event, promotion, raze, espionage, map pin, deals) are never closed. Presence and, for an automatic close, byte-identical captured content are re-checked inside the same screen invocation; then it reports advanced=true when the screen immediately shows its next queued item. Submission is not completion, and a thrown-away acknowledgement is never replayed. A request refused before it reached the engine returns status="refused" with reasons; only an already-sent request reports an unknown outcome`,
+  "civ.action": `{type:string,...} or {actions:[{type,...}] (<=${MAX_BATCH}, end_turn last only), expectedTurn?:integer, stopOnError?:boolean}; submission is not completion and a batch is never replayed. A request refused before it reached the engine returns status="refused" (batch items: status="refused", never "unknown"); only an already-sent request reports an unknown outcome. A congress submit that reports sessionSubmitted=true also runs the native ClosePopup teardown of the session screen and reports it separately as popupClose (closed / already-closed / not-the-submitted-surface); an unknown outcome is never followed by that teardown, and a failed teardown never replaces the submitted result`,
   "civ.rules": "{table?:allowlisted GameInfo table,where?:exact scalar equality object,offset?:integer>=0,limit?:1..500}; omit table to list",
+  "civ.civilopedia": "{query?:string,section?:string,id?:string,offset?:integer>=0,limit?:1..100}; no arguments lists sections; query searches the active Civilopedia's titles/ids/search terms; id reads one page (section disambiguates a repeated id). A page is produced by the game's own page code, so its chapters and stat boxes are what the screen shows, with narrative history/flavor omitted; when a page's layout cannot run in this state the same page is answered from the ruleset's own rows and chapters instead, and provenance.source says which happened (layout|data). Costs are the page's reference values; civ.options reports live prices and legality. No screen is opened, focused or navigated.",
   "civ.keybinds": "{category?:string,offset?:integer>=0,limit?:1..100000}; the game's live keyboard bindings from the Input manager",
   "civ.dismiss_notifications": "{}; dismisses every dismissable notification in the on-screen rail; cosmetic only, never a modal choice",
 };
@@ -192,13 +309,16 @@ export class CivBridge {
   private readonly options: Required<BridgeOptions>;
   private readonly transport = new TunerTransport();
   private queue: Promise<unknown> = Promise.resolve();
-  /** Popup adapters run Promise.all probes; this queue serializes their shared transport calls. */
-  private popupQueue: Promise<unknown> = Promise.resolve();
+  /** Single-flight gate for every FireTuner exchange; see gated(). */
+  private gate: Promise<unknown> = Promise.resolve();
   private closed = false;
   private states = new Map<number, string>();
   private identity = "";
   private loaded = new Set<number>();
-  private sources?: Promise<{ common: string; ui: string }>;
+  /** Loaded UI module sources, cached across context reloads; cleared never (source text is immutable). */
+  private uiSources?: Promise<string>;
+  private ruleSource?: Promise<string>;
+  private civilopediaSource?: Promise<string>;
   private records = new Map<string, Observation>();
   private fingerprints = new Map<string, { hash: string; revision: number }>();
   private gameKey = "";
@@ -206,8 +326,9 @@ export class CivBridge {
   private statesRefresh?: Promise<void>;
   /** Context names known not to exist after a shared refresh; avoids one LSQ round trip per popup. */
   private missingContexts = new Set<string>();
+  private readonly onInformationalPopup?: (observation: PopupObservation) => Promise<void>;
 
-  constructor(options: BridgeOptions = {}) {
+  constructor(options: BridgeOptions & PopupBridgeOptions = {}) {
     this.options = {
       host: options.host ?? "127.0.0.1",
       port: options.port ?? 4318,
@@ -219,6 +340,10 @@ export class CivBridge {
     if (!Number.isFinite(this.options.timeoutMs) || this.options.timeoutMs < 100 || this.options.timeoutMs > 300_000) {
       throw new Error("FireTuner timeout must be 100..300000 ms.");
     }
+    if (options.onInformationalPopup !== undefined && typeof options.onInformationalPopup !== "function") {
+      throw new Error("onInformationalPopup must be a function that archives one popup observation.");
+    }
+    this.onInformationalPopup = options.onInformationalPopup;
   }
 
   private serialized<T>(fn: () => Promise<T>): Promise<T> {
@@ -237,21 +362,27 @@ export class CivBridge {
     });
   }
 
-  private async ensureConnected(): Promise<void> {
+  private async ensureConnected(authorize?: RequestGuard): Promise<void> {
+    admit(authorize);
     if (this.transport.connected) return;
-    this.loaded.clear();
-    this.states.clear();
-    this.missingContexts.clear();
-    this.statesRefresh = undefined;
-    await this.transport.connect(this.options.host, this.options.port, this.options.timeoutMs);
-    try {
-      await this.transport.send(4, "APP:");
-      this.identity = await this.handshakeReply("APP");
-      await this.refreshStates();
-    } catch (error) {
-      this.transport.close();
-      throw error;
-    }
+    // Connect, handshake and the state list are one exclusive transport exchange: nothing else may
+    // send or receive while a half-open connection is being brought up.
+    await this.gated(async () => {
+      admit(authorize);
+      this.loaded.clear();
+      this.states.clear();
+      this.missingContexts.clear();
+      this.statesRefresh = undefined;
+      await this.transport.connect(this.options.host, this.options.port, this.options.timeoutMs);
+      try {
+        await this.transport.send(4, "APP:");
+        this.identity = await this.handshakeReply("APP");
+        await this.listStates();
+      } catch (error) {
+        this.transport.close();
+        throw error;
+      }
+    });
   }
 
   private async handshakeReply(kind: "APP" | "LSQ"): Promise<string> {
@@ -266,7 +397,14 @@ export class CivBridge {
     throw new Error(`FireTuner ${kind} handshake timed out.`);
   }
 
-  private async refreshStates(): Promise<void> {
+  private refreshStates(authorize?: RequestGuard): Promise<void> {
+    return this.gated(() => {
+      admit(authorize);
+      return this.listStates();
+    });
+  }
+
+  private async listStates(): Promise<void> {
     await this.transport.send(4, "LSQ:");
     const raw = await this.handshakeReply("LSQ");
     const parts = raw.split(/[\0\r\n]+/).map(value => value.trim()).filter(Boolean);
@@ -319,13 +457,13 @@ export class CivBridge {
    * current list. A missing name is remembered until LSQ reports a changed list, which matters for
    * popup observation where most of the reviewed contexts are normally not loaded.
    */
-  private async contextIndex(name: string, ui: boolean, unavailableHint?: string): Promise<number> {
+  private async contextIndex(name: string, ui: boolean, authorize?: RequestGuard, unavailableHint?: string): Promise<number> {
     let entry = this.contextEntry(name);
     if (!entry) {
       if (this.missingContexts.has(name)) {
         throw new Error(unavailableHint ?? `FireTuner Lua context ${name} is not available in this application.`);
       }
-      this.statesRefresh ??= this.refreshStates().finally(() => { this.statesRefresh = undefined; });
+      this.statesRefresh ??= this.refreshStates(authorize).finally(() => { this.statesRefresh = undefined; });
       await this.statesRefresh;
       entry = this.contextEntry(name);
       if (!entry) {
@@ -335,27 +473,28 @@ export class CivBridge {
       this.missingContexts.delete(name);
     }
     const index = entry[0];
-    if (ui && !this.loaded.has(index)) {
-      this.sources ??= Promise.all([
-        "common", "state", "actions", "options", "decisions",
-      ].map(module => readFile(new URL(`../lua/${module}.lua`, import.meta.url), "utf8")))
-        .then(([common, state, actions, options, decisions]) => ({
-          common: common!,
-          ui: [state, actions, options, decisions].join("\n"),
-        }));
-      const source = await this.sources;
+    if (!this.loaded.has(index)) {
       const marker = "ASTRA_" + randomUUID().replaceAll("-", "");
       const session = randomUUID();
-      const code = `${source.common}\n${source.ui}\nAstraCiv.session=AstraCiv.session or ${luaLiteral(session)}\nAstraCiv.emit(${luaLiteral(marker)},function() return {version=AstraCiv.version,gameId=AstraCiv.session} end)`;
-      await this.collect(index, code, marker);
-      this.loaded.add(index);
-    } else if (!ui && !this.loaded.has(index)) {
-      const source = await (this.sources ??= readFile(new URL("../lua/common.lua", import.meta.url), "utf8")
-        .then(common => ({ common, ui: "" })));
-      const marker = "ASTRA_" + randomUUID().replaceAll("-", "");
-      const session = randomUUID();
-      const code = `${source.common}\nAstraCiv.session=AstraCiv.session or ${luaLiteral(session)}\nAstraCiv.emit(${luaLiteral(marker)},function() return {version=AstraCiv.version,gameId=AstraCiv.session} end)`;
-      await this.collect(index, code, marker);
+      const tail = `\nAstraCiv.session=AstraCiv.session or ${luaLiteral(session)}\nAstraCiv.emit(${luaLiteral(marker)},function() return {version=AstraCiv.version,gameId=AstraCiv.session} end)`;
+      if (ui) {
+        const source = await (this.uiSources ??= Promise.all(UI_MODULES.map(module =>
+          readFile(new URL(`../lua/${module}.lua`, import.meta.url), "utf8")))
+          // Each file has module-private locals; sharing one lexical scope exceeds Civ's
+          // Lua register/local limit and can also accidentally bind another module's helpers.
+          .then(sources => sources.map(source => `do\n${source}\nend`).join("\n")));
+        await this.collect(index, `${source}${tail}`, marker, false, authorize);
+      } else if (name === "CivilopediaScreen") {
+        const source = await (this.civilopediaSource ??= Promise.all(["common", "civilopedia"].map(module =>
+          readFile(new URL(`../lua/${module}.lua`, import.meta.url), "utf8")))
+          .then(sources => sources.map(source => `do\n${source}\nend`).join("\n")));
+        await this.collect(index, `${source}${tail}`, marker, false, authorize);
+      } else {
+        // The rules context gets the shared primitives only, and it has its own cache: a
+        // common-only load must never satisfy a later InGame load that needs every module.
+        const source = await (this.ruleSource ??= readFile(new URL("../lua/common.lua", import.meta.url), "utf8"));
+        await this.collect(index, `${source}${tail}`, marker, false, authorize);
+      }
       this.loaded.add(index);
     }
     return index;
@@ -363,10 +502,14 @@ export class CivBridge {
 
   /**
    * Self-contained evaluator for screen contexts where AstraCiv is deliberately absent. It mirrors
-   * the trusted framing (marker:part:count:hex chunks) with a bounded JSON encoder.
+   * the trusted framing exactly: the same marker:part:count:hex chunk lines and the same
+   * {ok,result|error} envelope AstraCiv.emit produces (lua/common.lua:123-139), with a bounded
+   * JSON encoder. A screen-side Lua error becomes a received ok=false envelope, so one broken
+   * screen probe reports its own error instead of tearing down the shared transport.
    */
   private static readonly POPUP_EVALUATOR = String.raw`local ok, value = pcall(function() return (%BODY%) end)
-if not ok then error(tostring(value)) end
+local response
+if ok then response = { ok = true, result = value } else response = { ok = false, error = tostring(value) } end
 local function quote(value)
   return '"' .. value:gsub('[%z\1-\31\\"]', function(c)
     if c == '"' then return '\\"' end
@@ -394,46 +537,71 @@ local function encode(value, depth)
   table.sort(out)
   return '{' .. table.concat(out, ',') .. '}'
 end
-local text = encode(value, 0)
+local text = encode(response, 0)
 local chunks = math.max(1, math.ceil(#text / 2500))
 for i = 1, chunks do
   local part = text:sub((i - 1) * 2500 + 1, i * 2500)
   local hex = part:gsub('.', function(c) return string.format('%02x', string.byte(c)) end)
-  print(MARKER .. ':' .. i .. ':' .. chunks .. ':' .. hex)
+  print(__MARKER__ .. ':' .. i .. ':' .. chunks .. ':' .. hex)
 end
-print(MARKER .. ':DONE')`;
-
-  /** The trusted popup invoker handed to the reviewed adapters; model code cannot supply either string. */
-  private popupCollect(index: number, code: string, marker: string): Promise<Envelope> {
-    const next = this.popupQueue.then(() => this.collect(index, code, marker));
-    this.popupQueue = next.catch(() => undefined);
-    return next;
-  }
+print(__MARKER__ .. ':DONE')`;
 
   /**
    * Popup contexts are evaluated only through fixed bodies supplied by popups.ts. The evaluator is
-   * not exposed by RPC and its calls are serialized separately because observePopups probes in
-   * parallel for latency while FireTuner permits one receive at a time.
+   * not exposed by RPC. observePopups starts its probes in parallel, and popupInvoker may load a
+   * context first; both kinds of exchange take the single-flight transport gate below, so parallel
+   * probes can never collide with each other or with a request that is already in flight.
    */
-  private popupInvoker(): PopupInvoker {
+  private popupInvoker(authorize?: RequestGuard): PopupInvoker {
     return async (contextName: string, body: string) => {
       if (typeof contextName !== "string" || !contextName || contextName.length > 256) {
         throw new Error("Popup invoker received an invalid context name.");
       }
-      if (typeof body !== "string" || !body || body.length > 32_768 || body.includes("\0")) {
-        throw new Error("Popup invoker received an invalid body.");
+      // A guarded close embeds up to 48 KiB of captured text plus field paths, expanded into
+      // Lua byte escapes. This trusted generated code is not a player RPC argument: keep
+      // a separate byte bound, comfortably below the transport's 8 MiB frame limit.
+      if (typeof body !== "string" || !body || Buffer.byteLength(body, "utf8") > 1024 * 1024 || body.includes("\0")) {
+        throw new Error("Popup invoker body is empty, contains NUL, or exceeds 1 MiB.");
       }
-      const index = await this.contextIndex(contextName, false);
+      const index = await this.contextIndex(contextName, false, authorize);
       const marker = "ASTRA_" + randomUUID().replaceAll("-", "");
+      // Every marker occurrence is substituted. A leftover literal marker would be a nil global in the
+      // game, so the DONE line raised a Lua error instead of closing the response ("Socket is closed"
+      // plus "FireTuner Lua error" on every popup probe).
       const code = CivBridge.POPUP_EVALUATOR
-        .replace("MARKER", () => luaLiteral(marker))
+        .replaceAll("__MARKER__", () => luaLiteral(marker))
         .replace("%BODY%", () => body);
-      const response = await this.popupCollect(index, code, marker);
+      // A screen whose own Lua raised degrades that one observation; the shared transport and the
+      // other screens' probes keep running.
+      const response = await this.collect(index, code, marker, true, authorize);
+      if (!response.ok) throw new Error(luaReason(`Popup probe failed in ${contextName}: ${response.error ?? "the screen's Lua raised."}`));
       return response.result ?? null;
     };
   }
 
-  private async collect(index: number, code: string, marker: string): Promise<Envelope> {
+  /**
+   * FireTuner allows exactly one outstanding command/receive per connection: a second concurrent
+   * receive is refused outright (TunerTransport.receive), and the refused request tears the shared
+   * transport down. Every exchange therefore takes this single gate — one Lua request, one LSQ
+   * refresh, one popup probe, one context load — so callers may run in parallel without interleaving
+   * frames or stealing each other's reply.
+   */
+  private gated<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.gate.then(() => fn());
+    this.gate = run.catch(() => undefined);
+    return run;
+  }
+
+  private collect(index: number, code: string, marker: string, degrade = false, authorize?: RequestGuard): Promise<Envelope> {
+    // The guard runs inside the gate, immediately before the exchange is admitted: an abort during
+    // any earlier await (connect, LSQ, context load, probe) stops the mutation here.
+    return this.gated(() => {
+      admit(authorize);
+      return this.exchange(index, code, marker, degrade);
+    });
+  }
+
+  private async exchange(index: number, code: string, marker: string, degrade = false): Promise<Envelope> {
     const deadline = Date.now() + this.options.timeoutMs;
     const parts = new Map<number, Buffer>();
     let total = 0;
@@ -457,7 +625,10 @@ print(MARKER .. ':DONE')`;
           }
           const envelope = JSON.parse(Buffer.concat(chunks, bytes).toString("utf8")) as Envelope;
           if (typeof envelope.ok !== "boolean") throw new Error("Malformed FireTuner response envelope.");
-          if (!envelope.ok) throw new Error(envelope.error ?? "Trusted Lua request failed.");
+          // A received ok=false envelope is a known outcome: the request reached the screen's Lua
+          // and raised there. Screen probes hand it back as that screen's own degraded status, while
+          // every trusted request keeps failing loudly.
+          if (!envelope.ok && !degrade) throw new Error(envelope.error ?? "Trusted Lua request failed.");
           return envelope;
         }
         if (!text.startsWith(marker + ":")) continue;
@@ -490,15 +661,35 @@ print(MARKER .. ':DONE')`;
     }
   }
 
-  private async invoke(method: string, args: Arguments): Promise<Envelope> {
+  private async invoke(method: string, args: Arguments, authorize?: RequestGuard): Promise<Envelope> {
     const core = method === "rules";
-    const index = await this.contextIndex(core ? "GameCore_Tuner" : "InGame", !core);
+    admit(authorize);
+    const pedia = method === "civilopedia";
+    const index = await this.contextIndex(pedia ? "CivilopediaScreen" : core ? "GameCore_Tuner" : "InGame", !core && !pedia, authorize);
     const marker = "ASTRA_" + randomUUID().replaceAll("-", "");
-    return this.collect(index, `AstraCiv.emit(${luaLiteral(marker)},function() return AstraCiv.${method}(${luaLiteral(args)}) end)`, marker);
+    return this.collect(index, `AstraCiv.emit(${luaLiteral(marker)},function() return AstraCiv.${method}(${luaLiteral(args)}) end)`, marker, false, authorize);
   }
 
-  /** Validate and bound every argument before a connection is opened or anything is submitted. */
-  private static validate(method: string, args: Arguments): void {
+  /**
+   * The complete no-connection preflight request() performs: argument checks plus the exact Lua
+   * literal encoding (nesting depth, 32 KiB per string, JSON-value shape) and the 256 KiB encoded
+   * bound. Public so the host can reject invalid civ arguments before any automatic UI change;
+   * request() runs this same path once and never encodes twice.
+   */
+  static validateRequest(method: string, args: Arguments): void {
+    CivBridge.encodeArguments(method, args);
+  }
+
+  private static encodeArguments(method: string, args: Arguments): string {
+    if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("Bridge arguments must be an object.");
+    CivBridge.validateArguments(method, args);
+    const encoded = luaLiteral(args);
+    if (encoded.length > 256 * 1024) throw new Error("Bridge arguments exceed 256 KiB encoded bound.");
+    return encoded;
+  }
+
+  /** Argument bounds per method; the encoding preflight lives in encodeArguments. */
+  private static validateArguments(method: string, args: Arguments): void {
     switch (method) {
       case "civ.probe":
         if (args.verbose !== undefined && typeof args.verbose !== "boolean") throw new Error("verbose must be a boolean.");
@@ -597,6 +788,20 @@ print(MARKER .. ':DONE')`;
         if (args.offset !== undefined) requireInteger(args.offset, "offset", 0, 1_000_000);
         if (args.limit !== undefined) requireInteger(args.limit, "limit", 1, 500);
         return;
+      case "civ.civilopedia":
+        for (const key of Object.keys(args)) {
+          if (!["query", "section", "id", "offset", "limit"].includes(key)) throw new Error(`Unknown civ.civilopedia argument: ${key}`);
+        }
+        for (const key of ["query", "section", "id"]) {
+          const value = args[key];
+          if (value !== undefined && (typeof value !== "string" || !value.trim() || value.length > 256)) {
+            throw new Error(`civilopedia.${key} must be a nonempty string of at most 256 characters.`);
+          }
+        }
+        if (args.query !== undefined && args.id !== undefined) throw new Error("Civilopedia takes query or id, not both.");
+        if (args.offset !== undefined) requireInteger(args.offset, "offset", 0, 1_000_000);
+        if (args.limit !== undefined) requireInteger(args.limit, "limit", 1, 100);
+        return;
       case "civ.keybinds":
         if (args.category !== undefined && (typeof args.category !== "string" || args.category.length > 128)) throw new Error("category must be a short string.");
         if (args.offset !== undefined) requireInteger(args.offset, "offset", 0, 100_000);
@@ -607,56 +812,60 @@ print(MARKER .. ':DONE')`;
     }
   }
 
-  request(method: string, args: Arguments = {}): Promise<unknown> {
+  request(method: string, args: Arguments = {}, authorize?: RequestGuard): Promise<unknown> {
+    admit(authorize);
     if (!(BRIDGE_METHODS as readonly string[]).includes(method)) {
       return Promise.reject(new Error(`Unsupported bridge method ${method}; no arbitrary Lua or SQL RPC exists. Available: ${BRIDGE_METHODS.join(", ")}.`));
     }
     let encoded: string;
     try {
-      if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("Bridge arguments must be an object.");
-      CivBridge.validate(method, args);
-      encoded = luaLiteral(args);
+      encoded = CivBridge.encodeArguments(method, args);
     } catch (error) {
       return Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }
     if (encoded.length > 256 * 1024) return Promise.reject(new Error("Bridge arguments exceed 256 KiB encoded bound."));
     return this.serialized(async () => {
-      await this.ensureConnected();
+      admit(authorize);
+      await this.ensureConnected(authorize);
+      // The connect handshake and the state list are awaits the host may have passed during; the
+      // call only proceeds if it is still authorized at this point.
+      admit(authorize);
       switch (method) {
-        case "civ.probe": return this.probe(args);
-        case "civ.snapshot": return this.snapshot(args);
-        case "civ.inspect": return this.inspect(args);
-        case "civ.options": return this.read("options", args);
-        case "civ.path": return this.read("path", args);
-        case "civ.decisions": return this.decisions(args);
-        case "civ.rules": return this.read("rules", args);
-        case "civ.keybinds": return this.read("keybinds", args);
-        case "civ.dismiss_notifications": return this.read("dismiss_notifications", args);
-        case "civ.decide": return this.decide(args);
-        case "civ.action": return this.mutation("action", args);
+        case "civ.probe": return this.probe(args, authorize);
+        case "civ.snapshot": return this.snapshot(args, authorize);
+        case "civ.inspect": return this.inspect(args, authorize);
+        case "civ.options": return this.read("options", args, authorize);
+        case "civ.path": return this.read("path", args, authorize);
+        case "civ.decisions": return this.decisions(args, authorize);
+        case "civ.rules": return this.read("rules", args, authorize);
+        case "civ.civilopedia": return this.read("civilopedia", args, authorize);
+        case "civ.keybinds": return this.read("keybinds", args, authorize);
+        case "civ.dismiss_notifications": return this.read("dismiss_notifications", args, authorize);
+        case "civ.decide": return this.decide(args, authorize);
+        case "civ.action": return this.mutation("action", args, authorize);
       }
       throw new Error(`Unsupported bridge method ${method}; no arbitrary Lua or SQL RPC exists.`);
     });
   }
 
   /** Capabilities come from A.capabilities at call time; the bridge never publishes a static action table. */
-  private async probe(args: Arguments): Promise<unknown> {
+  private async probe(args: Arguments, authorize?: RequestGuard): Promise<unknown> {
     const verbose = args.verbose === true;
-    await this.refreshStates();
+    await this.refreshStates(authorize);
     const info = this.connectionInfo(verbose);
     const unavailable: Record<string, unknown> = {};
     let game: unknown = null;
     let capabilities: Record<string, unknown> = {};
     if ([...this.states.values()].includes("InGame")) {
       try {
-        const response = await this.invoke("turnState", {});
+        const response = await this.invoke("turnState", {}, authorize);
         game = response.result;
         Object.assign(unavailable, response.unavailable ?? {});
       } catch (error) {
         unavailable.game = message(error);
       }
       try {
-        const response = await this.invoke("capabilities", {});
+        const response = await this.invoke("capabilities", {}, authorize);
         if (response.result && typeof response.result === "object" && !Array.isArray(response.result)) {
           capabilities = response.result as Record<string, unknown>;
         } else {
@@ -680,37 +889,41 @@ print(MARKER .. ':DONE')`;
         gameId: "Loaded Lua-world instance UUID, stable over TCP reconnects; a reload gets a new instance",
         fog: "Only local player and visible entities are queried. Nonvisible tiles retain earlier observations, not live data. Enemy disappearance is not death.",
         unavailable: "null values plus grouped unavailable diagnostics; not fabricated zeroes",
-        capabilities: "Generated from the live ruleset each call. If an action type or operation is absent here, it does not resolve in this ruleset.",
+        capabilities: "What the runtime generator advertised on this call: action types and operations it can currently describe, not a claim about the ruleset. Missing means not advertised now (unknown, not absent); advertised means dispatchable through a codec, not currently legal. civ.options reports current legality and refusals.",
+        popupCatalog: "Fixed reviewed screen adapters. dismissable there means an explicit civ.decide close runs that screen's own native handler (information-only screens plus the dismiss-only congress, governor and great-people screens); autoDismissible on an observation additionally requires captured, untruncated content and is never offered for a gameplay choice.",
         submission: "civ.action and civ.decide return accepted/submitted, never completed. A partially executed batch names stoppedAt and is never replayed.",
       },
     };
   }
 
-  private async read(name: string, args: Arguments, arrayKey?: string): Promise<unknown> {
-    const response = await this.invoke(name, args);
-    const result = response.result;
-    const unavailable = response.unavailable ?? {};
-    if (Array.isArray(result)) return { [arrayKey ?? "result"]: result, unavailable };
-    if (!result || typeof result !== "object") return { result: result ?? null, unavailable };
-    return { ...(result as object), unavailable };
+  /** `unavailable: {}` was riding on four results in five, which taught the model to skip the key on
+   *  the fifth - the one carrying a real degraded-observation report. Present means something is
+   *  actually unavailable. */
+  private static withDiagnostics<T extends object>(body: T, unavailable: Record<string, unknown>): T {
+    return Object.keys(unavailable).length ? { ...body, unavailable } : body;
   }
 
-  private async decisions(args: Arguments): Promise<unknown> {
+  private async read(name: string, args: Arguments, authorize?: RequestGuard, arrayKey?: string): Promise<unknown> {
+    const response = await this.invoke(name, args, authorize);
+    const result = response.result;
+    const unavailable = response.unavailable ?? {};
+    if (Array.isArray(result)) return CivBridge.withDiagnostics({ [arrayKey ?? "result"]: result }, unavailable);
+    if (!result || typeof result !== "object") return CivBridge.withDiagnostics({ result: result ?? null }, unavailable);
+    return CivBridge.withDiagnostics({ ...(result as object) }, unavailable);
+  }
+
+  private async decisions(args: Arguments, authorize?: RequestGuard): Promise<unknown> {
     const id = typeof args.id === "string" && args.id.startsWith("popup:") ? args.id : undefined;
     if (id !== undefined) {
-      const observations = await observePopups(this.popupInvoker(), { id });
+      const observations = await observePopups(this.popupInvoker(authorize), { id });
       const popup = observations[0]!;
-      return {
-        decisions: [popup],
-        total: 1,
-        offset: 0,
-        more: false,
-        unavailable: popup.status === "ok" ? {} : { popup: { [popup.id]: popup.error ?? popup.status } },
-      };
+      return CivBridge.withDiagnostics(
+        { decisions: [popup], total: 1, offset: 0, more: false },
+        popup.status === "ok" ? {} : { popup: { [popup.id]: popup.error ?? popup.status } });
     }
 
-    const response = await this.invoke("decisions", args);
-    const observations = await observePopups(this.popupInvoker(), args.popups === "none" ? { kinds: [] } : undefined);
+    const response = await this.invoke("decisions", args, authorize);
+    const observations = await observePopups(this.popupInvoker(authorize), args.popups === "none" ? { kinds: [] } : undefined);
     const active: PopupObservation[] = observations.filter(observation =>
       observation.status === "ok" && (observation.active || observation.visible));
     const diagnostics = observations.filter(observation => observation.status !== "ok");
@@ -726,13 +939,13 @@ print(MARKER .. ':DONE')`;
     const result = response.result;
     if (Array.isArray(result)) {
       const decisions = [...result, ...active];
-      return { decisions, total: decisions.length, offset: 0, more: false, unavailable };
+      return CivBridge.withDiagnostics({ decisions, total: decisions.length, offset: 0, more: false }, unavailable);
     }
     if (!result || typeof result !== "object") {
       const decisions = [...active];
-      return { decisions, total: decisions.length, offset: 0, more: false, unavailable };
+      return CivBridge.withDiagnostics({ decisions, total: decisions.length, offset: 0, more: false }, unavailable);
     }
-    const output = { ...(result as Record<string, unknown>), unavailable } as Record<string, unknown>;
+    const output = CivBridge.withDiagnostics({ ...(result as Record<string, unknown>) }, unavailable) as Record<string, unknown>;
     const native = Array.isArray(output.decisions) ? output.decisions : [];
     output.decisions = [...native, ...active];
     if (typeof output.total === "number" && output.more !== true) output.total += active.length;
@@ -742,24 +955,215 @@ print(MARKER .. ':DONE')`;
     return output;
   }
 
-  private async decide(args: Arguments): Promise<unknown> {
-    if (typeof args.id === "string" && args.id.startsWith("popup:")) {
-      const result = await dismissPopup(args.id, this.popupInvoker());
-      return { ...result, accepted: result.dismissed, completed: result.dismissed, unavailable: {} };
-    }
-    return this.mutation("decide", args);
+  /**
+   * One presentation boundary. Every information-only screen that is currently rendered is
+   * captured, handed to the host callback (which archives it durably and may abort by throwing),
+   * revalidated immediately before the close, and only then closed through its exact native
+   * handler. A native close can raise the next queued item from the same screen: those are
+   * re-observed and re-presented in bounded rounds, so a successor is never acknowledged before
+   * its content is preserved. Choosers, diplomacy/congress, the generic modal, the advisor and the
+   * game-over screen are only reported. Without a callback nothing is dismissed automatically, and
+   * the first callback failure stops the boundary instead of closing anything else.
+   *
+   * `authorize` is the final admission check the host owns: it runs at the start of the boundary
+   * and again immediately before every native close, inside the serialized section, so an abort
+   * that arrives while the screen is still being probed or archived prevents any UI mutation.
+   * Throwing from it aborts the boundary; nothing is closed afterwards and the guard failure is
+   * never folded into a popup error result.
+   */
+  preparePresentation(authorize?: RequestGuard): Promise<PresentationReport> {
+    return this.serialized(async () => {
+      admit(authorize);
+      await this.ensureConnected();
+      return this.present(authorize);
+    });
   }
 
-  private async mutation(name: string, args: Arguments): Promise<unknown> {
+  private async present(authorize?: RequestGuard): Promise<PresentationReport> {
+    const invoke = this.popupInvoker(authorize);
+    const seen = new Map<string, PopupObservation>();
+    const presented: PopupObservation[] = [];
+    const dismissed: string[] = [];
+    const advanced: string[] = [];
+    const resolved: string[] = [];
+    const callbackFailures: Array<{ id: string; error: string }> = [];
+    const remaining = new Map<string, string>();
+    const lastPresented = new Map<string, PopupContent>();
+    let pending: string[] = [];
+    let more = false;
+
+    for (let round = 1; ; round++) {
+      const observations = round === 1
+        ? await observePopups(invoke)
+        : await Promise.all(pending.map(async id => (await observePopups(invoke, { id }))[0]!));
+      pending = [];
+
+      const work: PopupObservation[] = [];
+      for (const observation of observations) {
+        seen.set(observation.id, observation);
+        if (observation.status !== "ok") {
+          if (round > 1) remaining.set(observation.id, `The screen could not be probed while draining it: ${observation.error ?? observation.status}.`);
+          continue;
+        }
+        if (!observation.active && !observation.visible) {
+          if (round > 1) resolved.push(observation.id);
+          continue;
+        }
+        if (observation.autoDismissible) {
+          const prior = round > 1 ? lastPresented.get(observation.id) : undefined;
+          if (prior !== undefined && observation.content !== null && sameContent(prior, observation.content)) {
+            // A native acknowledgement that raises the same text again is not a new item; the
+            // bridge archives it once and never repeats the close on its own.
+            remaining.set(observation.id, "The screen shows the same text again after its native handler acknowledged one item, so nothing further was closed automatically.");
+            continue;
+          }
+          work.push(observation);
+        } else remaining.set(observation.id, observation.autoDismissReason ?? `${observation.context} is never closed automatically.`);
+      }
+      if (work.length === 0) break;
+      if (round > MAX_PRESENTATION_ROUNDS) {
+        more = true;
+        for (const observation of work) remaining.set(observation.id, `The bounded presentation drain stopped at ${MAX_PRESENTATION_ROUNDS} rounds with ${observation.context} still presenting; nothing was closed on this pass.`);
+        break;
+      }
+      if (this.onInformationalPopup === undefined) {
+        for (const observation of work) {
+          remaining.set(observation.id, "No onInformationalPopup callback is configured, so nothing is dismissed automatically.");
+        }
+        break;
+      }
+
+      let progressed = false;
+      for (const observation of work) {
+        // The host callback may have run long enough for the bridge to be closed (shutdown or
+        // control change); nothing further is closed then, and the rest is reported untouched.
+        if (this.closed) {
+          for (const item of work) {
+            remaining.set(item.id, "The bridge was closed while the boundary was presenting; nothing was closed and the screen was not touched.");
+          }
+          break;
+        }
+        const content = observation.content!;
+        try {
+          await this.onInformationalPopup(observation);
+        } catch (error) {
+          callbackFailures.push({ id: observation.id, error: message(error) });
+          remaining.set(observation.id, `The host callback failed, so nothing was closed: ${message(error)}`);
+          for (const other of work) {
+            if (other.id !== observation.id) {
+              remaining.set(other.id, "The presentation boundary stopped after the host callback failed; this screen was not touched.");
+            }
+          }
+          return this.report(seen, presented, dismissed, advanced, resolved, remaining, callbackFailures, more);
+        }
+        presented.push(observation);
+        lastPresented.set(observation.id, content);
+        // Final admission check: the host may have been cancelled while this screen was probed and
+        // archived, and that must prevent the native close. A throw here aborts the boundary.
+        admit(authorize);
+        const result = await dismissPopup(observation.id, invoke, content);
+        if (result.dismissed) {
+          dismissed.push(observation.id);
+          remaining.delete(observation.id);
+          progressed = true;
+        } else if (result.advanced) {
+          advanced.push(observation.id);
+          pending.push(observation.id);
+          remaining.set(observation.id, "Its native handler acknowledged one item and raised the next from the same screen; the next item is presented before it is acknowledged in turn.");
+          progressed = true;
+        } else if (result.changed) {
+          pending.push(observation.id);
+          remaining.set(observation.id, "Its content changed after it was presented, so the native close ran nothing; the new content is captured before it is closed.");
+          progressed = true;
+        } else if (result.gone) {
+          resolved.push(observation.id);
+          remaining.delete(observation.id);
+          progressed = true;
+        } else {
+          remaining.set(observation.id, result.note ?? result.error ?? `The native close did not complete (status ${result.status}).`);
+        }
+      }
+      if (!progressed) break;
+    }
+    return this.report(seen, presented, dismissed, advanced, resolved, remaining, callbackFailures, more);
+  }
+
+  private report(
+    seen: Map<string, PopupObservation>,
+    presented: PopupObservation[],
+    dismissed: string[],
+    advanced: string[],
+    resolved: string[],
+    remaining: Map<string, string>,
+    callbackFailures: Array<{ id: string; error: string }>,
+    more: boolean,
+  ): PresentationReport {
+    const unavailable: Record<string, unknown> = {};
+    const contextMissing = [...seen.values()].filter(item => item.status === "context-missing").map(item => item.id);
+    const errors = [...seen.values()].filter(item => item.status === "error").map(item => ({ id: item.id, error: item.error }));
+    if (contextMissing.length) unavailable.contextMissing = contextMissing;
+    if (errors.length) unavailable.errors = errors;
+    const observed = [...seen.values()].filter(item => item.status === "ok" && (item.active || item.visible));
+    return {
+      observed,
+      presented,
+      dismissed,
+      advanced,
+      resolved,
+      remaining: [...remaining].map(([id, reason]) => ({ id, reason })),
+      callbackFailures,
+      unavailable,
+      more,
+    };
+  }
+
+  private async decide(args: Arguments, authorize?: RequestGuard): Promise<unknown> {
+    if (typeof args.id === "string" && args.id.startsWith("popup:")) {
+      const result = await dismissPopup(args.id, this.popupInvoker(authorize));
+      return { ...result, accepted: result.dismissed, completed: result.dismissed, unavailable: {} };
+    }
+    return this.mutation("decide", args, authorize);
+  }
+
+  private async mutation(name: string, args: Arguments, authorize?: RequestGuard): Promise<unknown> {
     const label = name === "decide" ? "Decision" : "Action";
-    const response = await this.invoke(name, args).catch((error: unknown) => {
-      throw new Error(`${label} failed or its acknowledgement was lost; outcome may be unknown. It was NOT replayed. Read a new snapshot before deciding whether to retry. ${message(error)}`);
-    });
+    let response: Envelope;
+    try {
+      response = await this.invoke(name, args, authorize);
+    } catch (error) {
+      const refused = refusalReason(error);
+      if (refused === undefined) {
+        const text = message(error);
+        throw new Error(`${label} failed or its acknowledgement was lost; outcome may be unknown. It was NOT replayed. Read a new snapshot before deciding whether to retry. ${luaReason(text) || text}`);
+      }
+      return {
+        accepted: false, completed: false, status: "refused", reasons: [refused], unavailable: {},
+        note: "Refused before submission: nothing reached the engine, so there is no unknown outcome here. Fix the stated reason and submit again.",
+      };
+    }
     const result = response.result;
     if (!result || typeof result !== "object" || Array.isArray(result)) {
       return { result: result ?? null, unavailable: response.unavailable ?? {} };
     }
-    return { ...(result as object), unavailable: response.unavailable ?? {} };
+    const output: Record<string, unknown> = { ...(result as Record<string, unknown>), unavailable: response.unavailable ?? {} };
+    // The model's own explicit congress submit authorizes the screen teardown the native Accept
+    // performs (WorldCongressPopup.lua OnAccept -> ClosePopup). Only a known submitted outcome
+    // reaches this point: an unknown outcome throws above and is never followed by a close, and a
+    // refused request has nothing to tear down. The close is reported separately and its failure
+    // never replaces the submitted result.
+    if (congressSubmitted(output)) {
+      let popupClose: CongressCloseResult;
+      try {
+        popupClose = await closeSubmittedCongress(this.popupInvoker(authorize));
+      } catch (error) {
+        popupClose = {
+          id: "popup:world-congress", status: "error", error: message(error),
+          note: "The submitted result stands unchanged; the congress screen could not be re-probed, so close it explicitly with civ.decide if it is still up.",
+        };
+      }
+      output.popupClose = popupClose;
+    }
+    return output;
   }
 
   private clearKnowledge(): void {
@@ -935,8 +1339,8 @@ print(MARKER .. ':DONE')`;
     };
   }
 
-  private async snapshot(args: Arguments): Promise<Snapshot> {
-    const response = await this.invoke("snapshot", args);
+  private async snapshot(args: Arguments, authorize?: RequestGuard): Promise<Snapshot> {
+    const response = await this.invoke("snapshot", args, authorize);
     if (!response.result || typeof response.result !== "object" || Array.isArray(response.result)) throw new Error("Malformed snapshot response.");
     const snapshot = response.result as Snapshot;
     if (typeof snapshot.gameId !== "string" || !snapshot.gameId || snapshot.gameId.length > 256 ||
@@ -1005,14 +1409,12 @@ print(MARKER .. ':DONE')`;
       }
     }
 
-    const narrowed = coverage.units !== "complete" || coverage.cities !== "complete" || coverage.map !== "complete";
+    // What this response covers is data and stays. What "partial" and "last-known" mean is contract:
+    // the system prompt and civ.probe state it once, and it was being restated on every snapshot.
+    // `complete` is the flag that carries the invariant; the paragraph did not add to it.
     snapshot.knowledge = {
-      staleFacts: "Accumulated from earlier player-observable captures and restored independently of this snapshot; retained facts are last-known, never hidden live state.",
-      enemyAbsence: "Unknown, never inferred dead",
-      records: "id stable within the loaded game/player instance; revision increases when an observed record changes",
-      sections: `Included: ${declaredSections.join(", ")}. Anything outside these sections is omitted from this response, not empty in the game; accumulated records remain available through later matching queries and host recovery memory.`,
-      coverage: `units=${coverage.units}, cities=${coverage.cities}, map=${coverage.map}`,
-      ...(narrowed ? { absence: "This response is partial or sectioned, so missing records were not treated as absent. Their absence here means unqueried or not currently observable, not gone." } : {}),
+      sections: declaredSections,
+      coverage,
     };
     return snapshot;
   }
@@ -1029,8 +1431,8 @@ print(MARKER .. ':DONE')`;
   }
 
   /** Single-record lookup with the same last-known/stale discipline as a snapshot, without reading the map. */
-  private async inspect(args: Arguments): Promise<unknown> {
-    const response = await this.invoke("inspect", args);
+  private async inspect(args: Arguments, authorize?: RequestGuard): Promise<unknown> {
+    const response = await this.invoke("inspect", args, authorize);
     if (!response.result || typeof response.result !== "object" || Array.isArray(response.result)) throw new Error("Malformed inspect response.");
     const payload = response.result as Record<string, unknown>;
     const gameId = typeof payload.gameId === "string" ? payload.gameId : null;
@@ -1079,7 +1481,7 @@ print(MARKER .. ':DONE')`;
     if (this.closed) return;
     this.closed = true;
     this.transport.close();
-    await Promise.allSettled([this.queue, this.popupQueue]);
+    await Promise.allSettled([this.queue, this.gate]);
     this.loaded.clear();
     this.missingContexts.clear();
     this.records.clear();

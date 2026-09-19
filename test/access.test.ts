@@ -32,7 +32,10 @@ test("artifacts share selected work without exposing sibling private files", asy
   expect(JSON.parse(result.content)).toEqual({ tiles: [12, 18] });
   await expect(host.rpc("analyst", "artifact.read", { name: "../private.json" })).rejects.toThrow();
   await expect(host.rpc("analyst", "artifact.write", { name: "plans/../../private.json", content: "replace" })).rejects.toThrow();
-  await expect(host.rpc("analyst", "artifact.read", { name: "C:/Users/Eduard/.codex/auth.json" })).rejects.toThrow();
+  // An absolute host path is refused whatever it points at; the credential file is the case that
+  // matters, so the shape is asserted without naming a real account's home directory.
+  await expect(host.rpc("analyst", "artifact.read", { name: "C:/Users/example/.codex/auth.json" })).rejects.toThrow();
+  await expect(host.rpc("analyst", "artifact.read", { name: "/home/example/.codex/auth.json" })).rejects.toThrow();
 });
 
 test("an analyst can inspect captured state but cannot operate the live game", async () => {
@@ -46,6 +49,60 @@ test("an analyst can inspect captured state but cannot operate the live game", a
   await expect(host.rpc("analyst", "desktop.click", { x: 10, y: 10 })).rejects.toThrow("Live game control belongs to main");
   await expect(host.rpc("analyst", "control.grant", { agentId: "analyst" })).rejects.toThrow("Only main");
 });
+
+test("native screenshots remain available when popup observation is broken", async () => {
+  const { host } = await fixture();
+  host.bridge.preparePresentation = async () => { throw new Error("Popup transport unavailable"); };
+  const image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWZ0AAAAASUVORK5CYII=";
+  host.desktop.request = async method => {
+    if (method === "desktop.screenshot") return { data: image, mimeType: "image/png", width: 1, height: 1 };
+    throw new Error(`Unexpected native input: ${method}`);
+  };
+  const result = await host.rpc("main", "desktop.screenshot") as { data: string; presentationError: string };
+  expect(result.data).toBe(image);
+  expect(result.presentationError).toContain("Popup transport unavailable");
+});
+
+test("a coordinate click cannot auto-dismiss the screen its target belongs to", async () => {
+  const { host } = await fixture();
+  let modalVisible = true;
+  host.bridge.preparePresentation = async () => {
+    modalVisible = false;
+    return { observed: [], presented: [], dismissed: ["popup:tech"], advanced: [], resolved: [], remaining: [], callbackFailures: [], unavailable: {}, more: false };
+  };
+  let activated: string | undefined;
+  host.desktop.request = async method => {
+    if (method !== "desktop.click") throw new Error(`Unexpected native input: ${method}`);
+    activated = modalVisible ? "modal button" : "underlying map";
+    return { submitted: true };
+  };
+  await host.rpc("main", "desktop.click", { x: 20, y: 30 });
+  expect(activated).toBe("modal button");
+});
+
+for (const method of ["civ.action", "desktop.screenshot"]) {
+  test(`control handoff during popup preparation prevents ${method} from starting`, async () => {
+    const { host } = await fixture();
+    let handoff: Promise<void> | undefined;
+    const submitted: string[] = [];
+    host.desktop.request = async method => {
+      if (method !== "desktop.cancel") submitted.push(method);
+      return {};
+    };
+    host.bridge.request = async method => { submitted.push(method); return {}; };
+    host.bridge.preparePresentation = async () => {
+      handoff = host.setController("analyst");
+      return { observed: [], presented: [], dismissed: [], advanced: [], resolved: [], remaining: [], callbackFailures: [], unavailable: {}, more: false };
+    };
+    try {
+      await expect(host.rpc("main", method, method === "civ.action" ? { type: "end_turn" } : {}))
+        .rejects.toThrow("control handoff");
+      expect(submitted).toEqual([]);
+    } finally {
+      await handoff;
+    }
+  });
+}
 
 test("history search returns bounded excerpts with recoverable full-record offsets", async () => {
   const { host, directory } = await fixture();

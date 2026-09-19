@@ -18,6 +18,19 @@ credentials.*.json
 *.p12
 *.pfx
 
+# The OMP agent's own state. models.yml holds a provider API key in plaintext and agent.db is the
+# credential store; neither belongs in a checkout even as a copied-in reference.
+.omp/
+models.yml
+agent.db
+*.sqlite
+*.sqlite3
+*.db
+
+# Run artifacts. .civ6/ already covers the normal location; this catches a transcript or snapshot
+# dropped anywhere else in the tree.
+*.jsonl
+
 # Python and test-generated state.
 *.pyo
 .pytest_cache/
@@ -36,3 +49,8 @@ logs/
 Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+
+# Supplied strategy material for the expert-informed track. Kept on disk and deliberately not
+# committed yet: it is third-party-derived source material whose licensing and placement are still
+# open. Delete this block when that is settled.
+guides/

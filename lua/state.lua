@@ -53,11 +53,39 @@ local blockerNeeds = {
   ENDTURN_BLOCKING_RELIGION='religion', ENDTURN_BLOCKING_BELIEF='belief',
   ENDTURN_BLOCKING_GIVE_INFLUENCE_TOKEN='influenceToken', ENDTURN_BLOCKING_CLAIM_GREAT_PERSON='greatPerson',
   ENDTURN_BLOCKING_SPY_CHOOSE_ESCAPE_ROUTE='spyEscapeRoute', ENDTURN_BLOCKING_SPY_CHOOSE_DRAGNET_PRIORITY='spyDragnetPriority',
-  ENDTURN_BLOCKING_ARTIFACT='artifact'
+  ENDTURN_BLOCKING_ARTIFACT='artifact',
+  -- Rise & Fall / Gathering Storm blockers, names taken from the installed enum (all appear in
+  -- shipped Lua: ActionPanel.lua:100-114, DLC/Expansion1/UI/Replacements/ActionPanel_Expansion1.lua:19-28,
+  -- ActionPanel_Expansion2.lua). Each family named here exists in the decisions module; a blocker
+  -- with no matching family is left without `needs` rather than guessed.
+  ENDTURN_BLOCKING_GOVERNOR_APPOINTMENT='governor', ENDTURN_BLOCKING_GOVERNOR_PROMOTION='governor',
+  ENDTURN_BLOCKING_GOVERNOR_IDLE='governor', ENDTURN_BLOCKING_GOVERNOR_OPPORTUNITY='governor',
+  ENDTURN_BLOCKING_WORLD_CONGRESS_SESSION='congress', ENDTURN_BLOCKING_WORLD_CONGRESS_LOOK='congress',
+  ENDTURN_BLOCKING_EMERGENCY_NEEDS_ATTENTION='congress', ENDTURN_BLOCKING_COMMEMORATION_AVAILABLE='commemoration'
 }
 local function id(kind, owner, index)
   if index == nil then return A.session..':'..kind..':'..owner end
   return A.session..':'..kind..':'..owner..':'..index
+end
+--- Like A.call/A.static, but a nil return stays nil. "The engine reports nothing here" (no queued
+--- destination, no operation in progress) and "this read is unavailable or failed" are different
+--- facts and must not collapse into the same value. Availability failures still land in the
+--- response diagnostics, exactly as A.call records them.
+local function readValue(group, object, method, ...)
+  if object == nil or object == A.null then return A.unavailable(group, method, 'API object unavailable in this context') end
+  local fn = object[method]
+  if type(fn) ~= 'function' then return A.unavailable(group, method, 'API method unavailable') end
+  local ok, value = pcall(fn, object, ...)
+  if not ok then return A.unavailable(group, method, value) end
+  return value
+end
+local function readStatic(group, object, method, ...)
+  if object == nil then return A.unavailable(group, method, 'API namespace unavailable') end
+  local fn = object[method]
+  if type(fn) ~= 'function' then return A.unavailable(group, method, 'API function unavailable') end
+  local ok, value = pcall(fn, ...)
+  if not ok then return A.unavailable(group, method, value) end
+  return value
 end
 function A.localPlayer()
   local pid = Game.GetLocalPlayer()
@@ -76,10 +104,34 @@ local function unitIsReady(unit)
   if not ready then return false end
   return A.call('units', unit, 'IsReadyToMove') ~= false
 end
-local function readyUnitIds(pid, player)
+--- What the engine already records as work for this own unit, or nil when it records none:
+--- HasPendingOperations / IsAutomated (Objects.csv Q-UnitHasPendingOperations, Q-UnitIsAutomated)
+--- and UnitManager.GetQueuedDestination, the call the shipped UI uses to know a move is still
+--- queued and to redraw its path (WorldInput.lua:821, :907, :1165). A failed read is never
+--- reported as work.
+local function queuedWorkReason(unit)
+  local reason
+  if readValue('unitOrder', unit, 'HasPendingOperations') == true then reason = 'HasPendingOperations' end
+  if readValue('unitOrder', unit, 'IsAutomated') == true then
+    reason = reason and (reason..' and IsAutomated') or 'IsAutomated'
+  end
+  if type(readStatic('unitOrder', UnitManager, 'GetQueuedDestination', unit)) == 'number' then
+    reason = reason and (reason..' and a queued destination') or 'a queued destination'
+  end
+  return reason
+end
+--- Ready own units, which are candidates for the engine's order blockers and never a verdict:
+--- blocker membership itself is not readable from Lua (GetAllEndTurnBlocking returns blocker types).
+--- Callers may pass `withWork` to collect, per candidate, what the engine already records for it.
+local function readyUnitIds(pid, player, withWork)
   local out = A.array()
   for _, unit in player:GetUnits():Members() do
-    if unitIsReady(unit) then out[#out+1] = id('unit', pid, unit:GetID()) end
+    if unitIsReady(unit) then
+      local uid = id('unit', pid, unit:GetID())
+      out[#out+1] = uid
+      local reason = queuedWorkReason(unit)
+      if reason and withWork then withWork[#withWork+1] = {id=uid, reason=reason} end
+    end
   end
   return out
 end
@@ -93,6 +145,22 @@ local function idleProductionCityIds(pid, player)
   end
   return out
 end
+--- What is holding the turn when the engine will not enumerate blockers. `blockers=null` alone
+--- reads as "nothing is wrong", and a live leader screen is exactly the case where the model most
+--- needs to know. Cost is one table scan over sessions this player has actually heard from plus one
+--- native flag, so it never walks the player list.
+local function modalHold(pid)
+  if DiplomacyManager == nil then return A.null end
+  for sessionID in pairs(A.diplomacyStatements or {}) do
+    if A.static('turn', DiplomacyManager, 'IsSessionIDOpen', sessionID) == true then
+      return {kind='diplomacy', sessionId=sessionID}
+    end
+  end
+  if A.static('turn', DiplomacyManager, 'HasQueuedSession', pid) == true then
+    return {kind='diplomacy', queued=true}
+  end
+  return A.null
+end
 function A.turnState()
   local pid, player = A.localPlayer()
   -- ActionPanel.UpdateEndTurn waits for these before entering blocker bindings.
@@ -101,10 +169,12 @@ function A.turnState()
   local processing=A.static('turn',UI,'IsProcessingMessages')
   local ready=alive==true and complete==true and processing==false
   local types=A.null
+  local waitingOn=A.null
   if ready then
     types=A.static('notifications',NotificationManager,'GetAllEndTurnBlocking',pid)
   else
-    A.unavailable('notifications','readiness','Blocker observation deferred until the local player is alive, turn activation is complete, and UI messages have drained')
+    -- Report the hold here, not only in the diagnostics sidecar: turnState is what a wait loop reads.
+    waitingOn=modalHold(pid)
   end
   local blockers=A.null
   if types~=A.null and type(types)=='table' then
@@ -114,8 +184,16 @@ function A.turnState()
       local summaryKey=n~=A.null and A.call('notifications',n,'GetSummary') or A.null
       local name=blockerNames[blockingType]
       -- id is an EndTurnBlockingTypes identifier, not a notification ID; unit orders may have no notification.
-      local blocker={id=blockingType, type=name or A.null, summaryKey=summaryKey, summary=A.loc(summaryKey)}
-      if name and blockerUnits[name] then blocker.units=A.section('turnBlockers',function() return readyUnitIds(pid,player) end) end
+      local blocker={id=blockingType, type=name or A.null, summary=A.loc(summaryKey)}
+      if name and blockerUnits[name] then
+        local withWork=A.array()
+        blocker.units=A.section('turnBlockers',function() return readyUnitIds(pid,player,withWork) end)
+        -- Annotation, not a filter: these candidates already have native queued work recorded on
+        -- them (pending operation, automation or a queued destination). They stay in `units` because
+        -- an interrupted or stuck queued order can still need one, and because the engine's own
+        -- blocker membership is not readable here.
+        if #withWork>0 then blocker.unitsWithQueuedWork=withWork end
+      end
       if name=='ENDTURN_BLOCKING_PRODUCTION' then blocker.cities=A.section('turnBlockers',function() return idleProductionCityIds(pid,player) end) end
       if name and blockerNeeds[name] then blocker.needs=blockerNeeds[name] end
       blockers[#blockers+1]=blocker
@@ -131,7 +209,7 @@ function A.turnState()
     processing=processing, blockersReady=ready,
     submitted=A.static('turn',UI,'HasSentTurnComplete'),
     canEndTurn=canEndTurn, firstBlocker=firstBlocker,
-    blockers=blockers
+    blockers=blockers, waitingOn=waitingOn
   }
 end
 
@@ -193,6 +271,23 @@ local function rowFromValue(tableName, keyField, value)
   return nil
 end
 local productionKinds={{'Units','UnitType','unit'},{'Buildings','BuildingType','building'},{'Districts','DistrictType','district'},{'Projects','ProjectType','project'}}
+--- Production legality keeps BOTH native return values: CanProduce(hash,true) is the production
+--- panel's visibility filter while CanProduce(hash,false,true) reports startability plus the
+--- engine's own failure detail (ProductionPanel.lua:1911-1913, :2026-2038, :1574-1588, :2043).
+local function cityCanProduce(queue, hash)
+  if queue == nil or queue == A.null then return A.unavailable('cityProduction','CanProduce','Build queue unavailable in this context') end
+  local ok, able, results = pcall(queue.CanProduce, queue, hash, false, true)
+  if not ok then return A.unavailable('cityProduction','CanProduce',able) end
+  return able == true, results
+end
+local function productionDetails(results)
+  if type(results) ~= 'table' then return A.null end
+  local details=A.results(CityCommandResults or CityOperationResults, results)
+  local namespace=CityOperationResults or CityCommandResults
+  if type(namespace)=='table' and namespace.NO_SUITABLE_LOCATION~=nil and results[namespace.NO_SUITABLE_LOCATION]==true then details.noSuitableLocation=true end
+  for _ in pairs(details) do return details end
+  return A.null
+end
 --- Current-production hash -> type string, owning kind and the GameInfo row. 0 means idle.
 local function productionFromHash(hash)
   if type(hash) ~= 'number' or hash == 0 then return A.null, A.null, nil end
@@ -247,6 +342,74 @@ local function yields(group, object)
   for row in GameInfo.Yields() do out[row.YieldType]=A.call(group,object,'GetYield',row.Index) end
   return out
 end
+--- Own-unit order state, native reads only:
+---   operation    Unit:GetOperationType, a UnitOperationTypes value (Objects.csv Q-UnitGetOperationType)
+---   pending      Unit:HasPendingOperations. automated Unit:IsAutomated.
+---   destination  UnitManager.GetQueuedDestination (WorldInput.lua:821, :907, :1165). No path is
+---                computed here: the engine's per-plot path stays in civ.path, a per-request read,
+---                so a unit list never pays a path search per unit.
+local function unitOrder(unit)
+  local out={}
+  local operation=readValue('unitOrder',unit,'GetOperationType')
+  if type(operation)=='number' then
+    local name=A.enumName('unitOperationTypes',UnitOperationTypes,operation)
+    if name==A.null then name=A.typeFromHash('UnitOperations','OperationType',operation) end
+    if name==A.null then
+      out.operationValue=operation
+      A.unavailable('unitOrder','GetOperationType','Engine reported operation value '..operation..' with no name in this ruleset')
+    else
+      out.operation=A.shortName(name,'UNITOPERATION_')
+    end
+  end
+  -- Only a real boolean is reported; a failed read leaves the field absent rather than false.
+  local pending=readValue('unitOrder',unit,'HasPendingOperations')
+  if type(pending)=='boolean' then out.pending=pending end
+  local automated=readValue('unitOrder',unit,'IsAutomated')
+  if type(automated)=='boolean' then out.automated=automated end
+  local destination=readStatic('unitOrder',UnitManager,'GetQueuedDestination',unit)
+  if type(destination)=='number' then
+    local xy=A.plotXY(destination)
+    if xy==A.null then
+      out.destinationUnknown='Engine reported a queued destination that this map does not expose as a plot'
+    else
+      out.destination={plotId=destination,x=xy[1],y=xy[2]}
+    end
+  end
+  return out
+end
+--- Own trader state. A trader is its type row's MakeTradeRoute flag, and its current route is the
+--- owner's city route whose TraderUnitID is this unit, exactly as the native unit panel finds it
+--- (UnitPanel.lua:2165, :2170-2190). readyForRoute is the engine's own "a route can be started"
+--- test, ACTIVITY_AWAKE plus movement remaining (TradeRouteChooser.lua:1063-1066).
+local function unitTrade(player, unit, record)
+  local row=GameInfo.Units and GameInfo.Units[unit:GetUnitType()]
+  if not (type(row)=='table' and row.MakeTradeRoute==true) then return A.null end
+  local out={trader=true}
+  local uid,routes,broken=unit:GetID(),{},false
+  local ok=pcall(function()
+    for _,city in player:GetCities():Members() do
+      local cityRoutes=city:GetTrade():GetOutgoingRoutes()
+      if type(cityRoutes)~='table' then broken=true end
+      for _,route in ipairs(cityRoutes or {}) do
+        if type(route)=='table' and type(route.TraderUnitID)=='number' then routes[route.TraderUnitID]=route end
+      end
+    end
+  end)
+  if not ok then broken=true end
+  local route=routes[uid]
+  if route then
+    local active={}
+    if type(route.OriginCityPlayer)=='number' and type(route.OriginCityID)=='number' then active.originCityId=id('city',route.OriginCityPlayer,route.OriginCityID) end
+    if type(route.DestinationCityPlayer)=='number' and type(route.DestinationCityID)=='number' then active.destinationCityId=id('city',route.DestinationCityPlayer,route.DestinationCityID) end
+    out.activeRoute=active
+  else
+    out.activeRoute=A.null
+    if broken then out.routeUnknown='The outgoing route list could not be read completely, so an active route cannot be ruled out here' end
+  end
+  local activity=readStatic('unitOrder',UnitManager,'GetActivityType',unit)
+  out.readyForRoute=ActivityTypes~=nil and activity==ActivityTypes.ACTIVITY_AWAKE and type(record.moves)=='number' and record.moves>0
+  return out
+end
 local function unitRecord(unit, own)
   local owner, uid = unit:GetOwner(), unit:GetID()
   local result = A.fields('units',unit,{
@@ -268,6 +431,10 @@ local function unitRecord(unit, own)
     for key,value in pairs(extra) do result[key]=value end
     assert(type(result.moves)=='number' and type(result.maxMoves)=='number','Core unit movement extraction failed')
     result.ready = unitIsReady(unit)
+    -- Queued work and trader state sit beside readiness: readiness alone never says whether the unit
+    -- already has an order the engine is walking.
+    result.order = A.section('unitOrder',function() return unitOrder(unit) end)
+    result.trade = A.section('unitTrade',function() return unitTrade(Players[owner],unit,result) end)
     result.experience = A.section('unitExperience',function()
       local experience=unit:GetExperience()
       local values=A.fields('unitExperience',experience,{experience='GetExperiencePoints',level='GetLevel'})
@@ -303,9 +470,21 @@ local function cityRecord(city, own)
     out.options=A.array()
     for _, definition in ipairs({{'Units','UnitType','Unit'},{'Buildings','BuildingType','Building'},{'Districts','DistrictType','District'},{'Projects','ProjectType','Project'}}) do
       for row in GameInfo[definition[1]]() do
-        local legal=A.call('cityProduction',queue,'CanProduce',row.Hash,true)
-        if legal == true then
-          out.options[#out.options+1]={type=row[definition[2]],hash=row.Hash,kind=definition[3]:lower(),cost=A.call('cityProduction',queue,'Get'..definition[3]..'Cost',row.Index),progress=A.call('cityProduction',queue,'Get'..definition[3]..'Progress',row.Index),turns=A.call('cityProduction',queue,'GetTurnsLeft',row[definition[2]])}
+        -- Both native questions, as the panel asks them: the visibility filter above and the
+        -- startability plus reasons below. Reporting only the first made a displayed-but-locked
+        -- item look legal.
+        if A.call('cityProduction',queue,'CanProduce',row.Hash,true) == true then
+          local available, results = cityCanProduce(queue, row.Hash)
+          local option={type=row[definition[2]],hash=row.Hash,kind=definition[3]:lower(),available=available,
+            cost=A.call('cityProduction',queue,'Get'..definition[3]..'Cost',row.Index),
+            progress=A.call('cityProduction',queue,'Get'..definition[3]..'Progress',row.Index),
+            turns=A.call('cityProduction',queue,'GetTurnsLeft',row[definition[2]])}
+          if available ~= true then option.details=productionDetails(results) end
+          -- Native repair flag: a pillaged district or building is rebuilt by producing it again
+          -- (ProductionPanel.lua:1996 cityDistricts:IsPillaged(row.Index), :2075 :IsPillaged(row.Hash)).
+          if definition[3]=='District' then option.repair=A.call('cityDistricts',city:GetDistricts(),'IsPillaged',row.Index)
+          elseif definition[3]=='Building' then option.repair=A.call('cityBuildings',city:GetBuildings(),'IsPillaged',row.Hash) end
+          out.options[#out.options+1]=option
         end
       end
     end
@@ -321,6 +500,13 @@ local function cityRecord(city, own)
     for _,district in city:GetDistricts():Members() do
       local item=A.fields('cityDistricts',district,{typeIndex='GetType',x='GetX',y='GetY',complete='IsComplete'})
       item.type=A.typeName('Districts',item.typeIndex,'DistrictType'); item.yields=yields('cityDistrictYields',district)
+      -- Repair state: district:IsPillaged() (WorldBuilderPlayerEditor.lua:732), else the city
+      -- collection's (districtType, plotId) form (CitySupport.lua:665). Unreadable stays null.
+      item.pillaged=A.call('cityDistricts',district,'IsPillaged')
+      if item.pillaged==A.null and type(item.x)=='number' and type(item.y)=='number' then
+        local plot=Map.GetPlot(item.x,item.y)
+        if plot then item.pillaged=A.call('cityDistricts',city:GetDistricts(),'IsPillaged',district:GetType(),plot:GetIndex()) end
+      end
       item.garrisonDamage=A.call('cityDefense',district,'GetDamage',DefenseTypes.DISTRICT_GARRISON)
       item.garrisonMaxDamage=A.call('cityDefense',district,'GetMaxDamage',DefenseTypes.DISTRICT_GARRISON)
       item.wallDamage=A.call('cityDefense',district,'GetDamage',DefenseTypes.DISTRICT_OUTER)
@@ -426,6 +612,20 @@ end
 local function revealedPlaceholder(index,x,y)
   return {id=id('tile',index),engineId=index,x=x,y=y,visibility='revealed_not_visible',lastSeenTurn=A.null,unavailable='Not currently visible; live terrain, owner, improvements, resources, yields and entities deliberately not read'}
 end
+--- Queued research/civic nodes come from A.researchQueue (lua/common.lua), resolved at call time so
+--- observation, discovery and dispatch can never drift apart. The helper reports native queue
+--- observations only; a missing or failed helper is reported as unavailable (null plus a diagnostic)
+--- and never as an empty queue, because "nothing is queued" and "the queue could not be read" are
+--- different answers.
+local function queueObservation(player, kind)
+  if type(A.researchQueue) ~= 'function' then
+    return A.unavailable('queues', kind, 'A.researchQueue is unavailable in this loaded module set; the queued '..kind..' list is unknown, not empty')
+  end
+  local ok, value = pcall(A.researchQueue, player, kind)
+  if not ok then return A.unavailable('queues', kind, value) end
+  if type(value) ~= 'table' then return A.unavailable('queues', kind, 'Queue observation returned no record') end
+  return value
+end
 local function research(player, full)
   local techs=player:GetTechs()
   local out=A.fields('research',techs,{currentIndex='GetResearchingTech',sciencePerTurn='GetScienceYield'})
@@ -449,7 +649,7 @@ local function research(player, full)
     end
   end
   out.detail = full and 'full' or 'summary'
-  if not full then out.note='technologies lists only selectable or partially researched entries; completed holds the rest. Use detail="full" or civ.rules(table="Technologies") for the whole tree.' end
+  out.queue=A.section('researchQueue',function() return queueObservation(player,'research') end)
   return out
 end
 local function culture(player, full)
@@ -490,7 +690,7 @@ local function culture(player, full)
     out.slots[#out.slots+1]={slot=slot,typeIndex=slotIndex,type=A.typeName('GovernmentSlots',slotIndex,'GovernmentSlotType'),policyIndex=policyIndex,policy=A.typeName('Policies',policyIndex,'PolicyType'),policyName=locName('Policies',policyIndex)}
   end
   out.detail = full and 'full' or 'summary'
-  if not full then out.note='civics lists only selectable or partially progressed entries and policies only unlocked/active ones; completed holds finished civics. Use detail="full" or civ.rules for the whole tree.' end
+  out.queue=A.section('civicQueue',function() return queueObservation(player,'civic') end)
   return out
 end
 local function governors(player)
@@ -686,7 +886,11 @@ function A.snapshot(args)
         if notification and notification:IsVisibleInUI() then
           local item=A.fields('notifications',notification,{typeHash='GetType',summaryKey='GetSummary',messageKey='GetMessage',turn='GetTurn',dismissed='IsDismissed'})
           item.type=A.typeFromHash('Notifications','NotificationType',item.typeHash)
+          -- GetSummary/GetMessage already return rendered text, so the "Key" twins were the same
+          -- string a second time; the decoded type makes the raw hash redundant too.
           item.summary=A.loc(item.summaryKey);item.message=A.loc(item.messageKey)
+          item.summaryKey=nil;item.messageKey=nil
+          if item.type~=A.null then item.typeHash=nil end
           item.id=id('notification',pid,notificationId);item.engineId=notificationId;result[#result+1]=item
         end
       end
@@ -873,6 +1077,15 @@ function A.inspect(args)
       missing('Live record extraction failed')
     end
   end
+  --- Raw engine ids resolve through the shared authority (lua/common.lua A.resolveEntity), which
+  --- verifies the object's own GetOwner/GetID before anything is read and never remaps a stale id
+  --- to whatever entity the engine returns for it.
+  local function resolve(kind, entityOwner, entityIndex)
+    if type(A.resolveEntity) ~= 'function' then
+      return nil, 'shared entity resolution is unavailable in this loaded module set'
+    end
+    return A.resolveEntity(kind, entityOwner, entityIndex)
+  end
   if kind=='tile' then
     local plot
     if type(args.id)=='string' then plot=Map.GetPlotByIndex(index) else plot=Map.GetPlot(args.x,args.y) end
@@ -894,12 +1107,11 @@ function A.inspect(args)
       identified(engineIndex)
     end
   elseif kind=='unit' then
-    local unit
-    if owner==pid then unit=A.call('inspect',player:GetUnits(),'FindID',index)
-    else unit=A.static('inspect',UnitManager,'GetUnit',owner,index) end
+    local unit, unresolved = resolve('unit', owner, index)
     local function identify() identified(index,owner) end
-    if unit==nil or unit==A.null then
-      missing('No live unit with this id; it may have died, or was never observed by this player')
+    if unit == nil then
+      -- Covers a dead/never-observed unit and a stale id in one honest answer: neither is read.
+      missing('Unit '..tostring(owner)..':'..tostring(index)..' did not resolve to that exact live entity: '..tostring(unresolved))
       identify()
     elseif owner==pid then
       observed(function() return unitRecord(unit,true) end)
@@ -913,12 +1125,10 @@ function A.inspect(args)
       identify()
     end
   else
-    local city
-    if owner==pid then city=A.call('inspect',player:GetCities(),'FindID',index)
-    else city=A.static('inspect',CityManager,'GetCity',owner,index) end
+    local city, unresolved = resolve('city', owner, index)
     local function identify() identified(index,owner) end
-    if city==nil or city==A.null then
-      missing('No live city with this id; it may have been destroyed, or was never observed by this player')
+    if city == nil then
+      missing('City '..tostring(owner)..':'..tostring(index)..' did not resolve to that exact live entity: '..tostring(unresolved))
       identify()
     elseif owner==pid then
       observed(function() return cityRecord(city,true) end)

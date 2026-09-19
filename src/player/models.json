@@ -1,6 +1,6 @@
 {
   // Repo-owned opencode-go catalog overlay; entries mirror https://pi.dev/api/models/providers/opencode-go
-  // verbatim (verified 2026-09-09). Needed because pi-ai 0.84.4's builtin catalog predates these models
+  // (verified 2026-09-10). Needed because pi-ai 0.84.4's builtin catalog predates these models
   // and runs must stay offline (refreshOnCreate/allowModelNetwork disabled in createRuntime).
   "providers": {
     "opencode-go": {
@@ -17,6 +17,34 @@
           "maxTokens": 131072,
           "compat": { "sessionAffinityFormat": "openai-nosession" },
           "thinkingLevelMap": { "off": null, "minimal": "minimal", "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": null }
+        },
+        {
+          "id": "deepseek-flash",
+          "name": "DeepSeek V4.1 Flash",
+          "api": "openai-completions",
+          "baseUrl": "https://opencode.ai/zen/go/v1",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "cost": { "input": 0.15, "output": 0.6, "cacheRead": 0.003, "cacheWrite": 0 },
+          // Published entry declares supportsStore/supportsDeveloperRole/maxTokensField only. Every other
+          // DeepSeek model on this same baseUrl also declares thinkingFormat "deepseek" and
+          // requiresReasoningContentOnAssistantMessages, and the transport only applies them for provider
+          // "deepseek" or a deepseek.com baseUrl -- never for opencode.ai. Without them the request would
+          // send neither the thinking toggle nor reasoning_content on prior assistant turns, which
+          // https://api-docs.deepseek.com/guides/thinking_mode requires for tool requests (400) and keeps
+          // reasoning in context. Declared here so no name/baseUrl heuristic has to fire.
+          "compat": {
+            "supportsStore": false,
+            "supportsDeveloperRole": false,
+            "maxTokensField": "max_tokens",
+            "requiresReasoningContentOnAssistantMessages": true,
+            "thinkingFormat": "deepseek"
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 384000,
+          // max stays max: it is the route's top reasoning level and is never downgraded. xhigh is
+          // unsupported here, so it stays null and createRuntime rejects it instead of remapping to high.
+          "thinkingLevelMap": { "off": null, "minimal": null, "low": "low", "medium": null, "high": "high", "xhigh": null, "max": "max" }
         }
       ]
     }

@@ -330,7 +330,7 @@ _namespace = {
     "__name__": "__astra__", "__builtins__": builtins,
     "rpc": rpc, "display": display,
     "civ": Service("civ", ("probe", "snapshot", "inspect", "options", "path", "decisions", "decide",
-                           "action", "rules", "keybinds", "dismiss_notifications")),
+                           "action", "rules", "civilopedia", "keybinds", "dismiss_notifications")),
     "agent": Agents(),
     "artifact": Service("artifact", ("read", "write", "list")),
     "history": Service("history", ("search", "read", "note")),
@@ -385,6 +385,7 @@ def _execute(request):
         sys.stdout, sys.stderr = original_stdout, original_stderr
         for stream in output_files:
             stream.close()
+    reported = False
     for label, file in (("stdout", stdout_path), ("stderr", stderr_path)):
         relative = str(file.relative_to('/workspace'))
         _artifacts.append(relative)
@@ -394,8 +395,12 @@ def _execute(request):
                 preview = stream.read(MAX_PREVIEW_BYTES).decode("utf-8", errors="replace")
             suffix = f"\n[truncated {size} bytes; full {label}: /workspace/{relative}]" if size > MAX_PREVIEW_BYTES else ""
             _content.append({"type": "text", "text": f"{label}:\n{preview}{suffix}"})
-    if failure:
-        _content.append({"type": "text", "text": f"Execution raised an exception. Namespace and earlier effects are preserved.\n{failure[-MAX_PREVIEW_BYTES:]}"})
+            # The traceback already went to stderr, so it is in that preview. It was being sent a
+            # second time under a sentence the system prompt already states.
+            if label == "stderr" and failure and failure.strip().splitlines()[-1] in preview:
+                reported = True
+    if failure and not reported:
+        _content.append({"type": "text", "text": failure[-MAX_PREVIEW_BYTES:]})
     if not _content:
         _content.append({"type": "text", "text": "Execution completed without display output."})
     return {"content": _content, "isError": failed, "artifacts": _artifacts}

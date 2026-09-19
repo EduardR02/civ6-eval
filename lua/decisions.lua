@@ -15,7 +15,7 @@ local A = AstraCiv
 -- and popup-handling unlock. Nothing in this file dismisses a screen.
 -- ---------------------------------------------------------------------------
 
-local KINDS = {'commemoration','pantheon','great_person','governor','religion','city_fate','congress','espionage','diplomacy','blocker'}
+local KINDS = {'commemoration','pantheon','great_person','governor','religion','city_fate','congress','espionage','diplomacy','envoy','blocker'}
 local KIND_SET = {}
 for _, name in ipairs(KINDS) do KIND_SET[name] = true end
 local KIND_HELP = table.concat(KINDS, ', ')
@@ -41,14 +41,44 @@ local function parseCityId(value)
 end
 local function number(value) if type(value) == 'number' then return value end return nil end
 
+--- Native FindID/CityManager.GetCity resolve an index or slot, and a stale index can hand back a
+--- live object that is NOT the requested entity (the reviewed run produced seven actions on the
+--- wrong entity this way). Owner and id are therefore compared before any field is read and before
+--- any request is built for that object; a mismatch refuses, and never remaps onto the found entity.
+local function exactIdentity(group, kind, owner, id, entity)
+  if entity == nil or entity == A.null then return nil end
+  local actualOwner = number(A.call(group, entity, 'GetOwner'))
+  local actualId = number(A.call(group, entity, 'GetID'))
+  if actualOwner ~= owner or actualId ~= id then
+    local reason = 'The engine resolved '..kind..' '..tostring(id)..' to a different entity (owner '
+      ..tostring(actualOwner)..', id '..tostring(actualId)..'); nothing was submitted for it'
+    A.unavailable('identity', kind, reason)
+    return nil, reason
+  end
+  return entity
+end
+
+--- Resolve a session:city:<owner>:<id> id to a live city: the own city collection for an own
+--- destination, the global CityManager otherwise (a city-state destination is not owned by us),
+--- then exact identity. Returns nil plus a reason when the lookup answered with another entity.
+local function cityById(group, ctx, owner, cid)
+  local city
+  if owner == ctx.pid then city = A.call(group, ctx.player:GetCities(), 'FindID', cid)
+  else city = A.static(group, CityManager, 'GetCity', owner, cid) end
+  return exactIdentity(group, 'city', owner, cid, city)
+end
+
 --- One native request. Submission is never completion: UI.RequestPlayerOperation and the
 --- managers return nothing observable, so an untorn call is 'submitted' with the
 --- acknowledgement explicitly marked unobservable, a thrown call is 'unknown' and stops
 --- everything after it, and an explicit false is a refusal.
+--- A.mutate records that the request reached the engine, so an error raised later (for example by
+--- a validation check on the next item of the same decision) is reported as an unknown outcome
+--- instead of a clean refusal.
 local function request(fn, ...)
   local count = select('#', ...)
   local args = {...}
-  local ok, value = pcall(function() return fn(unpack(args, 1, count)) end)
+  local ok, value = pcall(A.mutate, fn, unpack(args, 1, count))
   if not ok then return {status='unknown', error=tostring(value):match('^[^\r\n]*')} end
   if value == false then return {status='rejected'} end
   if value == nil then return {status='submitted', acknowledgement='not_observable'} end
@@ -91,7 +121,7 @@ local function submit(items, note)
   elseif status == 'rejected' then
     out.reasons[#out.reasons+1] = 'Native request '..tostring(stoppedAt)..' of '..#items..' was refused by the engine. Earlier requests in this decision were already submitted.'
   end
-  out.note = note or 'Submission is not completion. Native decision requests are queued; re-observe (civ.decisions, civ.snapshot, civ.inspect) before assuming the outcome.'
+  if note ~= nil then out.note = note end
   return out
 end
 
@@ -102,6 +132,13 @@ local function refused(status, reason, extra)
   out.turnState = A.turnState()
   return out
 end
+
+-- Shared runtime helpers. lua/diplomacy.lua resolves these at call time so every decision family
+-- describes submitted/rejected/unknown identically and no copy of the mutation-safety rules can
+-- drift away from this one place.
+A.decisionRequest = request
+A.decisionSubmit = submit
+A.decisionRefused = refused
 
 -- ---------------------------------------------------------------------------
 -- Context: local player plus the currently active end-turn blockers, decoded by name.
@@ -312,14 +349,96 @@ end
 
 -- ---------------------------------------------------------------------------
 -- Great people.
--- Native: Base/Assets/UI/Popups/GreatPeoplePopup.lua. Legality and costs come from
---   Game.GetGreatPeople(): CanRecruitPerson / CanRejectPerson+GetRejectCost /
---   CanPatronizePerson+GetPatronizeCost(player, individual, YieldTypes.GOLD|FAITH).
---   Requests are PlayerOperations.RECRUIT_GREAT_PERSON / REJECT_GREAT_PERSON /
---   PATRONIZE_GREAT_PERSON with PARAM_GREAT_PERSON_INDIVIDUAL_TYPE = the individual id
---   from the timeline entry and, for patronage, PARAM_YIELD_TYPE.
+-- Native: Base/Assets/UI/Popups/GreatPeoplePopup.lua. The timeline read is GetTimeline()
+--   (:702-704) and the popup passes the entry's own `Individual` value to every legality call and
+--   to PARAM_GREAT_PERSON_INDIVIDUAL_TYPE (:726-745 discovery, :886-927 requests); it is never
+--   re-derived from a row index. Legality and costs come from Game.GetGreatPeople():
+--   CanRecruitPerson / CanRejectPerson+GetRejectCost / CanPatronizePerson+GetPatronizeCost(
+--   player, individual, YieldTypes.GOLD|FAITH). Requests are RECRUIT_GREAT_PERSON /
+--   REJECT_GREAT_PERSON / PATRONIZE_GREAT_PERSON with PARAM_YIELD_TYPE for patronage.
+--   A patronage price of 1000000 is the engine's "not purchasable" sentinel (:241-258) and the
+--   CAPABILITY_GREAT_PEOPLE_* capabilities gate the native buttons (:241-284); both are reported,
+--   neither is silently folded into engine legality.
 -- Recruiting is only an *opportunity* unless ENDTURN_BLOCKING_CLAIM_GREAT_PERSON is up.
 -- ---------------------------------------------------------------------------
+local PATRONIZE_UNAVAILABLE_COST = 1000000
+local GREAT_PERSON_CAPABILITIES = {
+  recruit = 'CAPABILITY_GREAT_PEOPLE_CAN_RECRUIT',
+  reject = 'CAPABILITY_GREAT_PEOPLE_CAN_REJECT',
+  gold = 'CAPABILITY_GREAT_PEOPLE_RECRUIT_WITH_GOLD',
+  faith = 'CAPABILITY_GREAT_PEOPLE_RECRUIT_WITH_FAITH',
+}
+
+--- Capabilities are UI gates, not engine legality: they are reported as facts, and an unknown
+--- capability stays A.null instead of being read as false in either direction.
+local function greatPersonCapabilities()
+  local out = {}
+  for key, capability in pairs(GREAT_PERSON_CAPABILITIES) do
+    local value = A.static('greatPeople', GameCapabilities, 'HasCapability', capability)
+    -- `false` is a real answer ("this ruleset has no such button") and must not collapse into the
+    -- unknown value the way `x and y or z` would.
+    if type(value) == 'boolean' then out[key] = value else out[key] = A.null end
+  end
+  return out
+end
+
+--- One timeline entry, read the way the popup reads it: one legality call per possible action plus
+--- the exact price each action reports. Prices are read even while an action is illegal, exactly
+--- as the native screen does for a disabled button; nothing is paid or chosen here.
+local function greatPersonEntryState(people, pid, entry)
+  local individual = entry.Individual
+  local goldYield = YieldTypes and YieldTypes.GOLD
+  local faithYield = YieldTypes and YieldTypes.FAITH
+  local state = {
+    individual = individual,
+    individualType = A.typeName('GreatPersonIndividuals', individual, 'GreatPersonIndividualType'),
+    claimedBy = entry.Claimant or A.null,
+    recruitCost = entry.Cost or A.null,
+    canRecruit = A.call('greatPeople', people, 'CanRecruitPerson', pid, individual) == true,
+    canReject = A.call('greatPeople', people, 'CanRejectPerson', pid, individual) == true,
+  }
+  if state.canReject then
+    state.rejectCost = A.call('greatPeople', people, 'GetRejectCost', pid, individual)
+  end
+  if goldYield ~= nil then
+    state.goldCost = A.call('greatPeople', people, 'GetPatronizeCost', pid, individual, goldYield)
+    state.canPatronizeGold = A.call('greatPeople', people, 'CanPatronizePerson', pid, individual, goldYield) == true
+    if type(state.goldCost) == 'number' and state.goldCost >= PATRONIZE_UNAVAILABLE_COST then
+      -- The sentinel means "no purchasable price in this ruleset", so the native screen hides the
+      -- button entirely; reporting 1000000 as a price would be a fabricated number.
+      state.goldCost, state.canPatronizeGold = A.null, false
+    end
+  end
+  if faithYield ~= nil then
+    state.faithCost = A.call('greatPeople', people, 'GetPatronizeCost', pid, individual, faithYield)
+    state.canPatronizeFaith = A.call('greatPeople', people, 'CanPatronizePerson', pid, individual, faithYield) == true
+    if type(state.faithCost) == 'number' and state.faithCost >= PATRONIZE_UNAVAILABLE_COST then
+      state.faithCost, state.canPatronizeFaith = A.null, false
+    end
+  end
+  return state
+end
+
+--- Resolve a caller-supplied individual against a freshly read timeline. Accepts the timeline's
+--- own `Individual` value or a GreatPersonIndividualType string, so an id-based decide survives a
+--- round trip without the caller knowing which representation the engine handed out.
+local function greatPersonEntry(people, individual)
+  local timeline = A.call('greatPeople', people, 'GetTimeline')
+  if timeline == A.null or type(timeline) ~= 'table' then
+    return nil, 'Great-people timeline unavailable; call civ.decisions again'
+  end
+  for _, entry in ipairs(timeline) do
+    if type(entry) == 'table' and entry.Individual ~= nil then
+      if entry.Individual == individual then return entry end
+      if type(individual) == 'string' then
+        local row = A.row('GreatPersonIndividuals', entry.Individual)
+        if row ~= A.null and row.GreatPersonIndividualType == individual then return entry end
+      end
+    end
+  end
+  return nil, 'That great person is not on the current timeline; call civ.decisions again'
+end
+
 local function greatPeopleDecisions(ctx, out)
   local people = A.static('greatPeople', Game, 'GetGreatPeople')
   -- Do not query a missing great-people manager.
@@ -328,83 +447,129 @@ local function greatPeopleDecisions(ctx, out)
   -- Guard: GetTimeline is only usable as a table; anything else means no data, not a crash.
   if timeline == A.null or type(timeline) ~= 'table' then return A.unavailable('greatPeople', 'GetTimeline', 'Great-people timeline unavailable') end
   local claimBlocks = blocking(ctx, 'ENDTURN_BLOCKING_CLAIM_GREAT_PERSON')
+  local capabilities = greatPersonCapabilities()
+  local scanned, emitted, ledger = 0, 0, A.array()
   for _, entry in ipairs(timeline) do
     local individual = type(entry) == 'table' and entry.Individual or nil
     -- Guard: entries without an Individual id (or already claimed) are skipped, not queried.
-    if individual ~= nil and entry.Claimant == nil then
-      local canRecruit = A.call('greatPeople', people, 'CanRecruitPerson', ctx.pid, individual) == true
-      local canReject = A.call('greatPeople', people, 'CanRejectPerson', ctx.pid, individual) == true
-      local goldYield = YieldTypes and YieldTypes.GOLD
-      local faithYield = YieldTypes and YieldTypes.FAITH
-      local canGold = goldYield ~= nil and A.call('greatPeople', people, 'CanPatronizePerson', ctx.pid, individual, goldYield) == true
-      local canFaith = faithYield ~= nil and A.call('greatPeople', people, 'CanPatronizePerson', ctx.pid, individual, faithYield) == true
-      if canRecruit or canReject or canGold or canFaith then
-        local row = A.row('GreatPersonIndividuals', individual)
-        local options = A.array()
-        options[#options+1] = {choice='recruit', operation='recruit', available=canRecruit, cost=entry.Cost}
-        if canReject then
-          options[#options+1] = {choice='reject', operation='reject', available=true,
-            cost=A.call('greatPeople', people, 'GetRejectCost', ctx.pid, individual), currency='great_person_points'}
+    if individual ~= nil then
+      scanned = scanned + 1
+      if entry.Claimant == nil then
+        local state = greatPersonEntryState(people, ctx.pid, entry)
+        local anyLegal = state.canRecruit or state.canReject
+          or state.canPatronizeGold == true or state.canPatronizeFaith == true
+        ledger[#ledger+1] = state
+        if anyLegal then
+          local row = A.row('GreatPersonIndividuals', individual)
+          local options = A.array()
+          -- `available` is the native button state: engine legality AND the ruleset capability AND
+          -- a real price. The underlying facts stay visible in engineLegal/capability/cost, so a
+          -- refusal is traceable instead of opaque.
+          options[#options+1] = {choice='recruit', operation='recruit',
+            available = state.canRecruit and type(state.recruitCost) == 'number' and capabilities.recruit ~= false,
+            engineLegal = state.canRecruit, cost = state.recruitCost, capability = capabilities.recruit}
+          if type(state.rejectCost) == 'number' then
+            options[#options+1] = {choice='reject', operation='reject', currency='great_person_points',
+              available = state.canReject and capabilities.reject ~= false,
+              engineLegal = state.canReject, cost = state.rejectCost, capability = capabilities.reject}
+          end
+          if type(state.goldCost) == 'number' then
+            options[#options+1] = {choice='patronize_gold', operation='patronize', currency='gold',
+              available = state.canPatronizeGold == true and capabilities.gold ~= false,
+              engineLegal = state.canPatronizeGold == true, cost = state.goldCost, capability = capabilities.gold}
+          end
+          if type(state.faithCost) == 'number' then
+            options[#options+1] = {choice='patronize_faith', operation='patronize', currency='faith',
+              available = state.canPatronizeFaith == true and capabilities.faith ~= false,
+              engineLegal = state.canPatronizeFaith == true, cost = state.faithCost, capability = capabilities.faith}
+          end
+          emitted = emitted + 1
+          out[#out+1] = {
+            key = 'individual'..tostring(individual),
+            kind = 'great_person', actionType = 'great_person',
+            operations = A.array{'recruit','reject','patronize'},
+            label = (row ~= A.null and A.loc(row.Name) or ('Great person '..tostring(individual))),
+            mandatory = claimBlocks and state.canRecruit,
+            blocks = claimBlocks and state.canRecruit,
+            individual = individual,
+            individualType = state.individualType,
+            individualIndex = row ~= A.null and row.Index or A.null,
+            class = A.typeName('GreatPersonClasses', entry.Class, 'GreatPersonClassType'),
+            era = A.typeName('Eras', entry.Era, 'EraType'),
+            turnGranted = entry.TurnGranted or A.null,
+            actionCharges = row ~= A.null and row.ActionCharges or A.null,
+            actionName = A.loc(entry.ActionNameText),
+            actionUsage = A.loc(entry.ActionUsageText),
+            actionEffect = A.loc(entry.ActionEffectText),
+            passiveEffect = A.loc(entry.PassiveEffectText),
+            earnConditions = A.loc(A.call('greatPeople', people, 'GetEarnConditionsText', ctx.pid, individual)),
+            capabilities = capabilities,
+            activation = 'civ.action(type="unit_command", unitId=<the claimed unit\'s unitId>, command="ACTIVATE_GREAT_PERSON"): activation happens in place on the map unit after the claim, and civ.options(unitId=...) lists the engine\'s activationPlots for it.',
+            options = options,
+            choiceHelp = 'choice=recruit|reject|patronize_gold|patronize_faith. Patronage and rejection spend real currency; nothing is paid implicitly. Claiming does not choose a tile or ability use: the spawned unit\'s activation is the separate ACTIVATE_GREAT_PERSON unit command named in the activation field.',
+          }
         end
-        if canGold then
-          options[#options+1] = {choice='patronize_gold', operation='patronize', currency='gold', available=true,
-            cost=A.call('greatPeople', people, 'GetPatronizeCost', ctx.pid, individual, goldYield)}
-        end
-        if canFaith then
-          options[#options+1] = {choice='patronize_faith', operation='patronize', currency='faith', available=true,
-            cost=A.call('greatPeople', people, 'GetPatronizeCost', ctx.pid, individual, faithYield)}
-        end
-        out[#out+1] = {
-          key = 'individual'..tostring(individual),
-          kind = 'great_person', actionType = 'great_person',
-          operations = A.array{'recruit','reject','patronize'},
-          label = (row ~= A.null and A.loc(row.Name) or ('Great person '..tostring(individual))),
-          mandatory = claimBlocks and canRecruit,
-          blocks = claimBlocks and canRecruit,
-          individual = row ~= A.null and row.GreatPersonIndividualType or A.null,
-          individualIndex = individual,
-          class = A.typeName('GreatPersonClasses', entry.Class, 'GreatPersonClassType'),
-          era = A.typeName('Eras', entry.Era, 'EraType'),
-          actionName = A.loc(entry.ActionNameText),
-          actionEffect = A.loc(entry.ActionEffectText),
-          passiveEffect = A.loc(entry.PassiveEffectText),
-          earnConditions = A.loc(A.call('greatPeople', people, 'GetEarnConditionsText', ctx.pid, individual)),
-          options = options,
-          choiceHelp = 'choice=recruit|reject|patronize_gold|patronize_faith. Patronage and rejection spend real currency; nothing is paid implicitly.',
-        }
+      else
+        ledger[#ledger+1] = {individual = individual, claimedBy = entry.Claimant,
+          individualType = A.typeName('GreatPersonIndividuals', individual, 'GreatPersonIndividualType')}
       end
     end
   end
+  -- A pending claim that this bridge cannot explain must be visible, not an empty list: the
+  -- blocker comes from the engine, and an empty answer used to look like "nothing to claim".
+  if claimBlocks and emitted == 0 then
+    local diagnostics = A.array()
+    for index = 1, math.min(#ledger, 24) do diagnostics[#diagnostics+1] = ledger[index] end
+    out[#out+1] = {
+      key = 'unresolved:turn'..tostring(ctx.turn),
+      kind = 'great_person', actionType = 'great_person',
+      operations = A.array(),
+      label = 'A Great Person claim is pending but the native timeline offers no legal claim',
+      mandatory = true, blocks = true,
+      timelineEntries = scanned,
+      options = A.array(),
+      timeline = diagnostics,
+      timelineTruncated = #ledger > #diagnostics,
+      capabilities = capabilities,
+      choiceHelp = 'civ.decide cannot answer this record: it exists so an unresolved engine claim is observable. timeline[] is the raw per-entry state (claimedBy, canRecruit, canReject, goldCost, faithCost). Re-read civ.decisions; the native Great People screen remains available.',
+    }
+  end
 end
 
-local function greatPersonSubmit(ctx, operation, individualType, currency)
+local function greatPersonSubmit(ctx, operation, individual, currency)
   local people = A.static('greatPeople', Game, 'GetGreatPeople')
   assert(people ~= A.null, 'Game.GetGreatPeople is unavailable in this context')
-  assert(type(individualType) == 'string', 'great_person needs individual=<GreatPersonIndividualType>')
-  local row = GameInfo.GreatPersonIndividuals[individualType]
-  assert(row, 'Unknown GreatPersonIndividualType: '..individualType)
-  local individual = row.Index
+  assert(individual ~= nil, 'great_person needs individual=<timeline individual or GreatPersonIndividualType from civ.decisions>')
+  local entry, failure = greatPersonEntry(people, individual)
+  assert(entry ~= nil, failure)
+  assert(entry.Claimant == nil, 'That great person has already been claimed or passed; call civ.decisions again')
+  local value = entry.Individual
+  local label = A.typeName('GreatPersonIndividuals', value, 'GreatPersonIndividualType')
+  local name = label ~= A.null and label or tostring(value)
   local parameters = {}
-  parameters[A.param(PlayerOperations, 'PARAM_GREAT_PERSON_INDIVIDUAL_TYPE')] = individual
+  parameters[A.param(PlayerOperations, 'PARAM_GREAT_PERSON_INDIVIDUAL_TYPE')] = value
   local nativeOperation
   if operation == 'recruit' then
-    assert(A.call('greatPeople', people, 'CanRecruitPerson', ctx.pid, individual) == true, 'Engine refuses recruitment of '..individualType)
+    assert(A.call('greatPeople', people, 'CanRecruitPerson', ctx.pid, value) == true, 'Engine refuses recruitment of '..name)
     nativeOperation = 'RECRUIT_GREAT_PERSON'
   elseif operation == 'reject' then
-    assert(A.call('greatPeople', people, 'CanRejectPerson', ctx.pid, individual) == true, 'Engine refuses rejection of '..individualType)
+    assert(A.call('greatPeople', people, 'CanRejectPerson', ctx.pid, value) == true, 'Engine refuses rejection of '..name)
     nativeOperation = 'REJECT_GREAT_PERSON'
   elseif operation == 'patronize' then
     assert(currency == 'gold' or currency == 'faith', 'patronize needs currency="gold" or "faith"; the cost is never chosen for you')
     local yield = YieldTypes and (currency == 'gold' and YieldTypes.GOLD or YieldTypes.FAITH)
     assert(yield ~= nil, 'YieldTypes is unavailable in this context')
-    assert(A.call('greatPeople', people, 'CanPatronizePerson', ctx.pid, individual, yield) == true,
-      'Engine refuses '..currency..' patronage of '..individualType)
+    assert(A.call('greatPeople', people, 'CanPatronizePerson', ctx.pid, value, yield) == true,
+      'Engine refuses '..currency..' patronage of '..name)
+    local cost = A.call('greatPeople', people, 'GetPatronizeCost', ctx.pid, value, yield)
+    assert(type(cost) ~= 'number' or cost < PATRONIZE_UNAVAILABLE_COST,
+      'The engine reports no purchasable '..currency..' price for '..name)
     parameters[A.param(PlayerOperations, 'PARAM_YIELD_TYPE')] = yield
     nativeOperation = 'PATRONIZE_GREAT_PERSON'
   else
     error('great_person operation must be recruit, reject or patronize')
   end
-  return submit({{label = nativeOperation..' '..individualType, run = function()
+  return submit({{label = nativeOperation..' '..name, run = function()
     return playerOperation(ctx.pid, nativeOperation, parameters)
   end}})
 end
@@ -425,6 +590,72 @@ local function cannotAssign(governorRow)
   if GameInfo.GovernorsCannotAssign == nil then return false end
   local row = GameInfo.GovernorsCannotAssign[governorRow.GovernorType]
   return row ~= nil and row.CannotAssign == true
+end
+
+--- The only native promotion-to-governor relationship is GovernorPromotionSets: GovernorPromotions has
+--- no GovernorType column at all (Expansion2_Schema.sql:372-379 defines GovernorPromotionType,
+--- Name, Description, Level, Column, BaseAbility; :402-407 adds the set table), and both shipped
+--- panels walk the set table before looking the promotion row up by its GovernorPromotion type
+--- (GovernorPanel.lua:203-208, GovernorDetailsPanel.lua:159-166). Matching a GovernorType field on
+--- the promotion row is what made every valid promotion look like it belonged to another governor.
+local function governorPromotionRows(governorType)
+  local out = A.array()
+  if GameInfo.GovernorPromotionSets == nil or GameInfo.GovernorPromotions == nil then return out, false end
+  local ok = pcall(function()
+    for set in GameInfo.GovernorPromotionSets() do
+      if type(set) == 'table' and set.GovernorType == governorType then
+        local row = GameInfo.GovernorPromotions[set.GovernorPromotion]
+        if row ~= nil then out[#out+1] = row
+        else A.unavailable('governors', 'GovernorPromotions', 'Promotion set names an undefined promotion: '..tostring(set.GovernorPromotion)) end
+      end
+    end
+  end)
+  if not ok then A.unavailable('governors', 'GovernorPromotionSets', 'Promotion set walk failed; promotion discovery is incomplete') end
+  table.sort(out, function(a, b) return (number(a.Index) or 0) < (number(b.Index) or 0) end)
+  return out, true
+end
+
+--- Prerequisite promotions, read from GovernorPromotionPrereqs exactly as GovernorSupport does
+--- (GovernorSupport.lua:167-182).
+local function governorPromotionPrereqs(promotion)
+  local out = A.array()
+  if GameInfo.GovernorPromotionPrereqs == nil then return out end
+  local ok = pcall(function()
+    for row in GameInfo.GovernorPromotionPrereqs() do
+      if type(row) == 'table' and row.GovernorPromotionType == promotion.GovernorPromotionType
+        and row.PrereqGovernorPromotion ~= nil then
+        out[#out+1] = row.PrereqGovernorPromotion
+      end
+    end
+  end)
+  if not ok then A.unavailable('governors', 'GovernorPromotionPrereqs', 'Promotion prerequisites unavailable') end
+  return out
+end
+
+--- GovernorSupport.IsPromotionHidden masks a promotion until its prerequisites are earned
+--- (GovernorSupport.lua:127-146: GovernorPromotionConditions.HiddenWithoutPrereqs plus a missing
+--- GovernorPromotionPrereqs entry). Masking changes the label the native screen shows, never whether
+--- the promotion can be submitted, so this is reported as information only.
+local function governorPromotionHidden(promotion, governor)
+  if GameInfo.GovernorPromotionConditions == nil then return A.null end
+  local hidden, missingPrereq = false, false
+  local ok = pcall(function()
+    for condition in GameInfo.GovernorPromotionConditions() do
+      if type(condition) == 'table' and condition.GovernorPromotionType == promotion.GovernorPromotionType then
+        hidden = condition.HiddenWithoutPrereqs == true
+      end
+    end
+    if hidden then
+      for _, name in ipairs(governorPromotionPrereqs(promotion)) do
+        local prereq = GameInfo.GovernorPromotions[name]
+        if prereq ~= nil and A.call('governors', governor, 'HasPromotion', prereq.Hash) ~= true then
+          missingPrereq = true
+        end
+      end
+    end
+  end)
+  if not ok then return A.null end
+  return hidden and missingPrereq
 end
 
 local function assignableCities(ctx, governors, governorRow, governor)
@@ -528,29 +759,51 @@ local function governorDecisions(ctx, out)
       if governor == A.null then A.unavailable('governors', 'GetGovernor', 'Appointed governor object unavailable') end
     end
     if governor ~= A.null then
-      -- Promotion
-      if A.call('governors', governors, 'CanPromoteGovernor', row.Hash) == true and GameInfo.GovernorPromotions ~= nil then
-        local options = A.array()
-        for promotion in GameInfo.GovernorPromotions() do
-          if promotion.GovernorType == row.GovernorType
-            and A.call('governors', governor, 'HasPromotion', promotion.Hash) ~= true
-            and A.call('governors', governors, 'CanEarnPromotion', row.Hash, promotion.Hash) == true then
-            options[#options+1] = {choice = promotion.GovernorPromotionType, available = true,
-              label = A.loc(promotion.Name), description = A.loc(promotion.Description)}
+      -- Promotion. Membership comes from the native GovernorPromotionSets relationship and
+      -- eligibility from the engine; the full set is reported so a locked or hidden promotion is
+      -- visible as a rule, not as a missing decision.
+      if A.call('governors', governors, 'CanPromoteGovernor', row.Hash) == true then
+        local promotions, setsKnown = governorPromotionRows(row.GovernorType)
+        if not setsKnown then
+          A.unavailable('governors', 'GovernorPromotionSets', 'GovernorPromotionSets/GovernorPromotions absent; promotion membership is unknown')
+        else
+          local options = A.array()
+          for _, promotion in ipairs(promotions) do
+            -- The base ability is granted with the appointment and is not earnable
+            -- (GovernorDetailsPanel.lua:159-175 splits it out of the promotion tree).
+            if promotion.BaseAbility ~= true then
+              local owned = A.call('governors', governor, 'HasPromotion', promotion.Hash)
+              local eligible = A.call('governors', governors, 'CanEarnPromotion', row.Hash, promotion.Hash)
+              options[#options+1] = {
+                choice = promotion.GovernorPromotionType,
+                available = eligible == true and owned ~= true,
+                owned = owned == true,
+                eligible = type(eligible) == 'boolean' and eligible or A.null,
+                level = promotion.Level or A.null,
+                column = promotion.Column or A.null,
+                hidden = governorPromotionHidden(promotion, governor),
+                prereqs = governorPromotionPrereqs(promotion),
+                label = A.loc(promotion.Name),
+                description = A.loc(promotion.Description),
+              }
+            end
           end
-        end
-        if #options > 0 then
-          out[#out+1] = {
-            key = 'promote:'..row.GovernorType,
-            kind = 'governor', actionType = 'governor', operation = 'promote',
-            operations = A.array{'promote'},
-            label = 'Promote '..tostring(A.loc(row.Name)),
-            mandatory = false,
-            blocks = blocking(ctx, 'ENDTURN_BLOCKING_GOVERNOR_PROMOTION'),
-            governor = row.GovernorType,
-            options = options,
-            choiceHelp = 'choice=<GovernorPromotionType>',
-          }
+          if #options > 0 then
+            local anyLegal = false
+            for _, option in ipairs(options) do if option.available then anyLegal = true; break end end
+            out[#out+1] = {
+              key = 'promote:'..row.GovernorType,
+              kind = 'governor', actionType = 'governor', operation = 'promote',
+              operations = A.array{'promote'},
+              label = 'Promote '..tostring(A.loc(row.Name))..(anyLegal and '' or ' (no promotion is earnable right now)'),
+              mandatory = false,
+              blocks = blocking(ctx, 'ENDTURN_BLOCKING_GOVERNOR_PROMOTION'),
+              governor = row.GovernorType,
+              promotionSet = 'GovernorPromotionSets',
+              options = options,
+              choiceHelp = 'choice=<GovernorPromotionType>. Every promotion in this governor\'s native set is listed with its owned/eligible flags and prerequisite promotions; only available=true can be submitted now.',
+            }
+          end
         end
       end
       -- Assignment. A neutralized governor cannot be moved (GovernorPanel OnAssignButton).
@@ -605,23 +858,31 @@ local function governorSubmit(ctx, operation, governorType, promotionType, cityI
     end}})
   elseif operation == 'promote' then
     assert(type(promotionType) == 'string', 'governor promote needs promotion=<GovernorPromotionType>')
-    assert(GameInfo.GovernorPromotions ~= nil, 'GovernorPromotions is absent from this ruleset')
-    local promotion = GameInfo.GovernorPromotions[promotionType]
-    assert(promotion, 'Unknown GovernorPromotionType: '..promotionType)
-    assert(promotion.GovernorType == governorType, promotionType..' does not belong to '..governorType)
+    -- Membership comes from GovernorPromotionSets, the same relationship discovery uses; a
+    -- GovernorType field on the promotion row does not exist in the installed ruleset.
+    local promotions, setsKnown = governorPromotionRows(governorType)
+    assert(setsKnown, 'GovernorPromotionSets/GovernorPromotions are absent from this ruleset; promotion membership is unknown')
+    local promotion
+    for _, candidate in ipairs(promotions) do
+      if candidate.GovernorPromotionType == promotionType then promotion = candidate end
+    end
+    assert(promotion ~= nil, promotionType..' is not in '..governorType..'\'s native promotion set (GovernorPromotionSets)')
+    assert(promotion.BaseAbility ~= true, promotionType..' is this governor\'s base ability, not an earnable promotion')
     assert(A.call('governors', governors, 'CanPromoteGovernor', row.Hash) == true, governorType..' cannot be promoted now')
     assert(A.call('governors', governors, 'CanEarnPromotion', row.Hash, promotion.Hash) == true,
       'Engine refuses promotion '..promotionType)
+    assert(A.call('governors', governor, 'HasPromotion', promotion.Hash) ~= true, governorType..' already has '..promotionType)
     parameters[A.param(PlayerOperations, 'PARAM_GOVERNOR_PROMOTION_TYPE')] = promotion.Index
     return submit({{label = 'PROMOTE_GOVERNOR '..governorType..' '..promotionType, run = function()
       return playerOperation(ctx.pid, 'PROMOTE_GOVERNOR', parameters)
     end}})
   elseif operation == 'assign' then
     local owner, cid = parseCityId(cityIdValue)
-    local city
-    if owner == ctx.pid then city = A.call('governors', ctx.player:GetCities(), 'FindID', cid)
-    else city = A.static('governors', CityManager, 'GetCity', owner, cid) end
-    assert(city ~= nil and city ~= A.null, 'Destination city no longer exists; call civ.decisions again')
+    local city, mismatch = cityById('governors', ctx, owner, cid)
+    if city == nil then
+      return refused('stale', mismatch or ('Destination city '..tostring(cid)..' is no longer observable; nothing was submitted'),
+        {governor = governorType, cityId = cityIdValue})
+    end
     local can, results = false, nil
     local ok, a, b = pcall(function() return governors:CanAssignGovernor(row.Hash, city, true) end)
     if ok then can, results = a == true, b end
@@ -908,10 +1169,11 @@ local function cityFateSubmit(ctx, operation, cityIdValue)
   local directiveName = CITY_FATE[operation]
   assert(directiveName ~= nil, 'city_fate operation must be keep, raze, liberate_founder, liberate_previous_owner or reject')
   local owner, cid = parseCityId(cityIdValue)
-  local city
-  if owner == ctx.pid then city = A.call('cityFate', ctx.player:GetCities(), 'FindID', cid)
-  else city = A.static('cityFate', CityManager, 'GetCity', owner, cid) end
-  assert(city ~= nil and city ~= A.null, 'City no longer exists; call civ.decisions again')
+  local city, mismatch = cityById('cityFate', ctx, owner, cid)
+  if city == nil then
+    return refused('stale', mismatch or ('City '..tostring(cid)..' is no longer observable; nothing was submitted'),
+      {operation = operation, cityId = cityIdValue})
+  end
   local parameters = cityFateParameters(directiveName)
   assert(parameters ~= nil, 'CityDestroyDirectives.'..directiveName..' or UnitOperationTypes.PARAM_FLAGS is unavailable in this ruleset')
   local legal = false
@@ -928,41 +1190,75 @@ end
 
 -- ---------------------------------------------------------------------------
 -- World Congress.
--- Native: DLC/Expansion2/UI/Additions/WorldCongressPopup.lua OnAccept.
---   In session (Game.GetCurrentTurnSegment() == TURNSEG_WORLDCONGRESS_1/2):
---     resolutions -> PlayerOperations.WORLD_CONGRESS_RESOLUTION_VOTE with
---       PARAM_RESOLUTION_TYPE = Resolutions row Hash, PARAM_WORLD_CONGRESS_VOTES = the
---       vote count (1..MaxVotes, always positive; the A/B option is the direction),
---       PARAM_RESOLUTION_OPTION = 1 or 2 and PARAM_RESOLUTION_SELECTION = targetIndex-1.
---     discussions -> WORLD_CONGRESS_DISCUSSION_VOTE with PARAM_PLAYER_ONE = Sender,
---       PARAM_PLAYER_TWO = Target and PARAM_WORLD_CONGRESS_VOTES = signed votes.
---     the native Accept then sends WORLD_CONGRESS_SUBMIT_TURN and ACTION_ENDTURN.
---   Out of session, the available-proposals tab submits new discussions with
---     WORLD_CONGRESS_DISCUSSION_SELECTION (PARAM_OTHER_PLAYER = Target,
---     PARAM_DISCUSSION_TYPE = Type) after an explicit favor-cost confirmation.
--- This module never sends ACTION_ENDTURN: end_turn stays an explicit civ.action.
+-- Native: DLC/Expansion2/UI/Additions/WorldCongressPopup.lua.
+--   Stage: Game.GetCurrentTurnSegment() against DB.MakeHash('TURNSEG_WORLDCONGRESS_1'|'_2'|
+--   '_RESOLUTION') (:21-23,78-92). 1 is the regular session, 2 the special session and the
+--   resolution segment is the stage-4 results screen; all three clear
+--   AllowStrategicCommands/AllowTacticalCommands (DLC/Expansion2/Data/Expansion2_TurnPhases.xml
+--   :12-14), which is why a congress request must not be judged by the ordinary command gate.
+--   In session the popup reads resolutions from GetResolutions(pid), discussions from
+--   GetProposals(pid).Proposals and prices from GetVotesandFavorCost(pid) (:574-575,1179-1186).
+--   OnAccept (:2222-2315) sends, per resolution with votes, WORLD_CONGRESS_RESOLUTION_VOTE with
+--   PARAM_RESOLUTION_TYPE = the Resolutions row Hash, PARAM_WORLD_CONGRESS_VOTES = the total
+--   positive votes, PARAM_RESOLUTION_OPTION = 1|2 and PARAM_RESOLUTION_SELECTION = the 1-based
+--   PossibleTargets index minus one; per discussion WORLD_CONGRESS_DISCUSSION_VOTE with
+--   PARAM_PLAYER_ONE/TWO and a SIGNED vote count; then WORLD_CONGRESS_SUBMIT_TURN and
+--   ActionTypes.ACTION_ENDTURN. This module mirrors that exactly: operation="submit" sends the
+--   votes it is given (if any), then WORLD_CONGRESS_SUBMIT_TURN and ACTION_ENDTURN, and it is the
+--   only turn-ending request any decision family issues. No ballot, vote or turn end is inferred
+--   from anything else, and operation="vote" never releases the session.
+--   The popup also keeps its screen until its own ClosePopup runs UIManager:DequeuePopup(ContextPtr)
+--   + Input.PopContext(), and out of session that close sends WORLD_CONGRESS_LOOKED_AT_AVAILABLE
+--   (:2394-2408). Screen teardown belongs to the popup module; the look acknowledgement is a
+--   player operation and is exposed explicitly as operation="looked".
+--   Out of session (including the results segment) the available-proposals tab sends
+--   WORLD_CONGRESS_DISCUSSION_SELECTION with PARAM_OTHER_PLAYER and PARAM_DISCUSSION_TYPE for each
+--   selected proposal, at most one per target player (:1452-1490,2270-2295), after an explicit
+--   favor-cost confirmation.
 -- ---------------------------------------------------------------------------
---- 1 or 2 while the congress is voting, 0 when it is not in session, nil when the turn
---- segment cannot be resolved. nil is honest ignorance: no congress decision is emitted
+local CONGRESS_SEGMENTS = {
+  {hash = 'TURNSEG_WORLDCONGRESS_1', stage = 1},
+  {hash = 'TURNSEG_WORLDCONGRESS_2', stage = 2},
+  {hash = 'TURNSEG_WORLDCONGRESS_RESOLUTION', stage = 4},
+}
+--- 1 regular session, 2 special session, 4 results/review segment, 0 no congress segment, nil
+--- when the segment cannot be decoded. nil is honest ignorance: no congress decision is emitted
 --- rather than guessing the wrong stage.
 local function congressSegment()
   local segment = A.static('congress', Game, 'GetCurrentTurnSegment')
-  local one = A.static('congress', DB, 'MakeHash', 'TURNSEG_WORLDCONGRESS_1')
-  local two = A.static('congress', DB, 'MakeHash', 'TURNSEG_WORLDCONGRESS_2')
-  if type(segment) ~= 'number' or type(one) ~= 'number' or type(two) ~= 'number' then return nil end
-  if segment == one then return 1 end
-  if segment == two then return 2 end
+  if type(segment) ~= 'number' then return nil end
+  for _, entry in ipairs(CONGRESS_SEGMENTS) do
+    local hash = A.static('congress', DB, 'MakeHash', entry.hash)
+    -- Without the hash names this stage cannot be identified; do not fall through to "no segment".
+    if type(hash) ~= 'number' then return nil end
+    if segment == hash then return entry.stage end
+  end
   return 0
 end
 
---- Native congress collections are keyed maps; sort them so repeated reads are byte-stable.
-local function sortedValues(map, keyOf)
+local function congressStageLabel(stage)
+  if stage == 1 then return 'regular_session' end
+  if stage == 2 then return 'special_session' end
+  if stage == 4 then return 'results' end
+  if stage == 0 then return 'none' end
+  return A.null
+end
+
+--- Native congress collections are keyed maps with a non-numeric "Stage" key; sort by the numeric
+--- key so repeated reads are byte-stable and the stage entries that carry no resolution are last.
+local function sortedValues(map)
   local list = {}
   if type(map) ~= 'table' then return list end
   for key, value in pairs(map) do
-    if type(value) == 'table' then list[#list+1] = {sort = keyOf(key, value), value = value} end
+    if type(value) == 'table' then list[#list+1] = {key = key, value = value} end
   end
-  table.sort(list, function(a, b) return a.sort < b.sort end)
+  table.sort(list, function(a, b)
+    local an, bn = tonumber(a.key), tonumber(b.key)
+    if an ~= nil and bn ~= nil then return an < bn end
+    if an ~= nil then return true end
+    if bn ~= nil then return false end
+    return tostring(a.key) < tostring(b.key)
+  end)
   local out = {}
   for _, entry in ipairs(list) do out[#out+1] = entry.value end
   return out
@@ -972,16 +1268,26 @@ local function proposalKey(proposal)
   return tostring(proposal.TypeName)..'_'..tostring(proposal.Target)..'_'..tostring(proposal.Sender)
 end
 
+--- The proposal map is keyed by the ProposalTypes row; the popup sorts categories by
+--- ProposalTypes.Sort and lists each category's ProposalsOfType (:1498-1518). The category and its
+--- per-category favor cost are attached so a caller can price a proposal selection instead of
+--- guessing, and so a disabled category entry cannot be mistaken for a votable discussion.
 local function proposalValues(result)
   local out = {}
   if result == A.null or type(result) ~= 'table' or type(result.Proposals) ~= 'table' then
     A.unavailable('congress', 'proposals', 'Native proposal categories unavailable')
     return out
   end
-  for _, category in pairs(result.Proposals) do
+  for key, category in pairs(result.Proposals) do
+    local definition = A.row('ProposalTypes', key)
     if type(category) == 'table' and type(category.ProposalsOfType) == 'table' then
+      local sort = definition ~= A.null and number(definition.Sort) or nil
       for _, proposal in pairs(category.ProposalsOfType) do
         if type(proposal) == 'table' and proposal.Type ~= nil and proposal.Target ~= nil then
+          proposal.category = key
+          proposal.categoryName = definition ~= A.null and A.loc(definition.Name) or A.null
+          proposal.categorySort = sort or A.null
+          proposal.categoryCost = number(category.FavorCost)
           out[#out+1] = proposal
         else
           A.unavailable('congress', 'proposal', 'Native proposal identity unavailable')
@@ -991,8 +1297,58 @@ local function proposalValues(result)
       A.unavailable('congress', 'proposals', 'Native ProposalsOfType unavailable')
     end
   end
-  table.sort(out, function(a, b) return proposalKey(a) < proposalKey(b) end)
+  table.sort(out, function(a, b)
+    local as, bs = tonumber(a.categorySort), tonumber(b.categorySort)
+    if as ~= nil and bs ~= nil and as ~= bs then return as < bs end
+    return proposalKey(a) < proposalKey(b)
+  end)
   return out
+end
+
+--- GetVotesandFavorCost returns the table the voting widgets index as `kCostData[votes - 1]` and
+--- cap with `kCostData.MaxVotes` (:983-1006,1443-1478): each numeric entry is the total favor that
+--- many votes cost, so the marginal price of the nth vote is the difference to the previous entry.
+--- Decoded here so a caller sees prices instead of a raw engine table. An entry the native shape
+--- does not explain stays unknown; a missing price never becomes zero.
+local function favorCosts(costs)
+  local cumulative, perVote = A.array(), A.array()
+  if type(costs) ~= 'table' then
+    A.unavailable('congress', 'GetVotesandFavorCost', 'Native favor cost table unavailable')
+    return cumulative, perVote, nil
+  end
+  local count = 0
+  while type(costs[count]) == 'number' do count = count + 1 end
+  for index = 0, count - 1 do
+    cumulative[index + 1] = costs[index]
+    perVote[index + 1] = index == 0 and costs[0] or (costs[index] - costs[index - 1])
+  end
+  if count == 0 then A.unavailable('congress', 'GetVotesandFavorCost', 'Native favor cost table carried no vote prices') end
+  return cumulative, perVote, number(costs.MaxVotes)
+end
+
+--- The native popup labels targets with GetVisiblePlayerName, which reports an unmet player as
+--- "unmet player" instead of leaking the name (PlayerSupport.lua:39-92). Only a positively met
+--- player's civilization name is returned; an unknown HasMet stays unknown rather than revealing
+--- a name the player has not earned.
+local function congressPlayerLabel(ctx, pid)
+  if type(pid) ~= 'number' then return A.null end
+  local function nameOf(config)
+    local name = A.call('congress', config, 'GetCivilizationShortDescription')
+    if type(name) ~= 'string' then name = A.call('congress', config, 'GetCivilizationTypeName') end
+    return type(name) == 'string' and A.loc(name) or A.null
+  end
+  if pid == ctx.pid then
+    local own = PlayerConfigurations and PlayerConfigurations[pid]
+    return own and nameOf(own) or A.null
+  end
+  local diplomacy = A.call('congress', ctx.player, 'GetDiplomacy')
+  local met = A.call('congress', diplomacy, 'HasMet', pid)
+  if met ~= true then
+    return met == false and A.loc('LOC_DIPLOPANEL_UNMET_PLAYER') or A.null
+  end
+  local config = PlayerConfigurations and PlayerConfigurations[pid]
+  if config == nil then return A.null end
+  return nameOf(config)
 end
 
 local function congressReady(ctx, stage)
@@ -1001,8 +1357,8 @@ local function congressReady(ctx, stage)
     if capability ~= false then A.unavailable('congress', 'readiness', 'World Congress capability unknown') end
     return false
   end
-  -- Voting and notification-opened emergency proposals are independent of ordinary era access.
-  if stage == 1 or stage == 2 then return true end
+  -- Voting and the results segment are independent of ordinary era access.
+  if stage == 1 or stage == 2 or stage == 4 then return true end
   if blocking(ctx, 'ENDTURN_BLOCKING_WORLD_CONGRESS_LOOK')
     or blocking(ctx, 'ENDTURN_BLOCKING_EMERGENCY_NEEDS_ATTENTION')
     or A.hasCongressNotification(ctx.pid) then return true end
@@ -1015,6 +1371,244 @@ local function congressReady(ctx, stage)
   return era >= initial
 end
 
+--- Fresh native facts about the presented congress screen, read after a submission. The screen
+--- itself stays up until the popup module runs the native close; this only reports state.
+local function congressObservation(ctx, congress)
+  return A.section('observed', function()
+    local stage = congressSegment()
+    return {
+      stage = stage or A.null,
+      stageName = congressStageLabel(stage),
+      inSession = A.call('congress', congress, 'IsInSession'),
+      blockersKnown = ctx.blockersKnown,
+      turnState = A.turnState(),
+    }
+  end)
+end
+
+--- A resolution option the native widget can actually vote: the row, both A/B effects, the 1-based
+--- engine target list with the exact PARAM_RESOLUTION_SELECTION value for each entry, and whether
+--- the engine reported any target at all (a resolution without targets cannot be voted).
+local function resolutionOption(ctx, data)
+  local row = A.row('Resolutions', data.Type)
+  local targets = A.array()
+  if type(data.PossibleTargets) == 'table' then
+    for index, value in ipairs(data.PossibleTargets) do
+      local playerId = data.TargetType == 'PlayerType' and tonumber(value) or nil
+      targets[#targets+1] = {
+        selection = index - 1,
+        targetIndex = index,
+        value = value,
+        playerId = playerId or A.null,
+        label = playerId ~= nil and congressPlayerLabel(ctx, playerId) or A.loc(value),
+      }
+    end
+  end
+  local favored, disfavored = A.array(), A.array()
+  for _, pid in ipairs(type(data.FavoredPlayerIDs) == 'table' and data.FavoredPlayerIDs or {}) do
+    favored[#favored+1] = congressPlayerLabel(ctx, tonumber(pid))
+  end
+  for _, pid in ipairs(type(data.DisfavoredPlayerIDs) == 'table' and data.DisfavoredPlayerIDs or {}) do
+    disfavored[#disfavored+1] = congressPlayerLabel(ctx, tonumber(pid))
+  end
+  if data.TargetType == nil then
+    A.unavailable('congress', 'resolutions', 'Resolution '..tostring(data.Type)..' reported no TargetType')
+  end
+  if row == A.null then
+    A.unavailable('congress', 'resolutions', 'Resolution row unavailable for '..tostring(data.Type))
+  end
+  return {
+    subject = 'resolution',
+    resolution = row ~= A.null and row.ResolutionType or A.null,
+    available = row ~= A.null and #targets > 0,
+    label = row ~= A.null and A.loc(row.Name) or A.null,
+    effect1 = row ~= A.null and A.loc(row.Effect1Description) or A.null,
+    effect2 = row ~= A.null and A.loc(row.Effect2Description) or A.null,
+    targetType = data.TargetType or A.null,
+    targets = targets,
+    favoredPlayers = favored,
+    disfavoredPlayers = disfavored,
+    reasons = #targets == 0
+      and A.array{'The engine reported no possible targets for this resolution; the native resolution widget cannot be voted without one'}
+      or A.null,
+    choice = {subject='resolution', resolution = row ~= A.null and row.ResolutionType or A.null,
+      option = 1, selection = 0, votes = 1},
+  }
+end
+
+--- A discussion option. `votes` in the choice template is signed: positive supports the proposal,
+--- negative opposes it, which is exactly what PARAM_WORLD_CONGRESS_VOTES carries (:2222-2262).
+local function discussionOption(ctx, proposal)
+  local blocker = proposal.VotingRestriction ~= nil and A.row('VotingBlockers', proposal.VotingRestriction) or A.null
+  local noUpvote = blocker ~= A.null and blocker.NoUpvote == true
+  local noDownvote = blocker ~= A.null and blocker.NoDownvote == true
+  return {
+    subject = 'discussion',
+    available = proposal.Disabled ~= true and not (noUpvote and noDownvote),
+    disabled = proposal.Disabled == true,
+    label = A.loc(proposal.Name),
+    description = A.loc(proposal.Description),
+    category = proposal.categoryName or A.null,
+    discussionType = proposal.TypeName,
+    discussionTypeId = proposal.Type,
+    sender = proposal.Sender,
+    target = proposal.Target,
+    senderName = congressPlayerLabel(ctx, proposal.Sender),
+    targetName = congressPlayerLabel(ctx, proposal.Target),
+    votingRestriction = proposal.VotingRestriction or A.null,
+    noUpvote = noUpvote,
+    noDownvote = noDownvote,
+    restrictionNote = blocker ~= A.null and A.loc(blocker.Description) or A.null,
+    proposalBlocker = proposal.ProposalBlockerType or A.null,
+    choice = {subject='discussion', sender=proposal.Sender, target=proposal.Target, votes=1},
+  }
+end
+
+--- In session: the votable ballot. Both stages vote discussions; only stage 1 has resolutions
+--- (SetPhase only populates resolutions for stage 1, :248-276).
+local function congressSession(ctx, out, congress, stage)
+  local options = A.array()
+  if stage == 1 then
+    for _, data in ipairs(sortedValues(A.call('congress', congress, 'GetResolutions', ctx.pid))) do
+      if data.Type ~= nil then options[#options+1] = resolutionOption(ctx, data) end
+    end
+  end
+  for _, proposal in ipairs(proposalValues(A.call('congress', congress, 'GetProposals', ctx.pid))) do
+    options[#options+1] = discussionOption(ctx, proposal)
+  end
+  local anyLegal = false
+  for _, option in ipairs(options) do if option.available then anyLegal = true; break end end
+  if not anyLegal then return end
+  -- Guard: only touch GetVotesandFavorCost/GetFavor once a votable ballot exists.
+  local cumulative, perVote, maxVotes = favorCosts(A.call('congress', congress, 'GetVotesandFavorCost', ctx.pid))
+  local favor = number(A.call('congress', ctx.player, 'GetFavor'))
+  out[#out+1] = {
+    key = 'session:stage'..stage..':turn'..ctx.turn,
+    kind = 'congress', actionType = 'congress', operation = 'vote',
+    operations = A.array{'vote','submit'},
+    label = 'World Congress '..(stage == 1 and 'regular session' or 'special session')..': cast votes',
+    mandatory = true,
+    blocks = blocking(ctx, 'ENDTURN_BLOCKING_WORLD_CONGRESS_SESSION'),
+    stage = stage,
+    stageName = congressStageLabel(stage),
+    inSession = A.call('congress', congress, 'IsInSession'),
+    favor = favor or A.null,
+    maxVotes = maxVotes or A.null,
+    favorCostByVotes = cumulative,
+    favorCostPerVote = perVote,
+    options = options,
+    choiceHelp = 'choices=[{subject="resolution",resolution=<ResolutionType>,option=1|2,selection=<targets[].selection>,votes=<n>}, {subject="discussion",sender=<playerId>,target=<playerId>,votes=<signed n>}]. '
+      ..'votes costs favor: favorCostByVotes[n] is the total price of n votes and favorCostPerVote[n] the price of the nth vote. '
+      ..'Submit with civ.action(type="congress",operation="submit") - it sends the votes you pass, then WORLD_CONGRESS_SUBMIT_TURN and ACTION_ENDTURN exactly like the native Accept button; operation="vote" alone defers that release.',
+  }
+end
+
+--- The native results/current-effects tabs: GetReview(pid) carries the last session's outcomes
+--- (WorldCongressPopup.PopulateReview:1822-1900), each with the chosen option, the chosen target and
+--- every player's votes. Read whenever the between-sessions popup is relevant so a stage-4 segment
+--- never hides the results just because there is nothing to propose.
+local function congressReview(ctx, out, congress, stage, status)
+  local review = A.call('congress', congress, 'GetReview', ctx.pid)
+  if review == A.null or type(review) ~= 'table' then
+    return A.unavailable('congress', 'GetReview', 'World Congress review data unavailable')
+  end
+  local resolutions = A.array()
+  for _, data in ipairs(sortedValues(review.Resolutions)) do
+    if data.Type ~= nil then
+      local row = A.row('Resolutions', data.Type)
+      local forVotes, againstVotes = 0, 0
+      if type(data.PlayerSelections) == 'table' then
+        for _, selection in pairs(data.PlayerSelections) do
+          if type(selection) == 'table' then
+            local votes = number(selection.Votes) or 0
+            if selection.OptionChosen == 1 then forVotes = forVotes + votes
+            else againstVotes = againstVotes + votes end
+          end
+        end
+      end
+      resolutions[#resolutions+1] = {
+        resolution = row ~= A.null and row.ResolutionType or A.null,
+        label = row ~= A.null and A.loc(row.Name) or A.null,
+        outcome = A.loc(data.ChosenOption),
+        outcomeLabel = A.loc(data.ChosenLabel),
+        targetType = data.TargetType or A.null,
+        chosenThing = data.ChosenThing or A.null,
+        chosenTarget = data.TargetType == 'PlayerType'
+          and congressPlayerLabel(ctx, tonumber(data.ChosenThing)) or A.loc(data.ChosenThing),
+        votesOption1 = forVotes,
+        votesOption2 = againstVotes,
+        tied = forVotes == againstVotes,
+        isNew = data.IsNew == true,
+      }
+    end
+  end
+  out[#out+1] = {
+    key = 'review:turn'..ctx.turn,
+    kind = 'congress', actionType = 'congress', operation = 'review',
+    operations = A.array(),
+    label = 'World Congress results of the last session',
+    mandatory = false, blocks = false,
+    stage = stage,
+    stageName = congressStageLabel(stage),
+    inSession = A.call('congress', congress, 'IsInSession'),
+    turnsToNextSession = type(status) == 'table' and status.TurnsLeft or A.null,
+    resolutions = resolutions,
+    options = A.array(),
+    choiceHelp = 'Informational only: these outcomes are already decided and there is nothing to submit. Propose discussions with operation="proposal" or acknowledge the between-sessions reminder with operation="looked".',
+  }
+end
+
+--- Out of session (including the results segment): emergency proposals for the next session.
+local function congressProposals(ctx, out, congress, stage)
+  local options = A.array()
+  for _, proposal in ipairs(proposalValues(A.call('congress', congress, 'GetEmergencies', ctx.pid))) do
+    if proposal.Disabled ~= true then
+      options[#options+1] = {
+        subject = 'discussion',
+        available = true,
+        label = A.loc(proposal.Name),
+        description = A.loc(proposal.Description),
+        category = proposal.categoryName or A.null,
+        discussionType = proposal.TypeName,
+        discussionTypeId = proposal.Type,
+        target = proposal.Target,
+        targetName = congressPlayerLabel(ctx, proposal.Target),
+        favorCost = proposal.categoryCost,
+        proposalBlocker = proposal.ProposalBlockerType or A.null,
+        choice = {target = proposal.Target, discussionType = proposal.Type},
+      }
+    end
+  end
+  -- The results readback is what the between-sessions popup is for: the results segment, the
+  -- "look at the congress" reminder, or a session that has something to propose. Outside those the
+  -- review and its meeting status are not read at all.
+  local resultsRelevant = stage == 4
+    or blocking(ctx, 'ENDTURN_BLOCKING_WORLD_CONGRESS_LOOK')
+    or #options > 0
+  -- Guard: fetch session status once, then reuse it for the results readback.
+  local status = resultsRelevant and A.call('congress', congress, 'GetMeetingStatus') or A.null
+  if #options > 0 then
+    local favor = A.call('congress', ctx.player, 'GetFavor')
+    out[#out+1] = {
+      key = 'proposals:turn'..ctx.turn,
+      kind = 'congress', actionType = 'congress', operation = 'proposal',
+      operations = A.array{'proposal','looked'},
+      label = 'World Congress: propose discussions for the next session',
+      mandatory = false,
+      blocks = blocking(ctx, 'ENDTURN_BLOCKING_WORLD_CONGRESS_LOOK') or blocking(ctx, 'ENDTURN_BLOCKING_EMERGENCY_NEEDS_ATTENTION'),
+      stage = stage,
+      stageName = congressStageLabel(stage),
+      inSession = A.call('congress', congress, 'IsInSession'),
+      favor = favor,
+      turnsToNextSession = type(status) == 'table' and status.TurnsLeft or A.null,
+      options = options,
+      choiceHelp = 'choices=[{target=<playerId>,discussionType=<engine discussion type from the option>}], at most one per target player, each spending its favorCost with no refund. '
+        ..'operation="looked" sends the same WORLD_CONGRESS_LOOKED_AT_AVAILABLE request the native popup sends when it closes out of session; it votes and proposes nothing.',
+    }
+  end
+  if resultsRelevant then congressReview(ctx, out, congress, stage, status) end
+end
+
 local function congressDecisions(ctx, out)
   local congress = A.static('congress', Game, 'GetWorldCongress')
   -- A missing congress object must not reach any session or emergency query.
@@ -1025,106 +1619,127 @@ local function congressDecisions(ctx, out)
     return
   end
   if not congressReady(ctx, stage) then return end
-  -- Meeting and favor queries require an actual ballot or emergency, not merely a congress wrapper.
   if stage == 1 or stage == 2 then
-    local options = A.array()
-    if stage == 1 then
-      local resolutions = A.call('congress', congress, 'GetResolutions', ctx.pid)
-      -- GetResolutions carries a non-numeric "Stage" key alongside the numbered entries.
-      for _, data in ipairs(sortedValues(resolutions, function(key) return tostring(key) end)) do
-        if data.Type ~= nil then
-          local row = A.row('Resolutions', data.Type)
-          local targets = A.array()
-          if type(data.PossibleTargets) == 'table' then
-            for i, value in ipairs(data.PossibleTargets) do
-              targets[#targets+1] = {selection = i - 1, value = value,
-                label = data.TargetType == 'PlayerType' and tostring(value) or A.loc(value)}
-            end
-          end
-          options[#options+1] = {
-            subject = 'resolution',
-            resolution = row ~= A.null and row.ResolutionType or A.null,
-            available = row ~= A.null,
-            label = row ~= A.null and A.loc(row.Name) or A.null,
-            effect1 = row ~= A.null and A.loc(row.Effect1Description) or A.null,
-            effect2 = row ~= A.null and A.loc(row.Effect2Description) or A.null,
-            targetType = data.TargetType,
-            targets = targets,
-            choice = {subject='resolution', resolution = row ~= A.null and row.ResolutionType or A.null,
-              option = 1, selection = 0, votes = 1},
-          }
-        end
-      end
-    end
-    local proposals = A.call('congress', congress, 'GetProposals', ctx.pid)
-    if type(proposals) == 'table' then
-      for _, proposal in ipairs(proposalValues(proposals)) do
-        options[#options+1] = {
-          subject = 'discussion',
-          available = proposal.Disabled ~= true,
-          label = A.loc(proposal.Name),
-          description = A.loc(proposal.Description),
-          discussionType = proposal.TypeName,
-          sender = proposal.Sender, target = proposal.Target,
-          choice = {subject='discussion', sender=proposal.Sender, target=proposal.Target, votes=1},
-        }
-      end
-    end
-    local anyLegal = false
-    for _, option in ipairs(options) do if option.available then anyLegal = true; break end end
-    if anyLegal then
-      -- Guard: only touch GetVotesandFavorCost/GetFavor once a votable ballot exists.
-      local costs = A.call('congress', congress, 'GetVotesandFavorCost', ctx.pid)
-      local favor = A.call('congress', ctx.player, 'GetFavor')
-      out[#out+1] = {
-        key = 'session:stage'..stage..':turn'..ctx.turn,
-        kind = 'congress', actionType = 'congress', operation = 'vote',
-        operations = A.array{'vote','submit'},
-        label = 'World Congress stage '..stage..': cast votes',
-        mandatory = true,
-        blocks = blocking(ctx, 'ENDTURN_BLOCKING_WORLD_CONGRESS_SESSION'),
-        stage = stage,
-        favor = favor, maxVotes = type(costs) == 'table' and costs.MaxVotes or A.null, favorCostByVotes = costs,
-        options = options,
-        choiceHelp = 'choices=[{subject="resolution",resolution=<ResolutionType>,option=1|2,selection=<0-based target index>,votes=<n>}, {subject="discussion",sender=<playerId>,target=<playerId>,votes=<signed n>}]. Votes cost favor: favorCostByVotes[n-1]. Then civ.action(type="congress",operation="submit") sends WORLD_CONGRESS_SUBMIT_TURN; ending the turn stays a separate explicit civ.action(type="end_turn").',
-      }
-    end
+    congressSession(ctx, out, congress, stage)
   else
-    -- Out of session, defer meeting status and favor until a proposal is available.
-    local emergencies = A.call('congress', congress, 'GetEmergencies', ctx.pid)
-    local options = A.array()
-    if type(emergencies) == 'table' then
-      for _, proposal in ipairs(proposalValues(emergencies)) do
-        if proposal.Disabled ~= true then
-          options[#options+1] = {
-            available = true,
-            label = A.loc(proposal.Name),
-            description = A.loc(proposal.Description),
-            discussionType = proposal.TypeName,
-            target = proposal.Target,
-            choice = {target = proposal.Target, discussionType = proposal.Type},
-          }
+    congressProposals(ctx, out, congress, stage)
+  end
+end
+
+--- Fresh revalidation of everything a vote request may target. Nothing here is trusted from the
+--- record the caller read: the ballot, the target counts, the prices and the favor are re-read.
+local function congressBallot(ctx, congress, stage)
+  local resolutions, discussions = {}, {}
+  if stage == 1 then
+    for _, data in ipairs(sortedValues(A.call('congress', congress, 'GetResolutions', ctx.pid))) do
+      if data.Type ~= nil then
+        local row = A.row('Resolutions', data.Type)
+        if row ~= A.null and row.ResolutionType ~= nil then
+          local targets = 0
+          if type(data.PossibleTargets) == 'table' then
+            for _ in ipairs(data.PossibleTargets) do targets = targets + 1 end
+          end
+          resolutions[row.ResolutionType] = {hash = row.Hash, targets = targets}
         end
       end
-    end
-    if #options > 0 then
-      -- Guard: fetch session status and favor only once a proposalable emergency exists.
-      local status = A.call('congress', congress, 'GetMeetingStatus')
-      local favor = A.call('congress', ctx.player, 'GetFavor')
-      out[#out+1] = {
-        key = 'proposals:turn'..ctx.turn,
-        kind = 'congress', actionType = 'congress', operation = 'proposal',
-        operations = A.array{'proposal'},
-        label = 'World Congress: propose discussions for the next session',
-        mandatory = false,
-        blocks = blocking(ctx, 'ENDTURN_BLOCKING_WORLD_CONGRESS_LOOK') or blocking(ctx, 'ENDTURN_BLOCKING_EMERGENCY_NEEDS_ATTENTION'),
-        favor = favor,
-        turnsToNextSession = type(status) == 'table' and status.TurnsLeft or A.null,
-        options = options,
-        choiceHelp = 'choices=[{target=<playerId>,discussionType=<engine discussion type from the option>}]. Each proposal spends favor with no refund.',
-      }
     end
   end
+  for _, proposal in ipairs(proposalValues(A.call('congress', congress, 'GetProposals', ctx.pid))) do
+    discussions[tostring(proposal.Sender)..'>'..tostring(proposal.Target)] = proposal
+  end
+  local cumulative, perVote, maxVotes = favorCosts(A.call('congress', congress, 'GetVotesandFavorCost', ctx.pid))
+  return {
+    resolutions = resolutions,
+    discussions = discussions,
+    cumulative = cumulative,
+    perVote = perVote,
+    maxVotes = maxVotes,
+    favor = number(A.call('congress', ctx.player, 'GetFavor')),
+  }
+end
+
+--- Build the native vote requests for one submission. The native Accept sends exactly one request
+--- per resolution and one per discussion (WorldCongressPopup.lua:2238-2262), so a duplicate entry
+--- is refused rather than turned into a second native request. Returns the request items, the known
+--- total favor cost (A.null when any price is undecodable) and a readback of what was submitted.
+local function congressVoteItems(ctx, ballot, stage, votes)
+  local items, ballotReadback, totalCost, priced = {}, A.array(), 0, true
+  local seenResolution, seenDiscussion = {}, {}
+  for _, vote in ipairs(votes) do
+    assert(type(vote) == 'table', 'Each congress vote must be a table')
+    local count = number(vote.votes)
+    assert(count ~= nil and count % 1 == 0, 'Each congress vote needs an integer votes count')
+    if vote.subject == 'discussion' then
+      local sender, target = number(vote.sender), number(vote.target)
+      assert(sender ~= nil and target ~= nil, 'A discussion vote needs sender and target player ids from the option')
+      local discussionKey = tostring(sender)..'>'..tostring(target)
+      assert(seenDiscussion[discussionKey] == nil,
+        'That discussion appears twice in this submission; the native Accept sends one request per discussion')
+      seenDiscussion[discussionKey] = true
+      local proposal = ballot.discussions[discussionKey]
+      assert(proposal ~= nil, 'That discussion is not on the current votable ballot: '..sender..'->'..target)
+      assert(proposal.Disabled ~= true, 'That discussion is disabled on the current ballot and cannot be voted')
+      local blocker = proposal.VotingRestriction ~= nil and A.row('VotingBlockers', proposal.VotingRestriction) or A.null
+      if blocker ~= A.null then
+        local note = tostring(A.loc(blocker.Description))
+        assert(not (blocker.NoUpvote == true and blocker.NoDownvote == true),
+          'That discussion cannot be voted in either direction: '..note)
+        assert(not (blocker.NoUpvote == true and count > 0), 'That discussion accepts only votes against: '..note)
+        assert(not (blocker.NoDownvote == true and count < 0), 'That discussion accepts only votes in favour: '..note)
+      end
+      assert(count ~= 0, 'A discussion vote needs a nonzero signed votes count: positive supports, negative opposes')
+      if ballot.maxVotes ~= nil then
+        assert(math.abs(count) <= ballot.maxVotes,
+          'This session allows at most '..ballot.maxVotes..' vote(s) per proposal; '..math.abs(count)..' were given')
+      end
+      local cost = ballot.cumulative[math.abs(count)]
+      if cost == nil then priced = false else totalCost = totalCost + cost end
+      ballotReadback[#ballotReadback+1] = {subject='discussion', sender=sender, target=target, votes=count,
+        favorCost = cost or A.null}
+      items[#items+1] = {label = 'WORLD_CONGRESS_DISCUSSION_VOTE '..sender..'->'..target, run = function()
+        local parameters = {}
+        parameters[A.param(PlayerOperations, 'PARAM_PLAYER_ONE')] = sender
+        parameters[A.param(PlayerOperations, 'PARAM_PLAYER_TWO')] = target
+        parameters[A.param(PlayerOperations, 'PARAM_WORLD_CONGRESS_VOTES')] = count
+        return playerOperation(ctx.pid, 'WORLD_CONGRESS_DISCUSSION_VOTE', parameters)
+      end}
+    else
+      assert(vote.subject == nil or vote.subject == 'resolution', 'congress vote subject must be "resolution" or "discussion"')
+      assert(stage == 1, 'Resolutions are only voted in the regular session; the special session has discussion votes only')
+      assert(type(vote.resolution) == 'string', 'A resolution vote needs resolution=<ResolutionType>')
+      local resolution = ballot.resolutions[vote.resolution]
+      assert(resolution ~= nil, 'Resolution is not on this session ballot: '..vote.resolution)
+      assert(seenResolution[vote.resolution] == nil,
+        'Resolution '..vote.resolution..' appears twice in this submission; the native Accept sends one request per resolution')
+      seenResolution[vote.resolution] = true
+      local option = number(vote.option)
+      assert(option == 1 or option == 2, 'A resolution vote needs option=1 or option=2')
+      assert(count > 0, 'Resolution votes are positive; option 1 or 2 selects the side')
+      assert(resolution.targets > 0, 'This resolution reported no possible targets; it cannot be voted')
+      local selection = number(vote.selection)
+      assert(selection ~= nil and selection % 1 == 0,
+        'A resolution vote needs selection=<targets[].selection> from the decision record')
+      assert(selection >= 0 and selection < resolution.targets,
+        'Target '..selection..' is outside this resolution\'s '..resolution.targets..' possible target(s)')
+      if ballot.maxVotes ~= nil then
+        assert(count <= ballot.maxVotes,
+          'This session allows at most '..ballot.maxVotes..' vote(s) per resolution; '..count..' were given')
+      end
+      local cost = ballot.cumulative[count]
+      if cost == nil then priced = false else totalCost = totalCost + cost end
+      ballotReadback[#ballotReadback+1] = {subject='resolution', resolution=vote.resolution, option=option,
+        selection=selection, votes=count, favorCost = cost or A.null}
+      items[#items+1] = {label = 'WORLD_CONGRESS_RESOLUTION_VOTE '..vote.resolution, run = function()
+        local parameters = {}
+        parameters[A.param(PlayerOperations, 'PARAM_RESOLUTION_TYPE')] = resolution.hash
+        parameters[A.param(PlayerOperations, 'PARAM_WORLD_CONGRESS_VOTES')] = count
+        parameters[A.param(PlayerOperations, 'PARAM_RESOLUTION_OPTION')] = option
+        parameters[A.param(PlayerOperations, 'PARAM_RESOLUTION_SELECTION')] = selection
+        return playerOperation(ctx.pid, 'WORLD_CONGRESS_RESOLUTION_VOTE', parameters)
+      end}
+    end
+  end
+  return items, priced and totalCost or A.null, ballotReadback
 end
 
 local function congressSubmit(ctx, operation, votes, proposals)
@@ -1134,81 +1749,83 @@ local function congressSubmit(ctx, operation, votes, proposals)
   assert(stage ~= nil and congressReady(ctx, stage), 'World Congress is not ready')
   if operation == 'submit' then
     assert(stage == 1 or stage == 2, 'The World Congress is not currently in a voting stage')
-    return submit({{label = 'WORLD_CONGRESS_SUBMIT_TURN', run = function()
+    local items, ballot, cost, favorKnown = {}, nil, A.null, A.null
+    -- The native Accept sends the votes and then the segment request, in that order
+    -- (WorldCongressPopup.lua:2238-2262 then :2270-2271). Supplying votes here reproduces that
+    -- whole sequence in one explicit call; omitting them means "my votes were already sent".
+    if votes ~= nil then
+      assert(type(votes) == 'table' and #votes > 0, 'congress submit votes must be a non-empty array when provided')
+      local fresh = congressBallot(ctx, congress, stage)
+      local voteItems, voteCost
+      voteItems, voteCost, ballot = congressVoteItems(ctx, fresh, stage, votes)
+      cost, favorKnown = voteCost, fresh.favor or A.null
+      if cost ~= A.null and fresh.favor ~= nil and cost > fresh.favor then
+        return refused('illegal', 'This ballot costs '..cost..' favor and only '..fresh.favor..' is available; nothing was submitted',
+          {favor = fresh.favor, favorCost = cost})
+      end
+      for _, item in ipairs(voteItems) do items[#items+1] = item end
+    end
+    items[#items+1] = {label = 'WORLD_CONGRESS_SUBMIT_TURN', run = function()
       return playerOperation(ctx.pid, 'WORLD_CONGRESS_SUBMIT_TURN', {})
-    end}}, 'The congress turn was submitted. Ending the game turn is a separate explicit civ.action(type="end_turn").')
+    end}
+    -- Ending the turn is part of the native Accept, and the ordinary end_turn action cannot do it in
+    -- this segment: all three congress segments clear AllowStrategicCommands and AllowTacticalCommands
+    -- (Expansion2_TurnPhases.xml:12-14). Submitting the ballot is the explicit authorization, so this
+    -- is the only request pair in the module that ends a turn and it never happens without 'submit'.
+    items[#items+1] = {label = 'ACTION_ENDTURN', run = function()
+      return request(UI.RequestAction, ActionTypes.ACTION_ENDTURN)
+    end}
+    local result = submit(items, 'Votes (when supplied), WORLD_CONGRESS_SUBMIT_TURN and ActionTypes.ACTION_ENDTURN were sent in that order, '
+      ..'exactly the sequence the native Accept button performs. Submission is not completion: re-read civ.decisions/turnState before assuming the '
+      ..'session advanced. The native congress screen is closed by the popup module, not by this request.')
+    result.turnEnding = true
+    result.sessionSubmitted = true
+    result.ballot = ballot or A.array()
+    result.favorCost = cost
+    result.favor = favorKnown
+    result.observed = congressObservation(ctx, congress)
+    result.popup = 'popup:world-congress'
+    -- The popup layer owns native teardown. After an explicit submit it closes the congress screen
+    -- that matches this submitted session surface and reports the outcome in `popupClose` on this
+    -- result (a failed teardown keeps the submitted result intact). This module only names the
+    -- surface; an explicit civ.decide({id="popup:world-congress"}) remains for the case where the
+    -- observation still reports the screen up.
+    result.presentation = 'The ballot is submitted. The bridge closes the native congress screen that matches this submitted session and reports it in popupClose (this module never dismisses a screen); no screenshot or button click is needed. If the screen is still reported up, check civ.decisions({id="popup:world-congress"}) and close it with civ.decide({id="popup:world-congress"}).'
+    return result
+  elseif operation == 'looked' then
+    assert(stage == 0 or stage == 4, 'The congress look acknowledgement belongs to the between-sessions screen, not a voting segment')
+    local result = submit({{label = 'WORLD_CONGRESS_LOOKED_AT_AVAILABLE', run = function()
+      return playerOperation(ctx.pid, 'WORLD_CONGRESS_LOOKED_AT_AVAILABLE', {})
+    end}}, 'This is the request the native popup sends when it closes out of session (:2394-2408); it acknowledges the reminder and sends no vote and no proposal.')
+    result.observed = congressObservation(ctx, congress)
+    return result
   elseif operation == 'vote' then
     assert(type(votes) == 'table' and #votes > 0, 'congress vote needs votes=[{subject="resolution"|"discussion",...}]')
     assert(stage == 1 or stage == 2, 'The World Congress is not currently in a voting stage')
-    local resolutionHash = {}
-    if stage == 1 then
-      local resolutions = A.call('congress', congress, 'GetResolutions', ctx.pid)
-      if type(resolutions) == 'table' then
-        for index, data in pairs(resolutions) do
-          if type(index) == 'number' and type(data) == 'table' then
-            local row = A.row('Resolutions', data.Type)
-            if row ~= A.null then resolutionHash[row.ResolutionType] = row.Hash end
-          end
-        end
-      end
+    local ballot = congressBallot(ctx, congress, stage)
+    local items, cost, readback = congressVoteItems(ctx, ballot, stage, votes)
+    -- The engine's own price table decides affordability, exactly as the native widget does
+    -- (:983-1006). An undecodable price never refuses; a known overspend never reaches the engine.
+    if cost ~= A.null and ballot.favor ~= nil and cost > ballot.favor then
+      return refused('illegal', 'This ballot costs '..cost..' favor and only '..ballot.favor..' is available; nothing was submitted',
+        {favor = ballot.favor, favorCost = cost})
     end
-    -- Discussion votes are revalidated against the live ballot; a sender/target pair that
-    -- is not on it is refused before any request, not sent and hoped for.
-    local ballot = {}
-    local proposals = A.call('congress', congress, 'GetProposals', ctx.pid)
-    for _, proposal in ipairs(proposalValues(proposals)) do
-      if proposal.Disabled ~= true and proposal.Sender ~= nil then
-        ballot[tostring(proposal.Sender)..'>'..tostring(proposal.Target)] = true
-      end
-    end
-    local items = {}
-    for _, vote in ipairs(votes) do
-      assert(type(vote) == 'table', 'Each congress vote must be a table')
-      local count = number(vote.votes)
-      assert(count ~= nil and count % 1 == 0 and count ~= 0, 'Each congress vote needs a nonzero integer votes count')
-      if vote.subject == 'discussion' then
-        local sender, target = number(vote.sender), number(vote.target)
-        assert(sender ~= nil and target ~= nil, 'A discussion vote needs sender and target player ids from the option')
-        assert(ballot[tostring(sender)..'>'..tostring(target)] == true,
-          'That discussion is not on the current votable ballot: '..sender..'->'..target)
-        items[#items+1] = {label = 'WORLD_CONGRESS_DISCUSSION_VOTE '..sender..'->'..target, run = function()
-          local parameters = {}
-          parameters[A.param(PlayerOperations, 'PARAM_PLAYER_ONE')] = sender
-          parameters[A.param(PlayerOperations, 'PARAM_PLAYER_TWO')] = target
-          parameters[A.param(PlayerOperations, 'PARAM_WORLD_CONGRESS_VOTES')] = count
-          return playerOperation(ctx.pid, 'WORLD_CONGRESS_DISCUSSION_VOTE', parameters)
-        end}
-      else
-        assert(vote.subject == nil or vote.subject == 'resolution', 'congress vote subject must be "resolution" or "discussion"')
-        assert(stage == 1, 'Resolutions are only voted in stage 1')
-        assert(type(vote.resolution) == 'string', 'A resolution vote needs resolution=<ResolutionType>')
-        local hash = resolutionHash[vote.resolution]
-        assert(hash ~= nil, 'Resolution is not on this session ballot: '..vote.resolution)
-        local option = number(vote.option)
-        assert(option == 1 or option == 2, 'A resolution vote needs option=1 or option=2')
-        assert(count > 0, 'Resolution votes are positive; option 1 or 2 selects the side')
-        local selection = number(vote.selection)
-        items[#items+1] = {label = 'WORLD_CONGRESS_RESOLUTION_VOTE '..vote.resolution, run = function()
-          local parameters = {}
-          parameters[A.param(PlayerOperations, 'PARAM_RESOLUTION_TYPE')] = hash
-          parameters[A.param(PlayerOperations, 'PARAM_WORLD_CONGRESS_VOTES')] = count
-          parameters[A.param(PlayerOperations, 'PARAM_RESOLUTION_OPTION')] = option
-          if selection ~= nil then
-            parameters[A.param(PlayerOperations, 'PARAM_RESOLUTION_SELECTION')] = selection
-          end
-          return playerOperation(ctx.pid, 'WORLD_CONGRESS_RESOLUTION_VOTE', parameters)
-        end}
-      end
-    end
-    return submit(items, 'Votes were submitted one native request at a time; requests[] reports which. Call civ.action(type="congress",operation="submit") when the ballot is complete.')
+    local result = submit(items, 'Votes were submitted one native request at a time; requests[] and ballot[] report exactly which. '
+      ..'The session is not released yet: civ.action(type="congress",operation="submit") sends WORLD_CONGRESS_SUBMIT_TURN and ACTION_ENDTURN like the native Accept, '
+      ..'or pass the same votes to operation="submit" to vote and release the session in one call.')
+    result.favor = ballot.favor or A.null
+    result.favorCost = cost
+    result.maxVotes = ballot.maxVotes or A.null
+    result.ballot = readback
+    return result
   elseif operation == 'proposal' then
-    assert(stage == 0, 'Emergency proposals cannot be selected during voting')
+    assert(stage == 0 or stage == 4, 'Emergency proposals cannot be selected during a voting segment')
     assert(type(proposals) == 'table' and #proposals > 0, 'congress proposal needs proposals=[{target=...,discussionType=...}]')
     local offered = {}
     for _, proposal in ipairs(proposalValues(A.call('congress', congress, 'GetEmergencies', ctx.pid))) do
       if proposal.Disabled ~= true then offered[tostring(proposal.Type)..'>'..tostring(proposal.Target)] = true end
     end
-    local items = {}
+    local items, seenTarget = {}, {}
     for _, proposal in ipairs(proposals) do
       assert(type(proposal) == 'table', 'Each proposal must be a table')
       local target = number(proposal.target)
@@ -1216,6 +1833,10 @@ local function congressSubmit(ctx, operation, votes, proposals)
       assert(proposal.discussionType ~= nil, 'Each proposal needs discussionType from the option')
       local discussionType = proposal.discussionType
       assert(offered[tostring(discussionType)..'>'..tostring(target)] == true, 'Emergency proposal is not currently offered')
+      -- The native proposals tab disables a second proposal for the same target (LOC_WORLD_
+      -- CONGRESS_TT_MAX_ONE_PROPOSAL, :1393-1440); a duplicate selection is refused here instead.
+      assert(seenTarget[target] == nil, 'The native screen allows at most one proposal per target player; target '..target..' was selected twice')
+      seenTarget[target] = true
       items[#items+1] = {label = 'WORLD_CONGRESS_DISCUSSION_SELECTION target '..target, run = function()
         local parameters = {}
         parameters[A.param(PlayerOperations, 'PARAM_OTHER_PLAYER')] = target
@@ -1223,9 +1844,11 @@ local function congressSubmit(ctx, operation, votes, proposals)
         return playerOperation(ctx.pid, 'WORLD_CONGRESS_DISCUSSION_SELECTION', parameters)
       end}
     end
-    return submit(items, 'Proposals spend favor with no refund. requests[] reports exactly which were submitted.')
+    local result = submit(items, 'Proposals spend favor with no refund. requests[] reports exactly which were submitted.')
+    result.observed = congressObservation(ctx, congress)
+    return result
   end
-  error('congress operation must be vote, proposal or submit')
+  error('congress operation must be vote, proposal, submit or looked')
 end
 
 -- ---------------------------------------------------------------------------
@@ -1261,8 +1884,10 @@ local function espionageEscapeDecision(ctx, out)
   local units = A.call('espionage', ctx.player, 'GetUnits')
   -- A missing unit collection or stale spy id must not reach the city lookup.
   if units == A.null then return A.unavailable('espionage', 'GetUnits', 'Unit collection unavailable') end
-  local spy = A.call('espionage', units, 'FindID', spyId)
-  if spy == A.null then return A.unavailable('espionage', 'FindID', 'Escaping spy unavailable') end
+  local spy = exactIdentity('espionage', 'unit', ctx.pid, spyId, A.call('espionage', units, 'FindID', spyId))
+  -- The escaping-spy getter and the unit collection are read at different moments; a slot reused in
+  -- between must not turn into an escape route for a different unit.
+  if spy == nil then return A.unavailable('espionage', 'FindID', 'Escaping spy lookup did not return the requested unit') end
   local city = A.static('espionage', Cities, 'GetPlotPurchaseCity', spy:GetX(), spy:GetY())
   -- District methods require a live city collection; city-centre escape remains available without it.
   local districts = city ~= A.null and A.call('espionage', city, 'GetDistricts') or A.null
@@ -1395,10 +2020,11 @@ local function espionageSubmit(ctx, operation, unitIdValue, districtType, operat
       name = 'SPY_TRAVEL_NEW_CITY'
       if cityIdValue ~= nil then
         local owner, cid = parseCityId(cityIdValue)
-        local city
-        if owner == ctx.pid then city = A.call('espionage', ctx.player:GetCities(), 'FindID', cid)
-        else city = A.static('espionage', CityManager, 'GetCity', owner, cid) end
-        assert(city ~= nil and city ~= A.null, 'Destination city is not observable; call civ.decisions again')
+        local city, mismatch = cityById('espionage', ctx, owner, cid)
+        if city == nil then
+          return refused('stale', mismatch or ('Destination city '..tostring(cid)..' is not observable; nothing was submitted'),
+            {operation = operation, cityId = cityIdValue})
+        end
         x, y = city:GetX(), city:GetY()
       end
       assert(number(x) ~= nil and number(y) ~= nil, 'espionage travel needs cityId or x/y of the destination city')
@@ -1418,10 +2044,11 @@ local function espionageSubmit(ctx, operation, unitIdValue, districtType, operat
       plot = Map.GetPlot(x, y)
     elseif operation == 'mission' and cityIdValue ~= nil then
       local owner, cid = parseCityId(cityIdValue)
-      local city
-      if owner == ctx.pid then city = A.call('espionage', ctx.player:GetCities(), 'FindID', cid)
-      else city = A.static('espionage', CityManager, 'GetCity', owner, cid) end
-      assert(city ~= nil and city ~= A.null, 'Mission city is not observable; call civ.decisions again')
+      local city, mismatch = cityById('espionage', ctx, owner, cid)
+      if city == nil then
+        return refused('stale', mismatch or ('Mission city '..tostring(cid)..' is not observable; nothing was submitted'),
+          {operation = operation, cityId = cityIdValue})
+      end
       plot = Map.GetPlot(city:GetX(), city:GetY())
     else
       plot = Map.GetPlot(spy:GetX(), spy:GetY())
@@ -1441,198 +2068,144 @@ local function espionageSubmit(ctx, operation, unitIdValue, districtType, operat
 end
 
 -- ---------------------------------------------------------------------------
--- Diplomacy sessions.
--- Native: Base/Assets/UI/DiplomacyActionView.lua. Discovery is
---   DiplomacyManager.HasQueuedSession(pid) plus DiplomacyManager.FindOpenSessionID(pid,
---   other) / GetSessionInfo(sessionID). The live statement arrives on the
---   Events.DiplomacyStatement stream, so this module caches the last variants per session
---   the same way state.lua caches notification ids; nothing is mutated by listening.
---   Answers are DiplomacyManager.AddResponse(sessionID, pid, key) and
---   DiplomacyManager.AddStatement(sessionID, pid, key).
---   Selection keys come from the native DiplomacyStatements/DiplomacySelections tables
---   (DiplomacyStatementSupport.lua) filtered by GetDiplomacy():IsDiplomaticActionValid;
---   when that derivation is unavailable only the always-present generic responses are
---   listed, and the record says so rather than inventing keys.
+-- Diplomacy sessions moved to lua/diplomacy.lua. The collector, the dispatcher and the action
+-- schema are resolved from A.diplomacyDecisions / A.diplomacyAction / A.diplomacyActionSpec at
+-- call time (see COLLECTORS and dispatch below), so this file keeps the decision ids, the
+-- pagination and the revalidation contract while the module owns the native session and deal
+-- encodings. The shared submission helpers it uses are A.decisionRequest / A.decisionSubmit /
+-- A.decisionRefused, exported above.
 -- ---------------------------------------------------------------------------
-if not A.diplomacyStatementsInitialized then
-  A.diplomacyStatements = {}
-  local ok = pcall(function()
-    Events.DiplomacyStatement.Add(function(fromPlayer, toPlayer, variants)
-      if type(variants) ~= 'table' then return end
-      local sessionID = variants.SessionID
-      if sessionID == nil then return end
-      A.diplomacyStatements[sessionID] = {
-        fromPlayer = fromPlayer, toPlayer = toPlayer,
-        statementType = variants.StatementType, statementSubType = variants.StatementSubType,
-        fromPlayerMood = variants.FromPlayerMood, initiator = variants.Initiator,
-        turn = Game.GetCurrentGameTurn(),
-      }
-    end)
-  end)
-  A.diplomacyStatementsInitialized = ok
-  if not ok then A.diplomacyStatements = {} end
+
+-- ---------------------------------------------------------------------------
+-- Envoys (influence tokens).
+-- Native: Base/Assets/UI/PartialScreens/CityStates.lua. Sending is one native request per token
+-- (OnConfirmPlacement, CityStates.lua:749-765):
+--   parameters[PlayerOperations.PARAM_PLAYER_ONE] = cityStatePlayerID
+--   UI.RequestPlayerOperation(localPlayer, PlayerOperations.GIVE_INFLUENCE_TOKEN, parameters)
+-- Availability is read from the local player's Influence object, not guessed: GetTokensToGive() is
+-- how many tokens may still be given (TopPanel.lua:245), CanGiveInfluence() gates giving at all, and
+-- CanGiveTokensToPlayer(cityState) is the exact predicate the screen uses to enable a city-state's
+-- envoy buttons (CityStates.lua:1499). Closing the native screen also records that the reminder was
+-- considered: localPlayer:GetInfluence():SetGivingTokensConsidered(true) (CityStates.lua:446-455).
+-- ---------------------------------------------------------------------------
+local function envoyInfluence(ctx)
+  local influence = A.call('envoy', ctx.player, 'GetInfluence')
+  if influence == A.null then
+    A.unavailable('envoy', 'GetInfluence', 'The local player Influence manager is unavailable')
+    return nil
+  end
+  return influence
 end
 
-local GENERIC_RESPONSES = {
-  {choice = 'POSITIVE', kindOfAnswer = 'response'},
-  {choice = 'NEGATIVE', kindOfAnswer = 'response'},
-  {choice = 'RESPONSE_IGNORE', kindOfAnswer = 'response'},
-}
-
---- Reproduce the native selection lookup for one statement. Same fixed queries and same
---- IsDiplomaticActionValid gate as DiplomacyStatementSupport.lua; no model-supplied SQL.
-local function statementSelections(ctx, cached, otherPlayerID)
-  if cached == nil then return nil, 'No statement has been observed on this session since the bridge attached' end
-  local typeName = A.static('diplomacy', DiplomacyManager, 'GetKeyName', cached.statementType)
-  local subTypeName = A.static('diplomacy', DiplomacyManager, 'GetKeyName', cached.statementSubType)
-  if type(typeName) ~= 'string' then return nil, 'Statement type could not be decoded' end
-  if type(subTypeName) ~= 'string' then subTypeName = 'NONE' end
-  local leader = 'ANY'
-  local config = PlayerConfigurations and PlayerConfigurations[cached.fromPlayer]
-  if config then
-    local name = A.call('diplomacy', config, 'GetLeaderTypeName')
-    if type(name) == 'string' then leader = name end
-  end
-  local mood = A.static('diplomacy', DiplomacyManager, 'GetKeyName', cached.fromPlayerMood)
-  if type(mood) ~= 'string' then mood = 'ANY' end
-  local initiator = 'HUMAN'
-  if cached.initiator ~= nil and PlayerConfigurations and PlayerConfigurations[cached.initiator] then
-    initiator = A.call('diplomacy', PlayerConfigurations[cached.initiator], 'IsHuman') == true and 'HUMAN' or 'AI'
-  end
-  local selectionsKey
-  for _, leaderKey in ipairs({leader, 'ANY'}) do
-    for _, moodKey in ipairs({mood, 'ANY'}) do
-      if selectionsKey == nil then
-        local rows = A.static('diplomacy', DB, 'Query',
-          'SELECT Selections from DiplomacyStatements WHERE Type = ? AND SubType = ? AND Initiator = ? AND Leader = ? AND Mood = ?',
-          typeName, subTypeName, initiator, leaderKey, moodKey)
-        if type(rows) == 'table' then
-          for _, row in ipairs(rows) do if row.Selections ~= nil then selectionsKey = row.Selections; break end end
-        end
-      end
-    end
-  end
-  if selectionsKey == nil then return nil, 'No DiplomacySelections row matched this statement in this ruleset' end
-  local diplomacy = A.call('diplomacy', ctx.player, 'GetDiplomacy')
-  -- Without the manager, native selection legality is unknown rather than implicitly true.
-  if diplomacy == A.null then
-    A.unavailable('diplomacy', 'GetDiplomacy', 'Diplomacy manager unavailable')
-    return nil, 'Diplomacy manager unavailable for native selection legality'
+--- City-state candidates, read from PlayerManager.GetAliveMinors(), which returns player objects
+--- (ReportScreen.lua:463 calls pMinorPlayer:GetInfluence() on each entry).
+local function envoyCandidates(ctx, influence)
+  local minors = A.static('envoy', PlayerManager, 'GetAliveMinors')
+  if type(minors) ~= 'table' then
+    A.unavailable('envoy', 'GetAliveMinors', 'Alive minor players are unavailable')
+    return nil
   end
   local options = A.array()
-  for _, leaderKey in ipairs({leader, 'ANY'}) do
-    for _, moodKey in ipairs({mood, 'ANY'}) do
-      if #options == 0 then
-        local rows = A.static('diplomacy', DB, 'Query',
-          'SELECT Text, Tooltip, Key, Sort, DiplomaticActionType from DiplomacySelections WHERE Type = ? AND Leader = ? AND Mood = ?',
-          selectionsKey, leaderKey, moodKey)
-        if type(rows) == 'table' then
-          for _, row in ipairs(rows) do
-            local available, reasons = true, nil
-            if row.DiplomaticActionType ~= nil and diplomacy ~= A.null then
-              local ok, valid, results = pcall(function()
-                return diplomacy:IsDiplomaticActionValid(row.DiplomaticActionType, otherPlayerID, true)
-              end)
-              available = ok and valid == true
-              if not ok or type(valid) ~= 'boolean' then
-                A.unavailable('diplomacy', 'IsDiplomaticActionValid', ok and 'Diplomatic selection legality unknown' or valid)
-              end
-              if ok then
-                if not available and type(results) == 'table' and type(results.FailureReasons) == 'table' then
-                  reasons = A.array()
-                  for _, text in ipairs(results.FailureReasons) do reasons[#reasons+1] = A.loc(text) end
-                end
-              end
-            end
-            options[#options+1] = {choice = row.Key, available = available, label = A.loc(row.Text),
-              tooltip = A.loc(row.Tooltip), diplomaticAction = row.DiplomaticActionType or A.null,
-              reasons = reasons or A.null, kindOfAnswer = 'response'}
-          end
-        end
-      end
+  for _, minor in ipairs(minors) do
+    local other = number(A.call('envoy', minor, 'GetID'))
+    if other ~= nil and other ~= ctx.pid then
+      local config = PlayerConfigurations and PlayerConfigurations[other]
+      local legal = A.call('envoy', influence, 'CanGiveTokensToPlayer', other)
+      local tokens = number(A.call('envoy', influence, 'GetTokensReceived', other))
+      local name = config and A.call('envoy', config, 'GetCivilizationShortDescription') or A.null
+      options[#options+1] = {
+        choice = tostring(other),
+        playerId = other,
+        available = legal == true,
+        label = type(name) == 'string' and A.loc(name) or ('city-state player '..other),
+        tokensReceived = tokens or A.null,
+        reasons = legal == A.null and A.array{'The engine did not answer CanGiveTokensToPlayer for this city-state'} or A.null,
+      }
     end
   end
-  if #options == 0 then return nil, 'DiplomacySelections returned no rows for this statement' end
-  return options, nil
+  return options
 end
 
-local function diplomacyDecisions(ctx, out)
-  if DiplomacyManager == nil then return A.unavailable('diplomacy', 'DiplomacyManager', 'Diplomacy namespace unavailable') end
-  local queued = A.static('diplomacy', DiplomacyManager, 'HasQueuedSession', ctx.pid)
-  -- A missing player manager cannot answer HasMet or native selection legality.
-  local diplomacy = A.call('diplomacy', ctx.player, 'GetDiplomacy')
-  if diplomacy == A.null then return A.unavailable('diplomacy', 'GetDiplomacy', 'Diplomacy manager unavailable') end
-  local seen, found = {}, 0
-  for other = 0, 63 do
-    if other ~= ctx.pid and Players and Players[other] and A.call('diplomacy', diplomacy, 'HasMet', other) == true then
-      local sessionID = A.static('diplomacy', DiplomacyManager, 'FindOpenSessionID', ctx.pid, other)
-      if type(sessionID) == 'number' and not seen[sessionID] then
-        seen[sessionID] = true
-        local info = A.static('diplomacy', DiplomacyManager, 'GetSessionInfo', sessionID)
-        local cached = A.diplomacyStatements[sessionID]
-        local options, note = statementSelections(ctx, cached, other)
-        if options == nil then
-          options = A.array()
-          for _, generic in ipairs(GENERIC_RESPONSES) do
-            options[#options+1] = {choice = generic.choice, available = true, kindOfAnswer = 'response',
-              label = generic.choice, generic = true}
-          end
-        end
-        local config = PlayerConfigurations and PlayerConfigurations[other]
-        found = found + 1
-        out[#out+1] = {
-          key = tostring(sessionID),
-          kind = 'diplomacy', actionType = 'diplomacy', operation = 'response',
-          operations = A.array{'response','statement'},
-          label = 'Diplomacy session with '..(config and tostring(A.loc(A.call('diplomacy', config, 'GetLeaderName'))) or ('player '..other)),
-          mandatory = true,
-          blocks = false,
-          uiBlocking = true,
-          sessionId = sessionID,
-          otherPlayerId = other,
-          initiatedBy = (type(info) == 'table' and info.FromPlayer ~= nil) and info.FromPlayer or A.null,
-          statementType = cached and A.static('diplomacy', DiplomacyManager, 'GetKeyName', cached.statementType) or A.null,
-          statementSubType = cached and A.static('diplomacy', DiplomacyManager, 'GetKeyName', cached.statementSubType) or A.null,
-          selectionSource = note == nil and 'native_diplomacy_tables' or 'generic_responses_only',
-          selectionNote = note or A.null,
-          options = options,
-          choiceHelp = 'choice=<selection key> answers with DiplomacyManager.AddResponse. operation="statement" with key=<STATEMENT> uses AddStatement instead (MAKE_PEACE, MAKE_DEAL, DECLARE_FORMAL_WAR, ...). A diplomacy window is live shared UI: it blocks native input until answered.',
-        }
-      end
-    end
+local function envoyDecisions(ctx, out)
+  local influence = envoyInfluence(ctx)
+  if influence == nil then return end
+  local available = number(A.call('envoy', influence, 'GetTokensToGive'))
+  if available == nil then
+    A.unavailable('envoy', 'GetTokensToGive', 'Unassigned envoy count unavailable; envoy state is unknown')
+    return
   end
-  if queued == true and found == 0 then
-    out[#out+1] = {
-      key = 'queued',
-      kind = 'diplomacy', actionType = 'diplomacy', operation = 'response',
-      operations = A.array{'response','statement'},
-      label = 'A diplomacy session is queued but not yet open',
-      mandatory = false, blocks = false, uiBlocking = true,
-      options = A.array(),
-      choiceHelp = 'No open session id yet; observe again once the native window opens.',
-    }
-  end
+  local canGive = A.call('envoy', influence, 'CanGiveInfluence')
+  local reminder = blocking(ctx, 'ENDTURN_BLOCKING_GIVE_INFLUENCE_TOKEN')
+  -- The end-turn reminder can outlive the tokens (it is gated on the player having considered it),
+  -- so the decision is reported whenever either the engine blocks or a token is really available.
+  if available < 1 and not reminder then return end
+  local options = envoyCandidates(ctx, influence)
+  if options == nil then return end
+  local label
+  if available < 1 then label = 'Envoy reminder: no unassigned envoy tokens'
+  elseif canGive ~= true then label = 'Envoy tokens are available but the engine currently disallows giving them'
+  else label = 'Send '..available..' unassigned envoy(s) to a city-state' end
+  out[#out+1] = {
+    key = 'tokens:turn'..ctx.turn,
+    kind = 'envoy', actionType = 'envoy', operation = 'send',
+    operations = A.array{'send','consider'},
+    label = label,
+    mandatory = true,
+    blocks = reminder,
+    tokensToGive = available,
+    canGiveInfluence = canGive,
+    options = options,
+    choiceHelp = 'choice=<city-state player id from the options>; civ.action(type="envoy",operation="send",target=<playerId>,count=<n>) sends that many tokens as one native request each. '..
+      'operation="consider" records the same "reminder considered" flag the native City-States screen sets when it closes; it sends nothing.',
+  }
 end
 
-local function diplomacySubmit(ctx, operation, sessionId, key)
-  assert(DiplomacyManager ~= nil, 'DiplomacyManager is unavailable in this context')
-  local session = number(sessionId)
-  assert(session ~= nil, 'diplomacy needs sessionId from civ.decisions')
-  assert(type(key) == 'string' and key ~= '', 'diplomacy needs key=<selection or statement key>')
-  local info = A.static('diplomacy', DiplomacyManager, 'GetSessionInfo', session)
-  if info == A.null then
-    return refused('illegal', 'Diplomacy session '..session..' is no longer open; call civ.decisions again', {sessionId = session})
+local function envoySubmit(ctx, operation, target, count)
+  local influence = envoyInfluence(ctx)
+  assert(influence ~= A.null, 'The local player Influence manager is unavailable; envoy state is unknown')
+  if operation == 'consider' then
+    assert(target == nil and count == nil, 'envoy operation "consider" takes no target or count')
+    local result = submit({{label = 'SetGivingTokensConsidered true', run = function()
+      return request(influence.SetGivingTokensConsidered, influence, true)
+    end}}, 'Recorded the envoy-reminder flag the native City-States screen sets when it closes (CityStates.lua:446-455). '..
+      'No token was sent and no city-state influence changed. Reobserve turnState.blockers: whether the engine\'s end-turn '..
+      'blocker is gated on this flag is not verifiable from Lua.')
+    result.observed = A.section('observed', function()
+      return {tokensToGive = number(A.call('envoy', influence, 'GetTokensToGive')) or A.null,
+        considered = A.call('envoy', influence, 'IsGivingTokensConsidered')}
+    end)
+    return result
   end
-  if operation == 'response' then
-    return submit({{label = 'AddResponse '..key, run = function()
-      return request(DiplomacyManager.AddResponse, session, ctx.pid, key)
-    end}})
-  elseif operation == 'statement' then
-    return submit({{label = 'AddStatement '..key, run = function()
-      return request(DiplomacyManager.AddStatement, session, ctx.pid, key)
-    end}})
+  assert(operation == 'send', 'envoy operation must be send or consider')
+  local wanted = count == nil and 1 or count
+  assert(type(wanted) == 'number' and wanted % 1 == 0 and wanted >= 1, 'envoy count must be an integer >= 1')
+  local cityState = number(target)
+  assert(cityState ~= nil and cityState >= 0 and cityState % 1 == 0, 'envoy send needs target=<city-state player id from civ.decisions>')
+  local available = number(A.call('envoy', influence, 'GetTokensToGive'))
+  assert(available ~= nil, 'Unassigned envoy count unavailable; refusing to submit an unknown number of tokens')
+  assert(wanted <= available, 'Only '..available..' unassigned envoy(s) remain; the request was not submitted')
+  local legal = A.call('envoy', influence, 'CanGiveTokensToPlayer', cityState)
+  if legal ~= true then
+    return refused('illegal', 'The engine does not allow sending an envoy to player '..cityState..' right now',
+      {target = cityState, canGiveTokensToPlayer = legal})
   end
-  error('diplomacy operation must be response or statement')
+  local operationId = A.param(PlayerOperations, 'GIVE_INFLUENCE_TOKEN')
+  local paramOne = A.param(PlayerOperations, 'PARAM_PLAYER_ONE')
+  local items = {}
+  for index = 1, wanted do
+    items[#items+1] = {label = 'GIVE_INFLUENCE_TOKEN '..index..'/'..wanted..' -> player '..cityState, run = function()
+      local parameters = {}
+      parameters[paramOne] = cityState
+      return request(UI.RequestPlayerOperation, ctx.pid, operationId, parameters)
+    end}
+  end
+  local result = submit(items, 'Each envoy is one native GIVE_INFLUENCE_TOKEN request (CityStates.lua:749-765); requests[] reports which were submitted. '..
+    'Submission is not completion and nothing is replayed: re-read the city-state before assuming the envoy arrived.')
+  result.observed = A.section('observed', function()
+    return {tokensToGive = number(A.call('envoy', influence, 'GetTokensToGive')) or A.null,
+      tokensReceived = number(A.call('envoy', influence, 'GetTokensReceived', cityState)) or A.null}
+  end)
+  return result
 end
 
 -- ---------------------------------------------------------------------------
@@ -1651,8 +2224,21 @@ local BLOCKER_HANDLERS = {
   ENDTURN_BLOCKING_STACKED_UNITS   = {subject='unit_orders', actionType='unit_operation', options='civ.options(unitId=...)'},
   ENDTURN_BLOCKING_ARTIFACT        = {subject='artifact',    actionType='unit_operation', options='civ.options(unitId=...)',
     note='Archaeologist artifact choice runs through the unit EXCAVATE operation.'},
-  ENDTURN_BLOCKING_GIVE_INFLUENCE_TOKEN = {subject='envoy', actionType=nil,
-    note='Envoy assignment has no verified bridge handler; use the native City-States screen.'},
+  ENDTURN_BLOCKING_GIVE_INFLUENCE_TOKEN = {subject='envoy', actionType='envoy', options='civ.decisions(kind="envoy")',
+    note='Envoy assignment is PlayerOperations.GIVE_INFLUENCE_TOKEN, one request per token (CityStates.lua:749-765). '..
+      'civ.action(type="envoy",operation="send",target=<cityState player id>) sends tokens; operation="consider" records the '..
+      'same reminder flag the native City-States screen sets when it closes.'},
+  ENDTURN_BLOCKING_CLAIM_GREAT_PERSON = {subject='great_person', actionType='great_person', options='civ.decisions(kind="great_person")',
+    note='The claim itself is PlayerOperations.RECRUIT_GREAT_PERSON / REJECT_GREAT_PERSON / PATRONIZE_GREAT_PERSON through civ.decide or '..
+      'civ.action(type="great_person",...). Activating the claimed unit afterwards is civ.action(type="unit_command", unitId=..., command="ACTIVATE_GREAT_PERSON").'},
+  ENDTURN_BLOCKING_WORLD_CONGRESS_SESSION = {subject='congress', actionType='congress', options='civ.decisions(kind="congress")',
+    note='Vote and release in one explicit call: civ.action(type="congress",operation="submit",votes=[...]) sends the votes, then WORLD_CONGRESS_SUBMIT_TURN and ACTION_ENDTURN like the native Accept. '..
+      'operation="vote" alone casts without releasing. Both command flags are cleared in this segment, so A.decisionReady only allows the congress family.'},
+  ENDTURN_BLOCKING_WORLD_CONGRESS_LOOK = {subject='congress_available_proposals', actionType='congress', options='civ.decisions(kind="congress")',
+    note='Between sessions this is the "look at the World Congress" reminder. Propose with operation="proposal", or acknowledge it with '..
+      'operation="looked" (the request the native popup sends when it closes out of session, WorldCongressPopup.lua:2394-2408).'},
+  ENDTURN_BLOCKING_EMERGENCY_NEEDS_ATTENTION = {subject='congress_emergency', actionType='congress', options='civ.decisions(kind="congress")',
+    note='Emergency proposals are selected with civ.action(type="congress",operation="proposal",proposals=[{target=...,discussionType=...}]).'},
   ENDTURN_BLOCKING_SPY_CHOOSE_DRAGNET_PRIORITY = {subject='spy_dragnet', actionType=nil,
     note='Counterspy dragnet priority has no verified bridge handler; use the native Espionage screen.'},
 }
@@ -1689,6 +2275,17 @@ end
 -- ---------------------------------------------------------------------------
 -- Collection, paging and the public read surface.
 -- ---------------------------------------------------------------------------
+--- The diplomacy collector lives in lua/diplomacy.lua and is resolved at call time, so a bridge
+--- that loads this file without that module reports a missing module instead of losing the family
+--- or crashing mid-observation. The kind stays in KINDS because it is still pageable and filterable.
+local function diplomacyCollector(ctx, out)
+  local fn = A.diplomacyDecisions
+  if type(fn) ~= 'function' then
+    return A.unavailable('diplomacy', 'module', 'lua/diplomacy.lua is not loaded in this bridge')
+  end
+  return fn(ctx, out)
+end
+
 local COLLECTORS = {
   commemoration = commemorationDecisions,
   pantheon = pantheonDecisions,
@@ -1698,7 +2295,8 @@ local COLLECTORS = {
   city_fate = cityFateDecisions,
   congress = congressDecisions,
   espionage = espionageDecisions,
-  diplomacy = diplomacyDecisions,
+  diplomacy = diplomacyCollector,
+  envoy = envoyDecisions,
   blocker = blockerDecisions,
 }
 
@@ -1727,18 +2325,22 @@ local SUMMARY_KEEP = {
   id=true, kind=true, actionType=true, operation=true, operations=true, label=true,
   mandatory=true, blocks=true, uiBlocking=true, selectCount=true, subject=true,
   blockerType=true, handler=true, discovery=true, handledHere=true, unitId=true,
-  cityId=true, sessionId=true, governor=true, individual=true, stage=true, source=true,
+  cityId=true, sessionId=true, otherPlayerId=true, governor=true, individual=true, stage=true, stageName=true,
+  source=true, favor=true, favorCost=true, tokensToGive=true, canGiveInfluence=true,
 }
 local function summarise(record)
   local out = {}
   for key, value in pairs(record) do if SUMMARY_KEEP[key] then out[key] = value end end
   local options = record.options
   out.optionCount = type(options) == 'table' and #options or 0
-  local legal = 0
+  local legal, known = 0, true
   if type(options) == 'table' then
-    for _, option in ipairs(options) do if option.available then legal = legal + 1 end end
+    for _, option in ipairs(options) do
+      if option.available == true then legal = legal + 1
+      elseif option.available ~= false then known = false end
+    end
   end
-  out.availableOptionCount = legal
+  out.availableOptionCount = known and legal or A.null
   return out
 end
 
@@ -1760,6 +2362,7 @@ function A.decisions(args)
     wanted, detail, kindFilter = args.id, 'full', kind
   end
   local ctx = context()
+  ctx.wanted = wanted
   local all = collect(ctx, kindFilter)
   local matched = A.array()
   for _, record in ipairs(all) do
@@ -1768,7 +2371,29 @@ function A.decisions(args)
   local decisions = A.array()
   for index = offset + 1, math.min(#matched, offset + limit) do
     local record = matched[index]
-    decisions[#decisions+1] = (detail == 'full') and record or summarise(record)
+    if detail == 'full' then
+      -- choiceHelp is contract, not state: identical for every record of a kind and unchanged
+      -- between calls. It is worth its length when the model asked about one decision, and it was
+      -- costing a multiple of itself on every list. civ.probe publishes the per-kind schema.
+      --
+      -- An opening catalog is ruleset data too. Its labels, statements and war types are the same
+      -- for every counterpart, so a list of seven met players was carrying seven copies of one
+      -- table; only the keys differ per player. Asking about one openings record (id=...) returns
+      -- the full entries together with this pair's legality, which is where both are worth paying for.
+      if wanted == nil then
+        local copy = {}
+        for key, value in pairs(record) do if key ~= 'choiceHelp' then copy[key] = value end end
+        if copy.operation == 'open' and type(copy.options) == 'table' then
+          local keys = A.array()
+          for _, option in ipairs(copy.options) do keys[#keys+1] = option.choice end
+          copy.options, copy.choices = nil, keys
+        end
+        record = copy
+      end
+      decisions[#decisions+1] = record
+    else
+      decisions[#decisions+1] = summarise(record)
+    end
   end
   return {
     decisions = decisions,
@@ -1781,9 +2406,6 @@ function A.decisions(args)
     turn = ctx.turn,
     blockersKnown = ctx.blockersKnown,
     turnState = ctx.turnState,
-    note = detail == 'summary'
-      and 'Summary rows carry ids, blocking status and option counts only. Use detail="full" or id=<decision id> for options, costs and descriptions. Popup observations are merged in by the bridge and use popup: ids.'
-      or A.null,
   }
 end
 
@@ -1791,7 +2413,7 @@ end
 -- Answering. civ.decide re-collects the decision from live native state before
 -- submitting, so a choice read one round trip ago is revalidated, not trusted.
 -- ---------------------------------------------------------------------------
-local function dispatch(ctx, args)
+local function dispatch(ctx, args, record)
   local kind = args.type
   if kind == 'commemoration' then
     local list = args.commemorations
@@ -1811,10 +2433,18 @@ local function dispatch(ctx, args)
     return cityFateSubmit(ctx, args.operation, args.cityId)
   elseif kind == 'congress' then
     return congressSubmit(ctx, args.operation, args.votes, args.proposals)
+  elseif kind == 'envoy' then
+    return envoySubmit(ctx, args.operation, args.target, args.count)
   elseif kind == 'espionage' then
     return espionageSubmit(ctx, args.operation, args.unitId, args.district, args.operationType, args.x, args.y, args.cityId)
   elseif kind == 'diplomacy' then
-    return diplomacySubmit(ctx, args.operation, args.sessionId, args.key)
+    -- lua/diplomacy.lua owns the session/deal encodings and is resolved here, at call time. When a
+    -- record is supplied (an id-based civ.decide) the module validates the choice against the
+    -- options that were just re-collected; a direct civ.action has no record and revalidates
+    -- against live native state on its own.
+    local fn = A.diplomacyAction
+    assert(type(fn) == 'function', 'lua/diplomacy.lua is not loaded in this bridge; the diplomacy family cannot be answered')
+    return fn(ctx, args, record)
   end
   error('Unsupported decision action type: '..tostring(kind))
 end
@@ -1857,8 +2487,7 @@ local function decideEspionage(record, choice)
     operationType=option.operation, x=option.x, y=option.y, cityId=record.cityId}
 end
 
-function A.decide(args)
-  args = args or {}
+local function decideValidated(args)
   assert(type(args.id) == 'string', 'civ.decide requires id=<decision id> from civ.decisions')
   assert(args.choice == nil or args.choices == nil, 'Pass either choice or choices, not both')
   local session, kind, key = args.id:match('^([^:]+):decision:([^:]+):(.*)$')
@@ -1914,23 +2543,60 @@ function A.decide(args)
       assert(type(choices) == 'table' and #choices > 0, 'This decision needs choices=[{subject=...,...}] vote entries')
       call = {type='congress', operation='vote', votes=choices}
     end
+  elseif kind == 'envoy' then
+    -- Sending is a real strategic choice, so the id path takes the city-state the model named and
+    -- never picks one for it; operation="consider" is the separate explicit acknowledgement.
+    if args.operation == 'consider' then
+      call = {type='envoy', operation='consider'}
+    else
+      local option = pickOption(record, choice)
+      assert(option ~= nil, 'choice must be one of the city-state ids from this decision')
+      assert(option.available, 'The engine does not allow sending an envoy to that city-state right now')
+      call = {type='envoy', operation='send', target=option.playerId, count=args.count}
+    end
   elseif kind == 'espionage' then
     call = decideEspionage(record, choice)
   else
-    assert(type(choice) == 'string', 'This decision needs choice=<selection key>')
-    local operation = args.operation or 'response'
-    -- Only validate against the option list when it really came from the native tables;
-    -- the generic fallback is not a complete list and must not reject a valid key.
-    if operation == 'response' and record.selectionSource == 'native_diplomacy_tables' then
-      local option = pickOption(record, choice)
-      assert(option ~= nil and option.available, 'choice must be an available selection key from this session')
-    end
-    call = {type='diplomacy', operation=operation, sessionId=record.sessionId, key=choice}
+    -- diplomacy: lua/diplomacy.lua owns session/deal identity, the selection keys and the statement
+    -- spelling. It receives the freshly re-collected record so the choice is validated against the
+    -- options the caller actually read, and it returns the submission result this function stamps.
+    local fn = A.diplomacyAction
+    assert(type(fn) == 'function', 'lua/diplomacy.lua is not loaded in this bridge; the diplomacy family cannot be answered')
+    local forwarded = {}
+    for field, value in pairs(args) do forwarded[field] = value end
+    forwarded.id, forwarded.type = nil, 'diplomacy'
+    forwarded.sessionId = record.sessionId
+    if forwarded.key == nil then forwarded.key = choice end
+    local result = fn(ctx, forwarded, record)
+    result.id = args.id
+    result.kind = kind
+    return result
   end
-  local result = dispatch(ctx, call)
+  local result = dispatch(ctx, call, record)
   result.id = args.id
   result.kind = kind
   return result
+end
+
+function A.decide(args)
+  args = args or {}
+  return A.entry(function()
+    return decideValidated(args)
+  end)
+end
+
+--- Whether a decision family may be submitted in the current turn segment. Ordinary strategic and
+--- tactical command flags cannot answer this: DLC/Expansion2/Data/Expansion2_TurnPhases.xml:12-14
+--- sets AllowStrategicCommands=false and AllowTacticalCommands=false for all three congress
+--- segments (TURNSEG_WORLDCONGRESS_1/2/_RESOLUTION), and submitting the ballot or the available
+--- proposals there is exactly what the native screen does (WorldCongressPopup.OnAccept,
+--- WorldCongressPopup.lua:2222-2315). actions.lua calls this for decision families so the congress
+--- family is not refused by a gate meant for ordinary unit/city/player requests.
+function A.decisionReady(kind)
+  local stage = congressSegment()
+  local pid = A.localPlayer()
+  if stage == 1 or stage == 2 or stage == 4 then return kind == 'congress' end
+  return Game.IsAllowStrategicCommands(pid) == true or Game.IsAllowTacticalCommands(pid) == true
 end
 
 -- ---------------------------------------------------------------------------
@@ -1947,10 +2613,10 @@ A.decisionActionTypes = {
   pantheon = {operations=A.array{'found'}, fields={belief='BeliefType'},
     native='PlayerOperations.FOUND_PANTHEON'},
   great_person = {operations=A.array{'recruit','reject','patronize'},
-    fields={operation='string', individual='GreatPersonIndividualType', currency='gold|faith (patronize)'},
-    native='PlayerOperations.RECRUIT_GREAT_PERSON / REJECT_GREAT_PERSON / PATRONIZE_GREAT_PERSON'},
+    fields={operation='string', individual='the timeline individual value from civ.decisions or its GreatPersonIndividualType', currency='gold|faith (patronize)'},
+    native='PlayerOperations.RECRUIT_GREAT_PERSON / REJECT_GREAT_PERSON / PATRONIZE_GREAT_PERSON with PARAM_GREAT_PERSON_INDIVIDUAL_TYPE'},
   governor = {operations=A.array{'appoint','assign','promote'},
-    fields={operation='string', governor='GovernorType', promotion='GovernorPromotionType (promote)', cityId='cityId encoding the destination owner (assign)'},
+    fields={operation='string', governor='GovernorType', promotion='GovernorPromotionType (promote, from this governor\'s GovernorPromotionSets)', cityId='cityId encoding the destination owner (assign)'},
     native='PlayerOperations.APPOINT_GOVERNOR / ASSIGN_GOVERNOR / PROMOTE_GOVERNOR'},
   religion = {operations=A.array{'found','belief'},
     fields={operation='string', religion='ReligionType (found)', name='string (found, when required)', belief='BeliefType', beliefs='BeliefType[]'},
@@ -1958,22 +2624,35 @@ A.decisionActionTypes = {
   city_fate = {operations=A.array{'keep','raze','liberate_founder','liberate_previous_owner','reject'},
     fields={operation='string', cityId='cityId'},
     native='CityManager.RequestCommand(city, CityCommandTypes.DESTROY, {PARAM_FLAGS=CityDestroyDirectives.*})'},
-  congress = {operations=A.array{'vote','proposal','submit'},
-    fields={operation='string', votes='vote entry[]', proposals='proposal entry[]'},
-    native='PlayerOperations.WORLD_CONGRESS_RESOLUTION_VOTE / WORLD_CONGRESS_DISCUSSION_VOTE / WORLD_CONGRESS_DISCUSSION_SELECTION / WORLD_CONGRESS_SUBMIT_TURN. Never sends ACTION_ENDTURN.'},
+  congress = {operations=A.array{'vote','proposal','submit','looked'},
+    fields={operation='string', votes='vote entry[] (operation=vote, or submit to vote and release in one call)', proposals='proposal entry[]'},
+    native='PlayerOperations.WORLD_CONGRESS_RESOLUTION_VOTE / WORLD_CONGRESS_DISCUSSION_VOTE for votes; operation="submit" sends votes (when supplied), then WORLD_CONGRESS_SUBMIT_TURN and ActionTypes.ACTION_ENDTURN, exactly the native Accept sequence. WORLD_CONGRESS_DISCUSSION_SELECTION for proposals and WORLD_CONGRESS_LOOKED_AT_AVAILABLE for operation="looked". submit is turn-ending: keep it last in a batch.'},
+  envoy = {operations=A.array{'send','consider'},
+    fields={operation='string', target='city-state player id (send)', count='integer tokens to send, default 1'},
+    native='PlayerOperations.GIVE_INFLUENCE_TOKEN with PARAM_PLAYER_ONE, one request per token (CityStates.lua:749-765); operation="consider" calls Influence:SetGivingTokensConsidered(true)'},
   espionage = {operations=A.array{'mission','escape','travel'},
     fields={operation='string', unitId='unitId', operationType='spy UnitOperation short name (mission)', x='integer', y='integer', district='DistrictType (escape)', cityId='destination city (travel) or the legality plot for an untargeted mission'},
     native='UnitManager.RequestOperation for missions/travel, PlayerOperations.SET_ESCAPE_ROUTE for escape'},
-  diplomacy = {operations=A.array{'response','statement'},
-    fields={operation='string', sessionId='integer', key='selection or statement key'},
-    native='DiplomacyManager.AddResponse / AddStatement'},
 }
+
+-- lua/diplomacy.lua publishes its own schema; it is copied here at load (the module is loaded
+-- before this file) so civ.probe advertises exactly the module's supported operations, and a bridge
+-- without the module advertises none instead of promising an unloaded family.
+A.decisionActionTypes.diplomacy = A.diplomacyActionSpec
+
+--- Whether a decision action ends the local player's turn. The congress submit reproduces the native
+--- Accept, which sends ActionTypes.ACTION_ENDTURN (WorldCongressPopup.lua:2270-2271); it is the only
+--- turn-ending request any decision family issues, and no other family infers one. actions.lua
+--- resolves this at call time so a batch keeps it in the same final position as its own end_turn.
+function A.decisionEndsTurn(args)
+  return type(args) == 'table' and args.type == 'congress' and args.operation == 'submit'
+end
 
 function A.decisionAction(args)
   assert(type(args) == 'table' and type(args.type) == 'string', 'Decision action requires type')
   assert(A.decisionActionTypes[args.type] ~= nil, 'Not a supported decision action type: '..tostring(args.type))
   local ctx = context()
-  local result = dispatch(ctx, args)
+  local result = dispatch(ctx, args, nil)
   result.type = args.type
   return result
 end

@@ -2,6 +2,16 @@ import { createConnection, type Socket } from "node:net";
 
 export interface TunerFrame { tag: number; payload: string }
 const MAX_FRAME = 8 * 1024 * 1024;
+/** Bounded connect retries: FireTuner refuses connections while the game loads or when its accept
+ *  backlog is saturated. Nothing has been sent at this stage, so a retry cannot replay a command. */
+const CONNECT_ATTEMPTS = 3;
+const CONNECT_RETRY_MS = 250;
+
+/** Only a refused/reset connect is worth retrying; timeouts and unavailable hosts are reported as-is. */
+function isRefused(error: Error): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ECONNREFUSED" || code === "ECONNRESET";
+}
 
 /** Distinguish initial setup failures from loss of a previously reachable game. */
 function connectFailureMessage(established: boolean, host: string, port: number, detail: string): string {
@@ -33,7 +43,27 @@ export class TunerTransport {
 
   get connected(): boolean { return !!this.socket && !this.socket.destroyed && !this.failure; }
 
+  /**
+   * Bring the connection up. A refused connect is retried a bounded number of times first: on
+   * Windows a transient refusal also means "the listener's accept backlog was full", and FireTuner
+   * refuses connections while the game is loading. Nothing has been sent at this point, so a retry
+   * can never replay a command; only the connect itself repeats. Timeouts and other failures are
+   * reported immediately.
+   */
   async connect(host: string, port: number, timeoutMs: number): Promise<void> {
+    for (let attempt = 1; ; attempt++) {
+      const failure = await this.attemptConnect(host, port, timeoutMs);
+      if (failure === undefined) return;
+      if (attempt >= CONNECT_ATTEMPTS || !isRefused(failure)) {
+        if (attempt > 1) failure.message += ` (${attempt} connection attempts)`;
+        throw failure;
+      }
+      await new Promise<void>(resolve => setTimeout(resolve, CONNECT_RETRY_MS));
+    }
+  }
+
+  /** Resolves with the failure instead of throwing so a retry can distinguish a refusal. */
+  private attemptConnect(host: string, port: number, timeoutMs: number): Promise<Error | undefined> {
     this.close();
     this.failure = undefined;
     this.headerUsed = 0;
@@ -55,10 +85,13 @@ export class TunerTransport {
     socket.once("connect", () => { clearTimeout(timer); this.everConnected = true; resolve(); });
     socket.once("error", error => {
       clearTimeout(timer);
-      reject(new Error(connectFailureMessage(this.everConnected, host, port, error.message)));
+      socket.destroy();
+      const failure = new Error(connectFailureMessage(this.everConnected, host, port, error.message));
+      (failure as NodeJS.ErrnoException).code = (error as NodeJS.ErrnoException).code;
+      reject(failure);
     });
     socket.once("close", () => { clearTimeout(timer); reject(new Error("FireTuner connection closed before ready.")); });
-    await promise;
+    return promise.then(() => undefined, (error: Error) => error);
   }
 
   private consume(bytes: Buffer): void {

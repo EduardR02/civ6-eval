@@ -101,3 +101,26 @@ test("a dropped live session terminates pending reads and refuses further comman
   expect(transport.connected).toBe(false);
   await expect(transport.send(3, "CMD:0:must_not_replay()")).rejects.toBe(error);
 });
+
+// Real retry backoff against a real socket: the point of the test is that a refused connect is
+// retried with a bounded attempt count, which cannot be driven by fake timers because the refusal
+// comes from the platform's TCP stack. Everything else here stays deterministic.
+test("a refused connect is retried a bounded number of times and then reported honestly", async () => {
+  const closed = createServer();
+  const listening = Promise.withResolvers<void>();
+  closed.listen(0, "127.0.0.1", listening.resolve);
+  await listening.promise;
+  const address = closed.address();
+  if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+  const stopping = Promise.withResolvers<void>();
+  closed.close(() => stopping.resolve());
+  await stopping.promise;
+
+  const transport = new TunerTransport();
+  transports.push(transport);
+  const error = await transport.connect("127.0.0.1", address.port, 1000).catch(error => error);
+  expect(error).toBeInstanceOf(Error);
+  expect(error.message).toContain("Cannot connect to FireTuner");
+  expect(error.message).toContain("3 connection attempts");
+  expect(transport.connected).toBe(false);
+}, 10_000);

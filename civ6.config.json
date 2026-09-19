@@ -1,9 +1,10 @@
 {
-  "model": "gpt-6-astra",
-  "provider": "codex",
-  "effort": "high",
+  "model": "deepseek-flash",
+  "provider": "opencode-go",
+  "effort": "max",
   "maxConcurrentAgents": 4,
-  "maxModelCalls": 200,
+  "maxModelCalls": "unlimited",
+  "expertGuidePath": "guides/herson-bbg/SKILL.md",
   "compactThreshold": 180000,
   "compactThresholds": { "opencode-go": 500000 },
   "distro": "Ubuntu-24.04"

@@ -5,7 +5,7 @@ import { createInterface } from "node:readline";
 import { loadConfig } from "./config.ts";
 import { PlayerHost } from "./host.ts";
 import { readOmpApiKey, readOmpCredential } from "./player/auth.ts";
-import type { PlayerEvent } from "./contracts.ts";
+import type { PlayerEvent, TaskRecord } from "./contracts.ts";
 import { readUsageReport, formatUsageReport } from "./usage.ts";
 import { runDashboard } from "./dashboard.ts";
 
@@ -27,14 +27,39 @@ Options:
   --run PATH      Use an explicit run directory
   --resume PATH   Resume an existing run directory
   --calls N       Saved-run call ceiling, or unlimited (children + compaction included)
-  --provider MODE codex (default), openai or opencode-go
-  --model NAME    Default gpt-6-astra (glm-5.3-flash for opencode-go)
-  --effort LEVEL  Codex/OpenAI: low, medium, high, xhigh; opencode-go: low, high, max (default high)
+  --knowledge T   Declared evaluation track: uncoached (default) or expert-informed.
+                  expert-informed loads expertGuidePath into the main player's system prompt
+                  as labelled reference; the run archives its exact text, hash and configuration.
+  --provider MODE openai, codex or opencode-go
+  --model NAME    Provider model id, for example deepseek-flash or gpt-6-astra
+  --effort LEVEL  Codex/OpenAI: low, medium, high, xhigh; opencode-go: low, high, max
+  --completion M  explicit (default) or response; see below
   --prompt TEXT   One task for play; omit for the interactive console
   --code TEXT     Python source for exec (mutually exclusive with --file)
   --file PATH     Python file for exec
   --json          Machine-readable output for usage only
   --interval N    Dashboard ledger poll interval in seconds (default 10)
+
+Configured values win. Without a configuration file the fallbacks are provider
+codex, model gpt-6-astra (glm-5.3-flash for opencode-go), effort high, 200 saved
+model calls, and completion mode explicit. The repository civ6.config.json pins
+whatever the next run should use; --provider/--model/--effort/--calls/--completion
+override it for one invocation.
+
+Completion modes (play):
+  explicit  The task ends only when the model declares its outcome through the
+            finish_task tool: "completed" (goal achieved/work done) or "blocked"
+            (needs the operator or an external blocker). A turn that only stops —
+            for example a progress report with no tool calls — gets exactly one
+            protocol reminder; a second undeclared turn stops the run as an
+            explicit protocol failure instead of silently ending it. Declared
+            outcomes are durable in player/agents.json and player/tasks.jsonl,
+            and \`--prompt\` exits 1 on blocked. The model owns the goal and the
+            evidence; the harness records the declaration without verifying it.
+  response  The task ends when the model stops calling tools. Use it for
+            one-shot questions and analyses; a full-game task can stop early.
+  Config key: "completionMode": "explicit" | "response". Children always use
+  response mode: a delegated analysis ends when its model stops.
 
 Authentication: ChatGPT/Codex subscription from ~/.omp/agent/agent.db by default.
 Set authPath to ~/.codex/auth.json to use the desktop/CLI login instead.
@@ -66,7 +91,7 @@ const COMMAND_OPTIONS: Record<string, readonly string[]> = {
   doctor: ["config", "run", "provider", "model", "effort"],
   observe: ["config", "run"],
   exec: ["config", "run", "code", "file"],
-  play: ["config", "run", "resume", "provider", "model", "effort", "calls", "prompt"],
+  play: ["config", "run", "resume", "provider", "model", "effort", "calls", "completion", "knowledge", "prompt"],
   usage: ["run", "json"],
   dashboard: ["run", "interval"],
 };
@@ -138,6 +163,16 @@ async function main(): Promise<void> {
     if (count !== "unlimited" && (!Number.isSafeInteger(count) || count < 1)) throw new Error("--calls must be a positive integer or unlimited");
     config.maxModelCalls = count;
   }
+  if (option("knowledge")) {
+    const value = option("knowledge")!;
+    if (value !== "uncoached" && value !== "expert-informed") throw new Error("--knowledge must be uncoached or expert-informed");
+    config.knowledge = value;
+  }
+  if (option("completion")) {
+    const value = option("completion")!;
+    if (value !== "explicit" && value !== "response") throw new Error("--completion must be explicit or response");
+    config.completionMode = value;
+  }
   if (command === "setup") {
     await runCommand(["uv", "venv", "--python", "3.12", ".venv"]);
     await runCommand(["uv", "pip", "install", "--python", config.pythonPath, "-r", "requirements.txt"]);
@@ -163,6 +198,11 @@ async function main(): Promise<void> {
     if (event.type === "text" && event.agentId === "main") process.stdout.write(event.text ?? "");
     else if (event.type === "agent_complete") {
       if (event.agentId !== "main") console.log(`\n[${event.agentId}] Completed`);
+    } else if (event.type === "task_outcome") {
+      const data = event.data as Partial<TaskRecord> | undefined;
+      console.log(`\n[${event.agentId}] Task ${data?.outcome ?? "declared"}: ${data?.reason ?? ""}`);
+    } else if (event.type === "protocol_repair") {
+      console.log(`\n[${event.agentId}] No task declaration in that turn; sending the single protocol reminder.`);
     } else if (event.type === "usage") {
       const data = event.data as { usage?: { input: number; output: number; cacheRead: number }; kind?: string } | undefined;
       if (data?.usage) console.log(`\n[${event.agentId}] ${data.kind ?? "model"}: ${data.usage.input} new input, ${data.usage.cacheRead} cached, ${data.usage.output} output tokens`);
@@ -269,8 +309,12 @@ async function main(): Promise<void> {
       return;
     }
     if (option("prompt")) {
-      await host.player.prompt(option("prompt")!);
+      const task = await host.player.prompt(option("prompt")!);
       process.stdout.write("\n");
+      // The task_outcome event already printed the declaration; a declared blocker is a
+      // controlled stop, not a harness failure, and scripted runs must be able to tell it
+      // apart from a completed task.
+      if (task?.outcome === "blocked") process.exitCode = 1;
       return;
     }
     console.log("Enter a task. /status /agents /usage /control ID /abort /quit.");
@@ -281,7 +325,7 @@ async function main(): Promise<void> {
     const prompt = () => { if (!closing) input.prompt(); };
     type AgentStatus = {
       totalCalls: number; active: number;
-      agents: { id: string; status: string; calls: number; compactionCalls: number }[];
+      agents: { id: string; status: string; calls: number; compactionCalls: number; task?: TaskRecord }[];
     };
     const operatorCommand = async (text: string) => {
       if (text === "/status") {
@@ -290,9 +334,11 @@ async function main(): Promise<void> {
           host.player.rpc("main", "agent.list", {}) as Promise<AgentStatus>,
         ]);
         console.log(`Run: ${runDir}\nControl: ${control.controller} | ${config.provider}/${config.model}\nCalls: ${state.totalCalls}/${config.maxModelCalls} saved-run ceiling (children + compaction included) | Agents: ${state.active} active, ${state.agents.length} total`);
+        const last = state.agents.find(agent => agent.id === "main")?.task;
+        if (last) console.log(`Last task: ${last.outcome} at ${last.at}${last.repair ? " (after one protocol reminder)" : ""}: ${last.reason.split("\n")[0]}`);
       } else if (text === "/agents") {
         const state = await host.player.rpc("main", "agent.list", {}) as AgentStatus;
-        for (const agent of state.agents) console.log(`${agent.id}: ${agent.status} | calls ${agent.calls} (${agent.compactionCalls} compaction)`);
+        for (const agent of state.agents) console.log(`${agent.id}: ${agent.status}${agent.task ? ` | task ${agent.task.outcome} at ${agent.task.at}` : ""} | calls ${agent.calls} (${agent.compactionCalls} compaction)`);
       } else if (text === "/usage") {
         console.log(formatUsageReport(await readUsageReport(runDir)));
       } else if (text.startsWith("/control ")) {

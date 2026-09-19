@@ -1,17 +1,19 @@
 import { mkdir, readFile, writeFile, appendFile, readdir, lstat, realpath, rename, unlink, stat } from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { createReadStream, readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { createServer, type Server } from "node:net";
 import { homedir } from "node:os";
 import { join, resolve, relative, isAbsolute, dirname } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
-import { CivBridge } from "./bridge.ts";
+import { CivBridge, type PresentationReport } from "./bridge.ts";
+import { popupDigest, type PopupObservation } from "./bridge/popups.ts";
 import { DesktopService } from "./desktop.ts";
 import { ExecutionService } from "./execution.ts";
 import { Player } from "./player.ts";
 import type { Arguments, PlayerEvent, ExecutionResult, ExecuteOptions } from "./contracts.ts";
 import type { Config } from "./config.ts";
 import { UsageLedger, readUsageReport } from "./usage.ts";
+import { saveJson } from "./player/storage.ts";
 
 const MAX_ARTIFACT_BYTES = 24 * 1024 * 1024;
 function textArg(args: Arguments, name: string): string {
@@ -49,21 +51,50 @@ export class PlayerHost {
   private controlEpoch = 0;
   private liveQueue: Promise<unknown> = Promise.resolve();
   private latestSnapshot?: string;
+  private readonly expertGuide?: string;
+  private readonly expertGuideDigest?: string;
   private lastObserved: { turn: number | null; gameId: string | null } = { turn: null, gameId: null };
   private noteRate = new Map<string, number[]>();
   private nativeLock?: Promise<Server>;
   private closed = false;
   private eventQueue: Promise<void> = Promise.resolve();
+  private readonly popupEvents = new Map<string, { eventId: string; popup: PopupObservation; lastObservedTurn: number | null }[]>();
   private readonly usage: UsageLedger;
   constructor(readonly projectRoot: string, readonly runDir: string, readonly config: Config, onEvent?: (event: PlayerEvent) => void) {
     this.usage = new UsageLedger(runDir, config.model, config.provider, config.apiRates);
-    this.bridge = new CivBridge({ host: config.tunerHost, port: config.tunerPort });
+    this.bridge = new CivBridge({
+      host: config.tunerHost, port: config.tunerPort,
+      onInformationalPopup: async popup => {
+        const agentId = this.controller;
+        const epoch = this.controlEpoch;
+        const event = { eventId: randomUUID(), popup, lastObservedTurn: this.lastObserved.turn };
+        this.log({ kind: "popup", agentId, ...event, gameId: this.lastObserved.gameId });
+        await this.eventQueue;
+        const pending = this.popupEvents.get(agentId) ?? [];
+        pending.push(event);
+        this.popupEvents.set(agentId, pending);
+        if (this.closed || epoch !== this.controlEpoch) throw new Error("Popup dismissal cancelled by shutdown or control change");
+      },
+    });
     this.desktop = new DesktopService({ projectRoot, pythonPath: config.pythonPath });
     this.execution = new ExecutionService({ projectRoot, runDir, distro: config.distro, rpc: this.rpc.bind(this) });
+    // A declared expert-informed run must actually carry its reference, so a missing or empty guide
+    // is a startup failure rather than a run that silently degrades into the uncoached track.
+    if (config.knowledge === "expert-informed") {
+      let text: string;
+      try { text = readFileSync(config.expertGuidePath, "utf8"); }
+      catch { throw new Error(`knowledge is expert-informed but the guide at ${config.expertGuidePath} could not be read. Point expertGuidePath at the consolidated guide, or run with --knowledge uncoached.`); }
+      if (!text.trim()) throw new Error(`The expert guide at ${config.expertGuidePath} is empty; refusing to declare an expert-informed run without supplied material.`);
+      this.expertGuide = text;
+      this.expertGuideDigest = createHash("sha256").update(text).digest("hex");
+    }
     this.player = new Player({
+      expertGuide: this.expertGuide,
       projectRoot, runDir, model: config.model, provider: config.provider, effort: config.effort,
       authPath: config.authPath, apiKey: config.provider === "openai" ? process.env.OPENAI_API_KEY : undefined, baseUrl: config.baseUrl,
       maxConcurrentAgents: config.maxConcurrentAgents, maxModelCalls: config.maxModelCalls === "unlimited" ? undefined : config.maxModelCalls,
+      completionMode: config.completionMode,
+      requestLimits: config.requestLimits,
       compactThreshold: config.compactThresholds?.[config.provider] ?? config.compactThreshold, rpc: this.rpc.bind(this),
       execute: (id, code, options) => this.execute(code, id, options),
       onEvent: event => { this.usage.onEvent(event); this.log({ kind: "player", ...event }); onEvent?.(event); },
@@ -92,7 +123,16 @@ export class PlayerHost {
         this.usage.restoreObservation(snapshot);
       }
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    this.log({ kind: "host", event: "start", config: { ...this.config, authPath: "[private]" }, controller: this.controller });
+    const config = { ...this.config, authPath: "[private]" };
+    const input = { config, expertGuide: this.expertGuide ?? null };
+    const inputSha256 = createHash("sha256").update(JSON.stringify(input)).digest("hex");
+    const inputFile = `inputs/${inputSha256}.json`;
+    saveJson(join(this.runDir, inputFile), input);
+    this.log({
+      kind: "host", event: "start", config, controller: this.controller,
+      input: { file: inputFile, sha256: inputSha256 },
+      knowledge: { track: this.config.knowledge, guidePath: this.config.knowledge === "expert-informed" ? this.config.expertGuidePath : null, guideSha256: this.expertGuideDigest ?? null, guideChars: this.expertGuide?.length ?? 0 },
+    });
   }
   private log(event: unknown): void {
     this.eventQueue = this.eventQueue.then(() => appendFile(join(this.runDir, "history.jsonl"), JSON.stringify({ at: new Date().toISOString(), ...event as object }) + "\n"));
@@ -120,14 +160,18 @@ export class PlayerHost {
     }
     return this.nativeLock;
   }
-  private async live<T>(id: string, operation: () => Promise<T>, requiresControl = true): Promise<T> {
+  private async live<T>(id: string, operation: (authorize: () => void) => Promise<T>, requiresControl = true): Promise<T> {
     const epoch = this.controlEpoch;
-    const next = this.liveQueue.catch(() => {}).then(async () => {
+    const authorize = () => {
       if (this.closed) throw new Error("Player host is closed");
       if (requiresControl && id !== this.controller) throw new Error(`Live game control belongs to ${this.controller}; use a captured snapshot or ask main to grant control.`);
-      if (requiresControl && epoch !== this.controlEpoch) throw new Error("Live request cancelled by a control handoff");
+      if (requiresControl && epoch !== this.controlEpoch) throw new Error("Live request cancelled by a control handoff or abort");
+    };
+    const next = this.liveQueue.catch(() => {}).then(async () => {
+      authorize();
       await this.lockNativeAccess();
-      return operation();
+      authorize();
+      return operation(authorize);
     });
     this.liveQueue = next;
     return next;
@@ -187,12 +231,35 @@ export class PlayerHost {
       return { logged: true, complaintId, artifact };
     }
     if (!method.startsWith("civ.") && !method.startsWith("desktop.")) throw new Error(`Unknown RPC method: ${method}`);
-    return this.live(agentId, async () => {
+    if (method.startsWith("civ.")) CivBridge.validateRequest(method, args);
+    return this.live(agentId, async authorize => {
       this.log({ kind: "request", agentId, method, args });
       try {
+        // Never clear a modal immediately before a coordinate click: its target was chosen from
+        // an earlier image. Prepare only at fresh observation / explicit turn-advance boundaries.
+        const endsTurn = method === "civ.action" && (args.type === "end_turn" ||
+          (Array.isArray(args.actions) && args.actions.at(-1)?.type === "end_turn"));
+        const prepares = method === "desktop.screenshot" || method === "civ.snapshot" || endsTurn ||
+          (method === "civ.decisions" && args.popups !== "none" && !(typeof args.id === "string" && args.id.startsWith("popup:")));
+        let presentation: PresentationReport | undefined;
+        let presentationError: string | undefined;
+        if (prepares) {
+          try {
+            presentation = await this.bridge.preparePresentation(authorize);
+            if (presentation.callbackFailures.length) throw new Error(`Informational popup preservation failed: ${JSON.stringify(presentation.callbackFailures)}`);
+          } catch (error) {
+            // Native screenshots remain usable for diagnosis even when the structured bridge fails.
+            if (method !== "desktop.screenshot") throw error;
+            presentationError = String(error);
+          }
+        }
+        authorize();
         let result: unknown = method.startsWith("desktop.")
           ? await this.desktop.request(method, args)
-          : await this.bridge.request(method, args);
+          : await this.bridge.request(method, args, authorize);
+        if ((presentation || presentationError) && result && typeof result === "object") {
+          result = { ...result, presentation, presentationError };
+        }
         if (method === "civ.snapshot") {
           const snapshotId = `s-${randomUUID()}`;
           result = { ...(result as object), snapshotId, capturedAt: new Date().toISOString() };
@@ -363,6 +430,15 @@ export class PlayerHost {
       throw error;
     } finally {
       options?.signal?.removeEventListener("abort", cancelDesktop);
+    }
+    const popups = this.popupEvents.get(agentId);
+    if (popups?.length) {
+      this.popupEvents.delete(agentId);
+      // The screen text, the screen, the turn. The rest of the observation - adapter notes, control
+      // paths, capture provenance, constant status flags - stays in public history rather than being
+      // reprinted into the player's context on every popup the game happens to raise.
+      const digests = popups.map(({ popup, lastObservedTurn }) => popupDigest(popup, lastObservedTurn)).filter(digest => digest !== null);
+      if (digests.length) result.content.push({ type: "text", text: `popups: ${JSON.stringify(digests)}` });
     }
     // Workspace file paths stay in the execution log, never in the model-visible result: the block was
     // ~100 chars on every call and it baited re-reads of output the model already had.
