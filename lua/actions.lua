@@ -413,11 +413,10 @@ local function playerResearch(args, pid, player, isTech)
   local accepted = A.mutate(UI.RequestPlayerOperation, pid, A.param(PlayerOperations, isTech and 'RESEARCH' or 'PROGRESS_CIVIC'), parameters)
   if accepted == false then return {accepted = false, completed = false, status = 'rejected', turnState = turnStateUnlessBatched()} end
   local out = submitted()
+  -- mode echoes the argument with its default applied, so it already says which end of the native
+  -- queue the path went to; planned is the engine's own path, returned verbatim.
   out.item, out.mode = args.item, args.mode or 'replace'
   out.planned = path
-  -- What this call did that the caller could not otherwise tell: which end of the native queue the
-  -- path went to. `planned` is the engine's own path, returned verbatim.
-  out.queue = args.mode == 'append' and 'appended' or 'replaced'
   return out
 end
 
