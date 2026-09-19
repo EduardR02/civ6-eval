@@ -1494,7 +1494,7 @@ A.civilopediaSpec = {
   page = {
     layoutStatus = 'rendered (native layout ran; stats/links are screen content) | unusable (no builder or no '
       .. 'layout template here) | unsupported (the layout touched the live screen or needs a missing helper) | '
-      .. 'failed | unavailable (globals are not shared with the page files, so no layout was run)',
+      .. 'error (the native layout raised) | unavailable (globals are not shared with the page files, so no layout was run)',
     chapters = 'mechanics text in native order: {source=chapter|paragraph|header|headerBody|iconHeaderBody, '
       .. 'chapterId from the native chapter map, header, paragraphs or body, icons} with header, paragraphs, body '
       .. 'and icon texts as localized strings; narrative HISTORY/CAPSULE chapters are listed under '
@@ -1554,7 +1554,7 @@ A.civilopediaSpec = {
       .. 'silently leave the real helpers in place, a cross-file probe runs first - it spoofs _ChaptersByPageLayout '
       .. 'and asks GetPageChapters for the marker, requiring it back by identity - and provenance.sharedGlobals '
       .. 'reports the answer.  A page reports the outcome, not the internals: page.layoutStatus (rendered|'
-      .. 'unusable|unsupported|failed|unavailable) plus one terse note, e.g. "layout not run: globals are not '
+      .. 'unusable|unsupported|error|unavailable) plus one terse note, e.g. "layout not run: globals are not '
       .. 'shared with the page files".  A layout that makes no page-helper calls and captures nothing is '
       .. 'unsupported, never a complete empty page',
     identity = 'the result carries no game id: A.session is a per-context FireTuner session id that can differ '
@@ -1567,7 +1567,8 @@ A.civilopediaSpec = {
     .. 'layer for the page helpers (AddChapter/AddRightColumnStatBox/SetPageHeader/...), the cache accessors the '
     .. 'layout reads and the blocked screen/hook names - no per-entity parsing, so any shipped or mod layout renders '
     .. 'through the same path and the layout itself decides the content and its formatting.  When the state has '
-    .. 'setfenv) it is addressed by name: the intercepted globals are swapped, and only after the cross-file probe '
+    .. 'a trimmed base library (no _G, no getfenv, no setfenv) it is addressed by name: the intercepted globals are '
+    .. 'swapped, and only after the cross-file probe '
     .. 'proves a written global is read by functions from other files.  Every name is verified to read back '
     .. 'afterwards, and a name that does not is a hard error.  When that '
     .. 'layout cannot run here, the page is answered from the same native data instead - its own chapter text and the '
