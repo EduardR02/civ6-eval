@@ -878,22 +878,21 @@ print(__MARKER__ .. ':DONE')`;
     } else {
       unavailable.capabilities = "Load an active game. The action catalog is generated from the live ruleset, never from a static table.";
     }
-    return {
+    return CivBridge.withDiagnostics({
       ...info,
       ...capabilities,
       game,
       popupCatalog,
-      unavailable,
       methods: METHOD_SCHEMA,
       semantics: {
         gameId: "Loaded Lua-world instance UUID, stable over TCP reconnects; a reload gets a new instance",
         fog: "Only local player and visible entities are queried. Nonvisible tiles retain earlier observations, not live data. Enemy disappearance is not death.",
-        unavailable: "null values plus grouped unavailable diagnostics; not fabricated zeroes",
+        unavailable: "present only when something was actually unavailable: null values plus grouped diagnostics, never fabricated zeroes. An absent key means nothing was degraded.",
         capabilities: "What the runtime generator advertised on this call: action types and operations it can currently describe, not a claim about the ruleset. Missing means not advertised now (unknown, not absent); advertised means dispatchable through a codec, not currently legal. civ.options reports current legality and refusals.",
         popupCatalog: "Fixed reviewed screen adapters. dismissable there means an explicit civ.decide close runs that screen's own native handler (information-only screens plus the dismiss-only congress, governor and great-people screens); autoDismissible on an observation additionally requires captured, untruncated content and is never offered for a gameplay choice.",
         submission: "civ.action and civ.decide return accepted/submitted, never completed. A partially executed batch names stoppedAt and is never replayed.",
       },
-    };
+    }, unavailable);
   }
 
   /** `unavailable: {}` was riding on four results in five, which taught the model to skip the key on
@@ -1120,7 +1119,7 @@ print(__MARKER__ .. ':DONE')`;
   private async decide(args: Arguments, authorize?: RequestGuard): Promise<unknown> {
     if (typeof args.id === "string" && args.id.startsWith("popup:")) {
       const result = await dismissPopup(args.id, this.popupInvoker(authorize));
-      return { ...result, accepted: result.dismissed, completed: result.dismissed, unavailable: {} };
+      return { ...result, accepted: result.dismissed, completed: result.dismissed };
     }
     return this.mutation("decide", args, authorize);
   }
@@ -1137,15 +1136,16 @@ print(__MARKER__ .. ':DONE')`;
         throw new Error(`${label} failed or its acknowledgement was lost; outcome may be unknown. It was NOT replayed. Read a new snapshot before deciding whether to retry. ${luaReason(text) || text}`);
       }
       return {
-        accepted: false, completed: false, status: "refused", reasons: [refused], unavailable: {},
+        accepted: false, completed: false, status: "refused", reasons: [refused],
         note: "Refused before submission: nothing reached the engine, so there is no unknown outcome here. Fix the stated reason and submit again.",
       };
     }
     const result = response.result;
     if (!result || typeof result !== "object" || Array.isArray(result)) {
-      return { result: result ?? null, unavailable: response.unavailable ?? {} };
+      return CivBridge.withDiagnostics({ result: result ?? null }, response.unavailable ?? {});
     }
-    const output: Record<string, unknown> = { ...(result as Record<string, unknown>), unavailable: response.unavailable ?? {} };
+    const output: Record<string, unknown> =
+      CivBridge.withDiagnostics({ ...(result as Record<string, unknown>) }, response.unavailable ?? {});
     // The model's own explicit congress submit authorizes the screen teardown the native Accept
     // performs (WorldCongressPopup.lua OnAccept -> ClosePopup). Only a known submitted outcome
     // reaches this point: an unknown outcome throws above and is never followed by a close, and a
@@ -1467,14 +1467,13 @@ print(__MARKER__ .. ':DONE')`;
         ? { record: "Live state unavailable; returning accumulated last-known data with explicit staleness." }
         : (response.unavailable ?? {}))
       : { record: "Not observed by this player, no longer controlled, or ID belongs to another loaded game. Unseen live state is never queried." };
-    return {
+    return CivBridge.withDiagnostics({
       gameId,
       turn: payload.turn ?? null,
       kind: payload.kind ?? null,
       status: payload.status ?? (remembered ? "remembered" : record ? "observed" : "not_observed"),
       record,
-      unavailable,
-    };
+    }, unavailable);
   }
 
   async close(): Promise<void> {

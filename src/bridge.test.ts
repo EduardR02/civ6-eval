@@ -1118,3 +1118,30 @@ test("a large preserved popup can pass the guarded close without another observa
   expect(report.dismissed).toEqual(["popup:historic-moments"]);
   expect(report.presented[0]!.content).toEqual(content);
 });
+
+// This regressed once already: withDiagnostics was added with a comment explaining that an
+// always-present empty `unavailable` teaches the model to skip the key, and then three of the five
+// result paths kept emitting one anyway. Assert the property across the paths rather than trusting
+// the helper to be reached.
+test("no result carries an empty unavailable, so its presence always means something is degraded", async () => {
+  const { bridge } = transportBridge();
+  const calls: [string, Arguments][] = [
+    ["civ.probe", {}],
+    ["civ.decisions", {}],
+    ["civ.action", { type: "end_turn" }],
+    ["civ.decide", { id: "g:decision:pantheon:player0", choice: "BELIEF_X" }],
+    // A popup: id takes the dismissal branch instead of the mutation one; both used to emit {}.
+    ["civ.decide", { id: "popup:historic-moments" }],
+    ["civ.inspect", { x: 1, y: 1 }],
+  ];
+  for (const [method, args] of calls) {
+    const result = await bridge.request(method, args) as Record<string, unknown>;
+    if (!("unavailable" in result)) continue;
+    expect({ method, unavailable: result.unavailable }).toEqual({
+      method,
+      unavailable: expect.objectContaining({}),
+    });
+    expect(Object.keys(result.unavailable as object).length,
+      `${method} returned an empty unavailable; presence must mean something was degraded`).toBeGreaterThan(0);
+  }
+});
