@@ -23,7 +23,7 @@ bun start play --prompt 'Inspect the current position and explain your next prio
 
 `setup` installs the Python/WSL dependencies; `--enable-tuner` changes Civ's local `AppOptions.txt` after saving a backup. Restart Civ after enabling FireTuner. Start or load a Gathering Storm game yourself and leave it open before `doctor` or `play`; the CLI does not start a scored game automatically. `bun start help` lists the other commands, including resume, usage reporting and the local dashboard. Run artifacts, captures, transcripts and player workspaces live under ignored `.civ6/`; the credential source and Civ saves are outside this repository. Do not publish a run directory without reviewing it separately.
 
-The checked-in `civ6.config.json` selects `deepseek-flash` through opencode-go, with a finite model-call ceiling. It is a starting configuration, not an endorsement or a benchmark result. Override provider, model, effort and call ceiling on the command line, or use `--config PATH` with your own JSON file outside the repository. The ceiling only limits this harness; it does not change provider quotas or charges. Usage prices shown by the program are API-equivalent estimates, not subscription charges.
+The checked-in `civ6.config.json` selects `deepseek-flash` through opencode-go and permits unlimited model calls. This removes only the harness's call-admission ceiling; it does not bypass provider quotas or charges. It is a starting configuration, not an endorsement or a benchmark result. Override provider, model, effort and call ceiling on the command line, or use `--config PATH` with your own JSON file outside the repository. Usage prices shown by the program are API-equivalent estimates, not subscription charges.
 
 ### Authentication
 

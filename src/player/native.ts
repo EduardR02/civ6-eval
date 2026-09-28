@@ -84,7 +84,7 @@ function imageParts(item: Item): Item[] {
 /** Codex quota is account-local; a generic 429 can instead be a brief throttle. */
 function codexQuotaResponse(status: number, body: string): boolean {
   if (status !== 429 && status !== 403) return false;
-  if (!body.trim()) return false;
+  if (!body.trim()) return status === 429;
   let code: unknown;
   try {
     const parsed = JSON.parse(body);

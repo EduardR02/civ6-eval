@@ -33,20 +33,19 @@ test("OMP pinned reader refreshes the same account; startup rotates only after O
   }
 });
 
-test("Codex quota switches accounts without changing opaque context; transient throttles and exhausted pools stop", async () => {
+test("Codex quota and bodyless 429 switch accounts without changing opaque context; transient throttles and exhausted pools stop", async () => {
   const directory = mkdtempSync(join(tmpdir(), "civ-codex-rotation-"));
   const path = join(directory, "auth.db");
   const database = new Database(path, { create: true });
   const attempts: { account: string | null; input: unknown }[] = [];
   let transient = true;
-  let bodyless = false;
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const body = await request.json() as { input: unknown };
     const account = request.headers.get("chatgpt-account-id");
     attempts.push({ account, input: body.input });
-    if (account === "account-a" && bodyless) return new Response(null, { status: 429 });
-    if (account === "account-a") return Response.json({ error: { code: transient ? "rate_limit_exceeded" : "usage_limit_reached", echo: "private-provider-error" } }, { status: 429, headers: { "retry-after": "42" } });
-    if (attempts.length > 4) return Response.json({ error: { code: "usage_limit_reached" } }, { status: 429 });
+    if (account === "account-a" && !transient) return new Response(null, { status: 429, headers: { "retry-after": "42" } });
+    if (account === "account-a") return Response.json({ error: { code: "rate_limit_exceeded", echo: "private-provider-error" } }, { status: 429, headers: { "retry-after": "42" } });
+    if (attempts.length > 3) return Response.json({ error: { code: "usage_limit_reached" } }, { status: 429 });
     return new Response('data: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n', { headers: { "Content-Type": "text/event-stream" } });
   } });
   try {
@@ -71,17 +70,11 @@ test("Codex quota switches accounts without changing opaque context; transient t
     expect(attempts.map(attempt => attempt.account)).toEqual(["account-a"]);
     expect(JSON.parse(readFileSync(join(directory, "player", "auth-source.json"), "utf8")).accountId).toBe("account-a");
 
-    bodyless = true;
-    expect((await ledger.stream(context).result()).stopReason).toBe("error");
-    expect(attempts.map(attempt => attempt.account)).toEqual(["account-a", "account-a"]);
-    expect(JSON.parse(readFileSync(join(directory, "player", "auth-source.json"), "utf8")).accountId).toBe("account-a");
-    bodyless = false;
-
     transient = false;
     expect((await ledger.stream(context).result()).stopReason).toBe("stop");
-    expect(attempts.map(attempt => attempt.account)).toEqual(["account-a", "account-a", "account-a", "account-b"]);
-    expect(attempts[2]!.input).toEqual(attempts[3]!.input);
-    expect(JSON.stringify(attempts[3]!.input)).toContain(opaque.encrypted_content);
+    expect(attempts.map(attempt => attempt.account)).toEqual(["account-a", "account-a", "account-b"]);
+    expect(attempts[1]!.input).toEqual(attempts[2]!.input);
+    expect(JSON.stringify(attempts[2]!.input)).toContain(opaque.encrypted_content);
     expect(events.filter(event => event === "account_switch")).toHaveLength(1);
     const binding = JSON.parse(readFileSync(join(directory, "player", "auth-source.json"), "utf8")) as { accountId: string; exhausted: Record<string, number> };
     expect(binding.accountId).toBe("account-b");
@@ -90,7 +83,7 @@ test("Codex quota switches accounts without changing opaque context; transient t
     expect(readFileSync(join(directory, "player", "agents", "main", "native.jsonl"), "utf8")).not.toContain("private-provider-error");
 
     expect((await ledger.stream(context).result()).stopReason).toBe("error");
-    expect(attempts.map(attempt => attempt.account)).toEqual(["account-a", "account-a", "account-a", "account-b", "account-b"]);
+    expect(attempts.map(attempt => attempt.account)).toEqual(["account-a", "account-a", "account-b", "account-b"]);
     expect(JSON.parse(readFileSync(join(directory, "player", "auth-source.json"), "utf8")).exhausted["account-b"]).toBeGreaterThan(Date.now());
     await expect(createRuntime(options)).rejects.toThrow("All Codex subscription accounts");
   } finally {

@@ -3,7 +3,7 @@
   "provider": "opencode-go",
   "effort": "max",
   "maxConcurrentAgents": 4,
-  "maxModelCalls": 200,
+  "maxModelCalls": "unlimited",
   "compactThreshold": 272000,
   "compactThresholds": { "opencode-go": 500000 },
   "distro": "Ubuntu-24.04"
