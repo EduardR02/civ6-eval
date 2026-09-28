@@ -50,7 +50,6 @@ Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
-# Supplied strategy material for the expert-informed track. Kept on disk and deliberately not
-# committed yet: it is third-party-derived source material whose licensing and placement are still
-# open. Delete this block when that is settled.
+# Local expert-informed guide derived from third-party videos. The draft is still being revised;
+# publication and source rights are unresolved. Keep it out of Git until both are settled.
 guides/

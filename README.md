@@ -1,44 +1,56 @@
 # Civ VI player
 
-A language model plays Civilization VI: Gathering Storm through the game's own UI and a FireTuner bridge. It can inspect screenshots and exact player-observable game state, issue legal game actions, write and retain Python code in an isolated workspace, and delegate bounded analyses. The model chooses what to inspect and how to play; the bridge is not a scripted strategy engine. [DESIGN.md](DESIGN.md) explains the interface and experimental choices.
+This is the code we're using to let a language model play Civilization VI: Gathering Storm. It can look at Civ's screen, read player-visible game state through a FireTuner bridge, and take actions in the game. It also has a persistent, isolated Python workspace for calculations and can delegate focused work to subagents using the same model in separate contexts.
+
+We want the interface to make Civ's mechanics easy to inspect and use, without deciding the strategy for the player. The model chooses what to investigate, where to expand, what to build and how to respond when the game changes. [DESIGN.md](DESIGN.md) goes into the tradeoffs behind that setup.
 
 ## Status
 
-This is an experiment, not a demonstrated Deity-winning agent. No full game has been completed in the runs so far: we stopped exploratory runs early when they became unpromising or exposed a harness problem. The interface has also changed during those runs, so they are not clean comparisons between models.
+We haven't finished a full game yet. So far we've stopped runs when they fell too far behind or turned up a problem with the interface, then fixed what we found and tried again. That has taught us quite a bit about the harness, but the runs don't give us a win rate or a clean model comparison.
 
-In the starts observed so far, Astra has used the interface more effectively and played faster than the other models tried; weaker models often spend more time per turn and struggle with the available controls. Early wars have been especially damaging against Deity's starting bonuses. The models have also made limited use of diplomacy—delegations, trades and similar interactions—which *might* be contributing to those wars. That is a hypothesis, not an identified cause: the interface or its explanation could be part of the problem. We do not yet have full-game results or a measured win rate.
+Of the models we've tried, Astra has made the best use of the interface and has been the quickest to play. The others tend to take longer per turn and have more trouble using the available controls. Nearby Deity AI civs start with large bonuses and have attacked us early in a lot of games. The models haven't done much to head that off: they rarely send delegations or open the trade screen to improve relations before a war is declared. We don't yet know whether that comes from the model's decisions, how the interface presents other players, the multiplayer focus of the guide, or something else.
 
-Live play owns the Windows desktop, and even the faster runs take much longer per turn than a human player. Long runs currently mean leaving the machine occupied, running overnight, or using a separate game computer. On our Astra subscription, one five-hour usage window has lasted only about 25 early turns; later turns have more decisions. This is a local observation, not a promised provider limit.
+New runs don't automatically remember earlier ones. If a run ends after an early attack, the next model won't know what happened unless we give it that history. One thing worth trying is a short account of a previous run's failure, to see whether the model changes how it deals with its neighbours.
+
+The game occupies the Windows desktop while a run is in progress. Even Astra plays slowly compared with a human, so a long run would need to happen overnight or on another computer. On our Astra subscription, we got through about 25 early turns in one five-hour usage window. Later turns take longer.
 
 ## Running locally
 
-The current implementation targets **Windows with Civ VI: Gathering Storm**, a working WSL 2 distro (the checked-in config names `Ubuntu-24.04`), [Bun](https://bun.sh/), [uv](https://docs.astral.sh/uv/) with Python 3.12, and access to the Civ VI desktop. Install the WSL distro before setup. You will also need credentials for a supported model provider; see below. This is not a headless game server or a cross-platform desktop client.
+You'll need Windows, Civ VI: Gathering Storm, a WSL 2 distro (the checked-in config uses `Ubuntu-24.04`), [Bun](https://bun.sh/), and [uv](https://docs.astral.sh/uv/) with Python 3.12. Install the WSL distro first. You'll also need access to a supported model provider.
 
 ```sh
 bun install
 bun start setup --enable-tuner
 bun start doctor
-bun start play --prompt 'Inspect the current position and explain your next priorities'
+bun start play --prompt 'Play the current game to a victory. Continue turn by turn until the game ends.'
 ```
 
-`setup` installs the Python/WSL dependencies; `--enable-tuner` changes Civ's local `AppOptions.txt` after saving a backup. Restart Civ after enabling FireTuner. Start or load a Gathering Storm game yourself and leave it open before `doctor` or `play`; the CLI does not start a scored game automatically. `bun start help` lists the other commands, including resume, usage reporting and the local dashboard. Run artifacts, captures, transcripts and player workspaces live under ignored `.civ6/`; the credential source and Civ saves are outside this repository. Do not publish a run directory without reviewing it separately.
+The starting [system prompt](src/prompts.ts) describes the tools and game interface. In the default completion mode, the CLI also appends [task-completion instructions](src/player.ts#L59).
 
-The checked-in `civ6.config.json` selects `deepseek-flash` through opencode-go and permits unlimited model calls. This removes only the harness's call-admission ceiling; it does not bypass provider quotas or charges. It is a starting configuration, not an endorsement or a benchmark result. Override provider, model, effort and call ceiling on the command line, or use `--config PATH` with your own JSON file outside the repository. Usage prices shown by the program are API-equivalent estimates, not subscription charges.
+`setup` installs the Python and WSL dependencies. With `--enable-tuner`, it backs up Civ's local `AppOptions.txt` and enables FireTuner; restart Civ afterward. Start or load a Gathering Storm game and leave it open before running `doctor` or `play`. For the other commands, including resume and the local dashboard, see `bun start help`.
+
+The checked-in `civ6.config.json` selects `deepseek-flash` through opencode-go and allows unlimited model calls. You can change the model, provider, effort and call limit with command-line flags or a private JSON file passed to `--config PATH`. `unlimited` removes the harness's call limit, not the provider's quota or charges. Usage costs shown by the program are API-equivalent estimates, not subscription bills.
+
+Run artifacts, captures, transcripts and player workspaces go under the ignored `.civ6/` directory. The credential source and Civ saves are outside this repository. Review any run directory separately before sharing it.
 
 ### Authentication
 
-Authentication still reflects the development setup. The default credential path is OMP's read-only `~/.omp/agent/agent.db`; **OMP is not required** if you choose one of these alternatives:
+The default credential path points at OMP's `~/.omp/agent/agent.db`, which the player reads without modifying it. You can use the player without OMP:
 
-- For the checked-in opencode-go profile, set `OPENCODE_API_KEY` in your environment instead of using the OMP credential store.
-- For a ChatGPT/Codex subscription, run `codex login`, set `"authPath": "~/.codex/auth.json"` in a private config, and select `--provider codex --model gpt-6-astra` (or another supported Codex model). This player reads the existing access token; it does not refresh that login for you.
-- For direct OpenAI API billing, set `OPENAI_API_KEY` and select `--provider openai --model gpt-6-astra` (or another supported API model). Subscription access and API billing are different routes.
+- With the checked-in opencode-go config, set `OPENCODE_API_KEY` in your environment.
+- For a ChatGPT/Codex subscription, run `codex login`, set `"authPath": "~/.codex/auth.json"` in a private config, then select `--provider codex --model gpt-6-astra` (or another supported model). The player uses the existing access token; renew it through Codex when needed.
+- For the OpenAI API, set `OPENAI_API_KEY` and select `--provider openai --model gpt-6-astra` (or another supported API model). This uses API billing rather than the subscription.
 
-Do not commit credentials or a private config. Keep the credential source on the trusted host, not in the player's Python workspace.
+Keep credentials and private config files out of Git. Player Python cannot read the host credential source.
 
 ## Knowledge and rulesets
 
-Runs distinguish *uncoached* play from an *expert-informed* track, selected with `--knowledge expert-informed`. The latter loads a separately supplied guide from `expertGuidePath` in the config. The local Herson/BBG synthesis used during development is **not included here** while its source rights and publication form are being settled; an expert-informed run in a fresh clone needs its own guide file and configured path. Uncoached play does not need that file.
+Runs use the *uncoached* track unless you pass `--knowledge expert-informed`. That option reads the guide named by `expertGuidePath` in the config. We have a usable first version of the guide locally, but are still experimenting with its content and structure, so it isn't checked in yet. We also haven't settled how to publish material derived from someone else's videos. For now, you can supply your own guide and set its path in the config.
 
-The development guide draws on competitive multiplayer material for Better Balanced Game (BBG) and Better Balanced Map(s) (BBM). Using those mods makes the source advice more applicable, but modded multiplayer advice is not automatically correct against Deity AI, and modded runs are not unmodified Gathering Storm results. The base game has different balance and can favor different strategies. Record the ruleset, mods, map settings, speed, seed, model, and knowledge track when comparing runs.
+Ours came from Herson's 30-video [Civ VI BBG Guides playlist](https://www.youtube.com/playlist?list=PLUmau0-sP9xFMKZz6eMH15mrf3h-fhFCQ). We collected the auto-generated English captions, used LLMs to make a first pass of useful notes for each video, and compiled those notes into a structured `SKILL.md`. During that last pass we compared sources, reconciled conflicting claims where possible, flagged what remained uncertain, and marked advice that depends on multiplayer conditions. The current draft is about 119,000 characters long. You can follow the same process with that playlist, or make a guide from other sources you prefer.
 
-The first-party source is [MIT licensed](LICENSE). Civ VI, mods and third-party strategy material retain their respective owners and licenses; the excluded guide is not covered by this repository's license.
+The guide draws on competitive multiplayer games with Better Balanced Game (BBG) and Better Balanced Map(s) (BBM). Much of the advice about growing cities, districts and the economy is useful against AI too. Advice that depends on bargaining with, deterring or predicting human opponents needs more care, and mod-specific numbers should be checked against the rules of the game being played.
+
+The idea is to give the model the kind of background someone might have after playing and studying Civ for a while, then see what it does in a fresh game. Supplying that background changes the experiment, so we keep guided and unguided runs separate. Record the mods, ruleset, map settings, speed, seed, model and knowledge track when comparing them.
+
+The code here is [MIT licensed](LICENSE).
