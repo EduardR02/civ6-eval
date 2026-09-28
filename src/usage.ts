@@ -59,6 +59,10 @@ type LedgerEvent =
   | { version: 1; type: "end"; requestId: string; outcome: RequestOutcome; endedAt: string | null; durationMs: number | null };
 const ASTRA_SOURCE = "https://developers.openai.com/api/docs/models/gpt-6-astra (verified 2026-09-08)";
 const ASTRA_RATES: ApiRates = { input: 10, cachedInput: 1, cacheWrite: 12.5, output: 50, longContextThreshold: 272000, longContextInputMultiplier: 2, longContextOutputMultiplier: 1.5 };
+const SOL_SOURCE = "https://developers.openai.com/api/docs/models/gpt-6-sol (verified 2026-09-22)";
+const SOL_RATES: ApiRates = { input: 2, cachedInput: 0.2, cacheWrite: 2.5, output: 10, longContextThreshold: 272000, longContextInputMultiplier: 2, longContextOutputMultiplier: 1.5 };
+const LUNA_SOURCE = "https://developers.openai.com/api/docs/models/gpt-6-luna (verified 2026-09-22)";
+const LUNA_RATES: ApiRates = { input: 0.1, cachedInput: 0.01, cacheWrite: 0.125, output: 0.5, longContextThreshold: 272000, longContextInputMultiplier: 2, longContextOutputMultiplier: 1.5 };
 const GLM_SOURCE = "@earendil-works/pi-ai 0.84.4 opencode-go catalog, glm-5.3-flash (verified 2026-09-08)";
 const GLM_RATES: ApiRates = { input: 0.075, cachedInput: 0.015, cacheWrite: 0, output: 0.25 };
 const MUSE_SOURCE = "@earendil-works/pi-ai 0.84.4 opencode-go catalog, muse-spark-1.3-contributor (verified 2026-09-09)";
@@ -80,8 +84,8 @@ export function validateApiRates(value: unknown): asserts value is ApiRates {
   if ((rates.longContextInputMultiplier !== undefined || rates.longContextOutputMultiplier !== undefined) && rates.longContextThreshold === undefined) throw new Error("apiRates long-context multipliers require longContextThreshold");
 }
 function pricing(model: string, provider: string, rates?: ApiRates): Pricing {
-  const defaults = model === "gpt-6-astra" ? ASTRA_RATES : model === "glm-5.3-flash" && provider === "opencode-go" ? GLM_RATES : model === "muse-spark-1.3-contributor" && provider === "opencode-go" ? MUSE_RATES : model === "deepseek-flash" && provider === "opencode-go" ? DEEPSEEK_RATES : null;
-  const source = rates ? "configured apiRates" : defaults === ASTRA_RATES ? ASTRA_SOURCE : defaults === GLM_RATES ? GLM_SOURCE : defaults === MUSE_RATES ? MUSE_SOURCE : defaults === DEEPSEEK_RATES ? DEEPSEEK_SOURCE : null;
+  const defaults = model === "gpt-6-astra" ? ASTRA_RATES : model === "gpt-6-sol" ? SOL_RATES : model === "gpt-6-luna" ? LUNA_RATES : model === "glm-5.3-flash" && provider === "opencode-go" ? GLM_RATES : model === "muse-spark-1.3-contributor" && provider === "opencode-go" ? MUSE_RATES : model === "deepseek-flash" && provider === "opencode-go" ? DEEPSEEK_RATES : null;
+  const source = rates ? "configured apiRates" : defaults === ASTRA_RATES ? ASTRA_SOURCE : defaults === SOL_RATES ? SOL_SOURCE : defaults === LUNA_RATES ? LUNA_SOURCE : defaults === GLM_RATES ? GLM_SOURCE : defaults === MUSE_RATES ? MUSE_SOURCE : defaults === DEEPSEEK_RATES ? DEEPSEEK_SOURCE : null;
   return { model, rates: rates ? { ...rates } : defaults ? { ...defaults } : null, source, basis: "standard API-equivalent USD per million tokens" };
 }
 function reference(value: unknown): TurnReference | null {

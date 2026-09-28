@@ -126,8 +126,59 @@ test("queued native work is annotated on the blockers that already carry it", ()
     assert(#blockered.units == 1 and blockered.units[1] == unit.id)
     assert(#blockered.unitsWithQueuedWork == 1 and blockered.unitsWithQueuedWork[1].id == unit.id)
     assert(tostring(blockered.unitsWithQueuedWork[1].reason):find('queued destination', 1, true), blockered.unitsWithQueuedWork[1].reason)
-    -- Readiness stays the engine's own answer.
+    -- The native ready signal is not an exact end-turn blocker verdict.
     assert(unit.ready == true and unit.activity == 'ACTIVITY_AWAKE')
+  `);
+});
+
+test("resting units stay out of order candidates until native readiness wakes them", () => {
+  run(`
+    local A = AstraCiv
+    STUB_BLOCKERS = {EndTurnBlockingTypes.ENDTURN_BLOCKING_UNIT_NEEDS_ORDERS}
+    STUB_FIRST_BLOCKER = EndTurnBlockingTypes.ENDTURN_BLOCKING_UNIT_NEEDS_ORDERS
+    STUB_UNIT_ACTIVITY = ActivityTypes.ACTIVITY_AWAKE
+    local nativeUnit = Players[0]:GetUnits():FindID(7)
+    nativeUnit.GetMovesRemaining = function() return 2 end
+    nativeUnit.GetMaxMoves = function() return 2 end
+    nativeUnit.GetFortifyTurns = function() return 1 end
+    local observation = A.snapshot({include={'units'}})
+    local unit = observation.units[1]
+    assert(unit.activity == 'ACTIVITY_AWAKE' and unit.moves == 2 and unit.maxMoves == 2)
+    assert(unit.fortifyTurns == 1)
+    assert(unit.ready == true, 'A woken native-ready unit can retain positive fortify turns')
+    local blocker = observation.turnState.blockers[1]
+    assert(#blocker.units == 1 and blocker.units[1] == unit.id,
+      'The blocker candidate list must retain the native-ready unit')
+    STUB_UNIT_ACTIVITY = ActivityTypes.ACTIVITY_SLEEP
+    local sleeping = A.snapshot({include={'units'}})
+    assert(sleeping.units[1].ready == false and #sleeping.turnState.blockers[1].units == 0,
+      'Sleeping units must not recur in order candidates')
+    STUB_UNIT_ACTIVITY = ActivityTypes.ACTIVITY_AWAKE
+    nativeUnit.IsReadyToMove = function() return false end
+    local resting = A.snapshot({include={'units'}})
+    assert(resting.units[1].ready == false and #resting.turnState.blockers[1].units == 0,
+      'An awake-looking fortified unit that native readiness excludes must not recur')
+    nativeUnit.IsReadyToMove = function() return true end
+    local woken = A.snapshot({include={'units'}})
+    assert(woken.units[1].ready == true and woken.turnState.blockers[1].units[1] == unit.id)
+  `);
+});
+
+test("unavailable native readiness stays unknown, not a false ready candidate", () => {
+  run(`
+    local A = AstraCiv
+    STUB_BLOCKERS = {EndTurnBlockingTypes.ENDTURN_BLOCKING_UNIT_NEEDS_ORDERS}
+    UnitManager.GetActivityType = function() error('fixture activity read failed') end
+    local observation = A.snapshot({include={'units'}})
+    local unit = observation.units[1]
+    assert(unit.ready == A.null, 'An unavailable activity read is unknown, not not-ready')
+    assert(observation.turnState.blockers[1].units == A.null,
+      'An unreadable readiness check must not fabricate a ready candidate or a definitive empty list')
+    UnitManager.GetActivityType = function() return ActivityTypes.ACTIVITY_AWAKE end
+    Players[0]:GetUnits():FindID(7).IsReadyToMove = function() error('fixture ready read failed') end
+    local unknown = A.snapshot({include={'units'}})
+    assert(unknown.units[1].ready == A.null and unknown.turnState.blockers[1].units == A.null,
+      'An unreadable native IsReadyToMove result cannot create a ready candidate')
   `);
 });
 

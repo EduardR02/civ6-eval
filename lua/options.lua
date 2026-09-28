@@ -7,6 +7,7 @@ local A = AstraCiv
 
 local MAX_PLOTS = 200
 local DEFAULT_LIMIT = 50
+local DEFAULT_TARGET_LIMIT = 20
 
 local function page(list, offset, limit)
   local out, total = A.array(), #list
@@ -30,9 +31,13 @@ local function selectors(args)
   assert(detail == 'summary' or detail == 'full', "detail must be 'summary' or 'full'")
   local offset = args.offset or 0
   local limit = args.limit or DEFAULT_LIMIT
+  local targetOffset = args.targetOffset or 0
+  local targetLimit = args.targetLimit or DEFAULT_TARGET_LIMIT
   assert(type(offset) == 'number' and offset % 1 == 0 and offset >= 0, 'offset must be a nonnegative integer')
   assert(type(limit) == 'number' and limit % 1 == 0 and limit >= 1 and limit <= 500, 'limit must be 1..500')
-  return detail, offset, limit, args.targets == true
+  assert(type(targetOffset) == 'number' and targetOffset % 1 == 0 and targetOffset >= 0, 'targetOffset must be a nonnegative integer')
+  assert(type(targetLimit) == 'number' and targetLimit % 1 == 0 and targetLimit >= 1 and targetLimit <= 50, 'targetLimit must be 1..50')
+  return detail, offset, limit, args.targets == true, targetOffset, targetLimit
 end
 
 -- ------------------------------------------------------------------ unit scope
@@ -52,6 +57,171 @@ local function operationTargets(unit, row)
   -- attack targets. Returning every plot as a target would be unsafe.
   if decoded.targets and #decoded.targets > 0 then return decoded.targets, decoded.plotResults end
   return decoded.plots, decoded.plotResults
+end
+
+local ORIGIN_YIELD_METHODS = {
+  'CalculateOriginYieldsFromPotentialRoute',
+  'CalculateOriginYieldsFromPath',
+  'CalculateOriginYieldsFromModifiers',
+}
+local DESTINATION_YIELD_METHODS = {
+  'CalculateDestinationYieldsFromPotentialRoute',
+  'CalculateDestinationYieldsFromPath',
+  'CalculateDestinationYieldsFromModifiers',
+}
+
+-- TradeSupport.lua:GetYieldsForRoute sums the three native arrays by one-based position,
+-- then multiplies positive international totals by the receiving player's modifier.
+-- A missing component is unknown, never a zero-yield route.
+local function tradeYields(manager, originOwner, originId, owner, id, destination)
+  local parts = {}
+  for _, method in ipairs(destination and DESTINATION_YIELD_METHODS or ORIGIN_YIELD_METHODS) do
+    local fn = manager[method]
+    if type(fn) ~= 'function' then return A.null, method..' unavailable.' end
+    local ok, values = pcall(fn, manager, originOwner, originId, owner, id)
+    if not ok or type(values) ~= 'table' or #values == 0 then
+      return A.null, method..' returned no usable yields.'
+    end
+    parts[#parts + 1] = values
+  end
+  local receiver = destination and owner or originOwner
+  local trade
+  if originOwner ~= owner then
+    local ok, result = pcall(function() return Players[receiver]:GetTrade() end)
+    if not ok then return A.null, 'International trade yield modifier unavailable.' end
+    trade = result
+  end
+  local out = A.array()
+  for i = 1, #parts[1] do
+    local row = GameInfo.Yields and GameInfo.Yields[i - 1]
+    local route, path, modifier = parts[1][i], parts[2][i], parts[3][i]
+    if not row or type(route) ~= 'number' or type(path) ~= 'number' or type(modifier) ~= 'number' then
+      return A.null, 'Native route yield components unavailable.'
+    end
+    local total = route + path + modifier
+    if originOwner ~= owner then
+      if not trade or type(trade.GetInternationalYieldModifier) ~= 'function' then
+        return A.null, 'International trade yield modifier unavailable.'
+      end
+      local ok, multiplier = pcall(trade.GetInternationalYieldModifier, trade, i - 1)
+      if not ok or type(multiplier) ~= 'number' then
+        return A.null, 'International trade yield modifier unavailable.'
+      end
+      if total > 0 then total = total * multiplier end
+    end
+    if total ~= 0 then out[#out + 1] = {yield = row.YieldType, value = total} end
+  end
+  return out
+end
+
+local function tradeFact(target, field, kind, fn)
+  local ok, value = pcall(fn)
+  if ok and type(value) == kind and value ~= A.null then target[field] = value
+  else
+    target[field] = A.null
+    target[field..'Reason'] = field..' unavailable.'
+  end
+end
+
+-- The chooser draws the native route path, not a promise that each tile gains a road.
+-- Positions retain their original one-based offset when fogged plots are omitted.
+local function tradePathDetails(target, path, visibility)
+  local plots = A.array()
+  target.pathMore = #path > 64
+  for i = 1, math.min(#path, 64) do
+    local okPlot, plot = pcall(function() return Map.GetPlotByIndex(path[i]) end)
+    if not okPlot or not plot then
+      target.pathPlots, target.pathPlotsReason = A.null, 'Route path plot lookup unavailable.'
+      return
+    end
+    local ok, x, y = pcall(function() return plot:GetX(), plot:GetY() end)
+    if not ok then
+      target.pathPlots, target.pathPlotsReason = A.null, 'Route path plot lookup unavailable.'
+      return
+    end
+    local visibleOK, visible = pcall(visibility.IsVisible, visibility, x, y)
+    if not visibleOK or type(visible) ~= 'boolean' then
+      target.pathPlots, target.pathPlotsReason = A.null, 'Route path visibility unavailable.'
+      return
+    end
+    if visible then plots[#plots + 1] = {position = i, x = x, y = y} end
+  end
+  target.pathPlots = plots
+end
+
+--- The installed TradeRouteChooser (RefreshChooserPanel / CheckTradeRoute) checks destination
+--- X0/Y0 and origin X1/Y1, then requires a nonempty GetTradeRoutePath. Iterate the same city
+--- collections, but gate foreign city coordinates on current plot visibility before reading
+--- identity or asking the engine about legality/path; nothing behind fog enters the result.
+local function tradeRouteTargets(unit, row, pid, player, offset, limit, detail)
+  local targets, total = A.array(), 0
+  local keys = UnitOperationTypes
+  assert(keys and keys.PARAM_X0 and keys.PARAM_Y0 and keys.PARAM_X1 and keys.PARAM_Y1,
+    'Trade-route operation parameters unavailable')
+  assert(type(UnitManager.CanStartOperation) == 'function', 'Trade-route legality query unavailable')
+  assert(type(Cities) == 'table' and type(Cities.GetCityInPlot) == 'function', 'City plot lookup unavailable')
+  local manager = Game.GetTradeManager and Game.GetTradeManager()
+  assert(manager and type(manager.GetTradeRoutePath) == 'function', 'Trade-route path query unavailable')
+  assert(type(Game.GetPlayers) == 'function', 'Player city enumeration unavailable')
+  local originX, originY = unit:GetX(), unit:GetY()
+  local origin = Cities.GetCityInPlot(originX, originY)
+  if origin == nil then return targets, total end -- Native chooser cannot open without an origin city.
+  assert(origin:GetOwner() == pid, 'Trade-route origin is not an owned city')
+  local originOwner, originId = origin:GetOwner(), origin:GetID()
+  local visibility = PlayersVisibility and PlayersVisibility[pid]
+  assert(visibility and type(visibility.IsVisible) == 'function', 'Current plot visibility unavailable')
+  local parameters = {
+    [keys.PARAM_X1] = originX, [keys.PARAM_Y1] = originY,
+  }
+  local function consider(city, x, y)
+    local owner, id = city:GetOwner(), city:GetID()
+    x, y = x or city:GetX(), y or city:GetY()
+    parameters[keys.PARAM_X0], parameters[keys.PARAM_Y0] = x, y
+    local legal = UnitManager.CanStartOperation(unit, row.Hash, nil, parameters)
+    assert(type(legal) == 'boolean', 'Trade-route legality query returned no answer')
+    if not legal then return end
+    local path = manager:GetTradeRoutePath(originOwner, originId, owner, id)
+    if path == nil then return end
+    assert(type(path) == 'table', 'Trade-route path query returned an invalid answer')
+    if #path == 0 then return end
+    total = total + 1
+    if total > offset and total <= offset + limit then
+      local target = {cityId = A.entityId('city', owner, id), owner = owner, x = x, y = y}
+      tradeFact(target, 'name', 'string', function() return A.loc(city:GetName()) end)
+      tradeFact(target, 'distance', 'number', function()
+        return Map.GetPlotDistance(originX, originY, x, y)
+      end)
+      tradeFact(target, 'tradingPost', 'boolean', function()
+        return city:GetTrade():HasActiveTradingPost(originOwner)
+      end)
+      tradeFact(target, 'tradeRouteQuest', 'boolean', function()
+        local quest = GameInfo.Quests and GameInfo.Quests['QUEST_SEND_TRADE_ROUTE']
+        local quests = Game.GetQuestsManager and Game.GetQuestsManager()
+        if not quest or not quests then return nil end
+        return quests:HasActiveQuestFromPlayer(pid, owner, quest.Index)
+      end)
+      target.originYields, target.originYieldsReason =
+        tradeYields(manager, originOwner, originId, owner, id, false)
+      target.destinationYields, target.destinationYieldsReason =
+        tradeYields(manager, originOwner, originId, owner, id, true)
+      target.pathLength = #path
+      if detail == 'full' and limit == 1 then tradePathDetails(target, path, visibility) end
+      targets[#targets + 1] = target
+    end
+  end
+  for _, city in player:GetCities():Members() do consider(city) end
+  -- Keep visibility authority before any foreign city identity or yield/trade API read.
+  for _, other in ipairs(Game.GetPlayers()) do
+    if other:GetID() ~= pid then
+      for _, city in other:GetCities():Members() do
+        local x, y = city:GetX(), city:GetY()
+        local visible = visibility:IsVisible(x, y)
+        assert(type(visible) == 'boolean', 'Current plot visibility query returned no answer')
+        if visible then consider(city, x, y) end
+      end
+    end
+  end
+  return targets, total
 end
 
 --- What the player can actually ask for right now. The full ruleset list is fifty operations and
@@ -79,7 +249,7 @@ local function currentlyRelevant(entries, key, detail, requested)
   return kept, ruled
 end
 
-local function unitOptions(args, pid, detail, offset, limit, wantTargets)
+local function unitOptions(args, pid, player, detail, offset, limit, wantTargets, targetOffset, targetLimit)
   local unit = A.ownedEntity('unit', args.unitId, pid)
   local requested = args.operation
   local operations, commands = {}, {}
@@ -105,11 +275,28 @@ local function unitOptions(args, pid, detail, offset, limit, wantTargets)
         entry.available = A.null
         entry.reason = 'Legality depends on the target; request targets=true or operation="'..short..'".'
         if wantTargets or requested == short then
-          local targets, pairsList = operationTargets(unit, row)
-          if targets then
-            entry.targets = targets
-            entry.available = #targets > 0
-            if detail == 'full' then entry.plotResults = pairsList end
+          if short == 'MAKE_TRADE_ROUTE' then
+            local ok, targets, total = pcall(tradeRouteTargets, unit, row, pid, player, targetOffset, targetLimit, detail)
+            entry.targetOffset = targetOffset
+            if ok then
+              entry.targets, entry.targetsTotal = targets, total
+              entry.targetsMore = total > targetOffset + #targets
+              -- Foreign cities outside current visibility are deliberately not inspected, so
+              -- zero visible destinations cannot prove that the native chooser has no route.
+              entry.available = total > 0 and true or A.null
+              entry.reason = total == 0 and 'No currently visible legal destination; other destinations are unknown.' or nil
+            else
+              entry.targets = A.unavailable('tradeRoutes', 'targets', targets)
+              entry.targetsTotal, entry.targetsMore = A.null, A.null
+              entry.reason = 'Native trade-route destination query unavailable.'
+            end
+          else
+            local targets, pairsList = operationTargets(unit, row)
+            if targets then
+              entry.targets = targets
+              entry.available = #targets > 0
+              if detail == 'full' then entry.plotResults = pairsList end
+            end
           end
         end
       else
@@ -510,11 +697,11 @@ end
 
 function A.options(args)
   args = args or {}
-  local detail, offset, limit, wantTargets = selectors(args)
+  local detail, offset, limit, wantTargets, targetOffset, targetLimit = selectors(args)
   assert(args.operation == nil or (type(args.operation) == 'string' and args.operation ~= ''), 'operation must be a nonempty string')
   assert(args.unitId == nil or args.cityId == nil, 'Pass unitId, cityId, or neither for player scope')
   local pid, player = A.localPlayer()
-  if args.unitId ~= nil then return unitOptions(args, pid, detail, offset, limit, wantTargets) end
+  if args.unitId ~= nil then return unitOptions(args, pid, player, detail, offset, limit, wantTargets, targetOffset, targetLimit) end
   if args.cityId ~= nil then return cityOptions(args, pid, detail, offset, limit, wantTargets) end
   return playerOptions(args, pid, player, detail, offset, limit)
 end

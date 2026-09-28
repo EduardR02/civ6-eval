@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { Type } from "typebox";
 import { createAgentSession, defineTool, DefaultResourceLoader, SessionManager, SettingsManager, type AgentSession, type ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { Api, Model, Usage } from "@earendil-works/pi-ai";
-import type { Arguments, PlayerOptions, TaskRecord } from "./contracts.ts";
+import { defaultReasoningEffort, type Arguments, type PlayerOptions, type TaskRecord } from "./contracts.ts";
 import { playerPrompt } from "./prompts.ts";
 import { createRuntime } from "./player/auth.ts";
 import { emptyUsage, NativeResponses } from "./player/native.ts";
@@ -89,6 +89,7 @@ export class Player {
   private readonly ready: Promise<void>;
   private runtime!: ModelRuntime;
   private model!: Model<Api>;
+  private rotateCodexAccount?: (failedAccountId: string, retryAfterMs?: number) => boolean;
   private calls = 0;
   private active = 0;
   private readonly slotWaiters: SlotWaiter[] = [];
@@ -123,9 +124,11 @@ export class Player {
   }
 
   private async initialize(): Promise<void> {
-    const { runtime, model } = await createRuntime(this.options);
+    const { runtime, model, rotateCodexAccount, startupAccountSwitched } = await createRuntime(this.options);
     this.runtime = runtime;
     this.model = model;
+    this.rotateCodexAccount = rotateCodexAccount;
+    if (startupAccountSwitched) this.options.onEvent?.({ type: "account_switch", agentId: "main", text: "Pinned Codex subscription unavailable; switched to another OMP account", at: new Date().toISOString() });
   }
 
   private newRecord(id: string, name: string, parentId?: string): AgentRecord {
@@ -223,7 +226,7 @@ export class Player {
       this.persist();
       this.emit("usage", record, undefined, { usage, total: record.usage, kind }, requestId);
     };
-    if (nativeLedger) record.native = new NativeResponses(record.id, this.options, this.runtime, this.model, reserveCall, accountUsage);
+    if (nativeLedger) record.native = new NativeResponses(record.id, this.options, this.runtime, this.model, reserveCall, accountUsage, this.rotateCodexAccount);
     /** A declaration is durable provider bookkeeping first and a recorded outcome second: a
      * failed ledger write must never be laundered into a completed task. */
     const finishTask = defineTool({
@@ -253,7 +256,7 @@ export class Player {
     });
     const { session } = await createAgentSession({
       cwd: workspace, agentDir: directory, modelRuntime: this.runtime, model: this.model,
-      thinkingLevel: this.options.effort ?? (this.model.provider === "opencode-go" ? "high" : "xhigh"),
+      thinkingLevel: this.options.effort ?? defaultReasoningEffort(this.model.id),
       settingsManager, resourceLoader, sessionManager, tools: explicit ? ["exec_py", FINISH_TOOL] : ["exec_py"],
       customTools: [{
         name: "exec_py", label: "Python", description: "Execute arbitrary Python in your persistent sandbox. Use display(image) to see images; rpc and agent helpers access game, artifacts, history and same-model subagents. Code may perform real game actions; errors/interruption are never automatically retried.",

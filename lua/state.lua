@@ -92,17 +92,20 @@ function A.localPlayer()
   assert(pid and pid >= 0 and Players[pid], 'No local player. Load an active game; observer/hotseat transition is not supported.')
   return pid, Players[pid]
 end
--- "Ready" mirrors the native rule: awake, still has movement, and not holding a fortify/sleep/skip
--- posture. IsReadyToMove is the engine's own answer (UnitFlagManager/CityBannerManager use it) and
--- only ever narrows the result, so a missing API degrades to the documented composite test.
-local function unitIsReady(unit)
+-- Resting/fortified units are not an order candidate merely because they retain movement. The
+-- native UI uses IsReadyToMove and GetFirstReadyUnit to distinguish them from a unit it wakes for
+-- orders. Fortify turns alone cannot decide: a woken unit may still have positive fortify turns.
+-- If the readiness read is unavailable, keep the answer unknown rather than claiming "ready".
+local function unitMayNeedOrders(unit)
   local activity = A.static('units', UnitManager, 'GetActivityType', unit)
   local moves = A.call('units', unit, 'GetMovesRemaining')
-  local fortify = A.call('units', unit, 'GetFortifyTurns')
-  local awake = ActivityTypes ~= nil and activity == ActivityTypes.ACTIVITY_AWAKE
-  local ready = awake and type(moves) == 'number' and moves > 0 and (fortify == A.null or fortify == 0)
-  if not ready then return false end
-  return A.call('units', unit, 'IsReadyToMove') ~= false
+  if ActivityTypes == nil or ActivityTypes.ACTIVITY_AWAKE == nil or activity == A.null or type(moves) ~= 'number' then
+    return A.null
+  end
+  if activity ~= ActivityTypes.ACTIVITY_AWAKE or moves <= 0 then return false end
+  local nativeReady = A.call('units', unit, 'IsReadyToMove')
+  if type(nativeReady) ~= 'boolean' then return A.null end
+  return nativeReady
 end
 --- What the engine already records as work for this own unit, or nil when it records none:
 --- HasPendingOperations / IsAutomated (Objects.csv Q-UnitHasPendingOperations, Q-UnitIsAutomated)
@@ -120,19 +123,22 @@ local function queuedWorkReason(unit)
   end
   return reason
 end
---- Ready own units, which are candidates for the engine's order blockers and never a verdict:
---- blocker membership itself is not readable from Lua (GetAllEndTurnBlocking returns blocker types).
---- Callers may pass `withWork` to collect, per candidate, what the engine already records for it.
+--- Native-ready own units are candidates for unit-order blockers, not exact blocker membership:
+--- GetAllEndTurnBlocking only returns blocker types. If readiness cannot be read, a blocker with
+--- no known candidate reports unknown rather than a definitive empty unit list.
 local function readyUnitIds(pid, player, withWork)
-  local out = A.array()
+  local out, uncertain = A.array(), false
   for _, unit in player:GetUnits():Members() do
-    if unitIsReady(unit) then
+    local ready = unitMayNeedOrders(unit)
+    if ready == A.null then uncertain = true end
+    if ready == true then
       local uid = id('unit', pid, unit:GetID())
       out[#out+1] = uid
       local reason = queuedWorkReason(unit)
       if reason and withWork then withWork[#withWork+1] = {id=uid, reason=reason} end
     end
   end
+  if #out == 0 and uncertain then return A.null end
   return out
 end
 local function idleProductionCityIds(pid, player)
@@ -430,7 +436,8 @@ local function unitRecord(unit, own)
     extra.activity=A.enumName('ActivityTypes',ActivityTypes,A.static('units',UnitManager,'GetActivityType',unit))
     for key,value in pairs(extra) do result[key]=value end
     assert(type(result.moves)=='number' and type(result.maxMoves)=='number','Core unit movement extraction failed')
-    result.ready = unitIsReady(unit)
+    -- `ready` follows native order readiness; it is not exact end-turn blocker membership.
+    result.ready = unitMayNeedOrders(unit)
     -- Queued work and trader state sit beside readiness: readiness alone never says whether the unit
     -- already has an order the engine is walking.
     result.order = A.section('unitOrder',function() return unitOrder(unit) end)

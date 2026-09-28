@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { resolve, join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { validateApiRates, type ApiRates } from "./usage.ts";
-import { validateRequestLimits, type CompletionMode, type RequestLimits } from "./contracts.ts";
+import { defaultReasoningEffort, validateRequestLimits, type CompletionMode, type RequestLimits } from "./contracts.ts";
 
 export interface Config {
   model: string;
@@ -31,10 +31,10 @@ export interface Config {
 }
 export async function loadConfig(projectRoot: string, filename?: string): Promise<Config> {
   const config: Config = {
-    model: "gpt-6-astra", provider: "codex", effort: "high",
+    model: "gpt-6-astra", provider: "codex", effort: defaultReasoningEffort("gpt-6-astra"),
     authPath: join(homedir(), ".omp", "agent", "agent.db"), pythonPath: resolve(projectRoot, ".venv/Scripts/python.exe"),
     distro: "Ubuntu-24.04", tunerHost: "127.0.0.1", tunerPort: 4318,
-    maxConcurrentAgents: 4, maxModelCalls: 200, compactThreshold: 180000,
+    maxConcurrentAgents: 4, maxModelCalls: 200, compactThreshold: 272000,
     completionMode: "explicit",
     knowledge: "uncoached",
     expertGuidePath: resolve(projectRoot, "guides/herson-bbg/SKILL.md"),
@@ -48,6 +48,7 @@ export async function loadConfig(projectRoot: string, filename?: string): Promis
   for (const key of Object.keys(raw)) if (!Object.hasOwn(config, key) && key !== "baseUrl" && key !== "apiRates" && key !== "compactThresholds" && key !== "requestLimits") throw new Error(`Unknown configuration key: ${key}`);
   Object.assign(config, raw);
   if (raw.provider === "opencode-go" && raw.model === undefined) config.model = "glm-5.3-flash";
+  if (raw.effort === undefined) config.effort = defaultReasoningEffort(config.model);
   if (!["openai", "codex", "opencode-go"].includes(config.provider)) throw new Error("provider must be openai, codex or opencode-go");
   if (!["low", "medium", "high", "xhigh", "max"].includes(config.effort)) throw new Error("Invalid reasoning effort");
   for (const key of ["model", "authPath", "pythonPath", "distro", "tunerHost", "runsDir", "expertGuidePath"] as const) {

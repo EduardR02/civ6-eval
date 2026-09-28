@@ -102,6 +102,12 @@ local function operationParameters(spec, args, pid, unit)
   end
   if wantsX then coordinates(args.x, args.y, pid, spec.target == 'visible_coordinate') end
   if wantsY then coordinates(args.destinationX, args.destinationY, pid, spec.target == 'visible_coordinate') end
+  if spec == A.unitOperationSpecs.MAKE_TRADE_ROUTE then
+    -- TradeRouteChooser.lua:829-835 sends the trader's current tile as the origin, in addition
+    -- to destination X0/Y0, for both its legality check and its request.
+    parameters[A.param(UnitOperationTypes, 'PARAM_X1')] = unit:GetX()
+    parameters[A.param(UnitOperationTypes, 'PARAM_Y1')] = unit:GetY()
+  end
   if spec.currentPlot and unit ~= nil and type(UnitOperationTypes) == 'table'
     and UnitOperationTypes.PARAM_X ~= nil and UnitOperationTypes.PARAM_Y ~= nil then
     -- Native build operations carry the unit's own tile (GetBuildImprovementParameters, UnitPanel.lua:346-351).

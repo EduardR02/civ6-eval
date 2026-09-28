@@ -440,3 +440,250 @@ test("Great Person activation and order cancel dispatch as parameterless native 
     assert(live.deferred == false and #live.plots > 0)
   `);
 });
+
+test("trade-route discovery uses native legality and path, and never looks up fogged foreign cities", () => {
+  scenario(`
+    local A = AstraCiv
+    local query = {unitId='test:unit:0:7'}
+    local quiet = A.options(query)
+    local trade
+    for _, op in ipairs(quiet.operations) do if op.op == 'MAKE_TRADE_ROUTE' then trade = op end end
+    assert(trade and trade.targets == nil and trade.available == A.null)
+    for _, call in ipairs(STUB_TRACE()) do
+      assert(call.call ~= 'TradeManager.GetTradeRoutePath', 'default options unexpectedly scanned routes')
+      assert(not call.call:find('TradeManager.Calculate', 1, true), 'default options unexpectedly computed yields')
+      assert(call.call ~= 'UnitManager.GetOperationTargets' or call.data.operation ~= 2013,
+        'trade routes must not use generic plot target discovery')
+    end
+
+    -- The foreign city is present in the native player's city collection, but its identity
+    -- getters fail under fog. Revealed does not imply currently visible.
+    STUB_VISIBLE['2,0'] = true
+    local ownAndMinor = A.options({unitId=query.unitId, operation='MAKE_TRADE_ROUTE'})
+    trade = ownAndMinor.operations[1]
+    assert(trade.available == true and trade.targetsTotal == 2 and trade.targetsMore == false)
+    assert(trade.targets[1].cityId == 'test:city:0:3' and trade.targets[2].cityId == 'test:city:2:11')
+    assert(trade.targets[2].x == 2 and trade.targets[2].y == 0)
+    assert(trade.targets[1].name == 'LOC_TEST_CITY' and trade.targets[1].originYields[1].value == 5)
+    for _, call in ipairs(STUB_TRACE()) do
+      if call.call == 'UnitManager.CanStartOperation' and call.data.operation == 2013 then
+        assert(call.data.parameters[UnitOperationTypes.PARAM_X0] ~= 2
+          or call.data.parameters[UnitOperationTypes.PARAM_Y0] ~= 2,
+          'fogged foreign city was checked for route legality')
+      end
+    end
+
+    STUB_VISIBLE['2,2'] = true
+    STUB_TRADE_LEGAL['2,0'] = false
+    local legal = A.options({unitId=query.unitId, operation='MAKE_TRADE_ROUTE', targetLimit=1, limit=1})
+    trade = legal.operations[1]
+    assert(legal.offset == 0 and legal.more == false, 'target paging must not page operation entries')
+    assert(trade.targetsTotal == 2 and #trade.targets == 1 and trade.targetsMore == true)
+    assert(trade.targets[1].cityId == 'test:city:0:3' and trade.targetOffset == 0)
+    local second = A.options({unitId=query.unitId, operation='MAKE_TRADE_ROUTE', targetOffset=1, targetLimit=1})
+    trade = second.operations[1]
+    assert(trade.targetsTotal == 2 and trade.targetOffset == 1 and trade.targetsMore == false)
+    assert(#trade.targets == 1 and trade.targets[1].cityId == 'test:city:1:12')
+    local beyond = A.options({unitId=query.unitId, operation='MAKE_TRADE_ROUTE', targetOffset=3, targetLimit=1})
+    assert(#beyond.operations[1].targets == 0 and beyond.operations[1].targetsMore == false)
+    -- A legal operation with no route path is NOT a destination the chooser would show.
+    STUB_TRADE_PATHS['1:12'] = nil
+    local pathless = A.options({unitId=query.unitId, operation='MAKE_TRADE_ROUTE'})
+    assert(pathless.operations[1].targetsTotal == 1)
+    STUB_TRADE_LEGAL['1,1'] = false
+    local empty = A.options({unitId=query.unitId, operation='MAKE_TRADE_ROUTE'})
+    assert(empty.operations[1].available == A.null and empty.operations[1].targetsTotal == 0,
+      'No visible destination is not proof that a fogged city cannot receive a route')
+    assert(#empty.operations[1].targets == 0 and empty.operations[1].targetsMore == false)
+  `);
+});
+
+test("trade-route page reports the chooser's native yield totals and only public destination facts", () => {
+  scenario(`
+    local A = AstraCiv
+    STUB_VISIBLE['2,0'] = true
+    STUB_VISIBLE['2,2'] = true
+    local page = A.options({unitId='test:unit:0:7', operation='MAKE_TRADE_ROUTE'}).operations[1]
+    assert(page.available == true and page.targetsTotal == 3)
+    local byOwner = {}
+    for _, target in ipairs(page.targets) do byOwner[target.owner] = target end
+    local own, minor, foreign = byOwner[0], byOwner[2], byOwner[1]
+    assert(own.owner == 0 and own.name == 'LOC_TEST_CITY' and own.distance == 0)
+    assert(own.tradingPost == false and own.tradeRouteQuest == false)
+    assert(own.originYields[1].yield == 'YIELD_FOOD' and own.originYields[1].value == 5)
+    assert(own.originYields[2].yield == 'YIELD_GOLD' and own.originYields[2].value == 8)
+    assert(#own.originYields == 2 and own.destinationYields[1].yield == 'YIELD_GOLD'
+      and own.destinationYields[1].value == 4 and own.destinationYields[2].yield == 'YIELD_FAITH'
+      and own.destinationYields[2].value == 3,
+      'a complete sparse array omits genuine zeroes without international multipliers')
+    assert(minor.owner == 2 and minor.name == 'LOC_TEST_CITY_STATE')
+    assert(minor.tradeRouteQuest == true and minor.tradingPost == false)
+    assert(minor.originYields[1].value == 7.5 and minor.originYields[2].value == 16)
+    assert(minor.destinationYields[1].value == 5 and minor.destinationYields[2].value == 3,
+      'city-state destination must use its own receiving-player multiplier')
+    assert(foreign.owner == 1 and foreign.name == 'LOC_FOREIGN_CITY' and foreign.distance == 1)
+    assert(foreign.tradingPost == true and foreign.tradeRouteQuest == false)
+    assert(foreign.originYields[2].value == 16 and foreign.destinationYields[1].value == 12)
+    assert(foreign.destinationYields[2].value == 6)
+    assert(foreign.pathLength == 2 and foreign.pathPlots == nil and foreign.pathMore == nil)
+
+    local calls = 0
+    for _, call in ipairs(STUB_TRACE()) do
+      if call.call == 'TradeManager.CalculateOriginYieldsFromPotentialRoute' then
+        calls = calls + 1
+        assert(call.data.originOwner == 0 and call.data.originId == 3)
+      end
+    end
+    assert(calls == 3, 'yield calculation must occur on returned targets, not hidden cities')
+    STUB_TRADE_YIELDS.Origin.YieldsFromModifiers[3] = -2
+    local negative = A.options({unitId='test:unit:0:7', operation='MAKE_TRADE_ROUTE', targetLimit=1})
+      .operations[1].targets[1].originYields
+    assert(#negative == 3 and negative[3].yield == 'YIELD_FAITH' and negative[3].value == -2,
+      'negative yields remain observable and unmultiplied')
+    STUB_TRADE_YIELDS.Origin.YieldsFromPotentialRoute = {0, 0, 0}
+    STUB_TRADE_YIELDS.Origin.YieldsFromPath = {0, 0, 0}
+    STUB_TRADE_YIELDS.Origin.YieldsFromModifiers = {0, 0, 0}
+    local zero = A.options({unitId='test:unit:0:7', operation='MAKE_TRADE_ROUTE', targetLimit=1})
+      .operations[1].targets[1]
+    assert(zero.originYields ~= A.null and #zero.originYields == 0 and zero.originYieldsReason == nil,
+      'a complete zero-yield answer differs from an unavailable yield API')
+  `);
+});
+
+test("missing native trade facts remain unknown without removing legal destinations", () => {
+  scenario(`
+    local A = AstraCiv
+    STUB_VISIBLE['2,2'] = true
+    local manager = Game.GetTradeManager()
+    local oldPathYields = manager.CalculateOriginYieldsFromPath
+    manager.CalculateOriginYieldsFromPath = nil
+    local oldTrade = Players[1].GetTrade
+    Players[1].GetTrade = nil
+    local oldQuests = Game.GetQuestsManager
+    Game.GetQuestsManager = nil
+    local target = A.options({
+      unitId='test:unit:0:7', operation='MAKE_TRADE_ROUTE', targetOffset=1, targetLimit=1,
+    }).operations[1]
+    assert(target.available == true and target.targetsTotal == 2 and #target.targets == 1)
+    local foreign = target.targets[1]
+    assert(foreign.cityId == 'test:city:1:12' and foreign.name == 'LOC_FOREIGN_CITY')
+    assert(foreign.originYields == A.null and foreign.originYieldsReason:find('CalculateOriginYieldsFromPath', 1, true))
+    assert(foreign.destinationYields == A.null and foreign.destinationYieldsReason:find('modifier', 1, true))
+    assert(foreign.tradeRouteQuest == A.null and foreign.tradeRouteQuestReason)
+    assert(foreign.tradingPost == true and foreign.distance == 1)
+    manager.CalculateOriginYieldsFromPath = oldPathYields
+    Players[1].GetTrade = oldTrade
+    Game.GetQuestsManager = oldQuests
+    STUB_TRADE_YIELDS.Origin.YieldsFromPath = {1}
+    local partial = A.options({unitId='test:unit:0:7', operation='MAKE_TRADE_ROUTE'}).operations[1].targets[1]
+    assert(partial.originYields == A.null and partial.originYieldsReason:find('components', 1, true),
+      'a missing yield position cannot silently become zero')
+  `);
+});
+
+test("detailed trade paths are bounded to one destination and omit fogged coordinates", () => {
+  scenario(`
+    local A = AstraCiv
+    STUB_VISIBLE['2,2'] = true
+    STUB_TRADE_PATHS['1:12'] = {4, 6, 8} -- 6 is revealed but currently fogged.
+    local many = A.options({unitId='test:unit:0:7', operation='MAKE_TRADE_ROUTE', detail='full'})
+    assert(many.operations[1].targets[2].pathLength == 3 and many.operations[1].targets[2].pathPlots == nil)
+    local one = A.options({
+      unitId='test:unit:0:7', operation='MAKE_TRADE_ROUTE', detail='full', targetOffset=1, targetLimit=1,
+    }).operations[1].targets[1]
+    assert(one.pathLength == 3 and one.pathMore == false and #one.pathPlots == 2)
+    assert(one.pathPlots[1].position == 1 and one.pathPlots[1].x == 1)
+    assert(one.pathPlots[2].position == 3 and one.pathPlots[2].x == 2)
+    local long = {}
+    for i = 1, 70 do long[i] = i % 2 == 0 and 6 or 4 end
+    STUB_TRADE_PATHS['1:12'] = long
+    local capped = A.options({
+      unitId='test:unit:0:7', operation='MAKE_TRADE_ROUTE', detail='full', targetOffset=1, targetLimit=1,
+    }).operations[1].targets[1]
+    assert(capped.pathLength == 70 and capped.pathMore == true and #capped.pathPlots == 32)
+    assert(capped.pathPlots[#capped.pathPlots].position == 63)
+    STUB_TRADE_PATHS['1:12'] = {4, 999, 8}
+    local unreadable = A.options({
+      unitId='test:unit:0:7', operation='MAKE_TRADE_ROUTE', detail='full', targetOffset=1, targetLimit=1,
+    }).operations[1].targets[1]
+    assert(unreadable.cityId == 'test:city:1:12' and unreadable.pathLength == 3)
+    assert(unreadable.pathPlots == A.null and unreadable.pathPlotsReason)
+  `);
+});
+
+test("trade-route query failures are unavailable rather than an empty legal destination list", () => {
+  scenario(`
+    local A = AstraCiv
+    local query = {unitId='test:unit:0:7', operation='MAKE_TRADE_ROUTE'}
+    local nativeManager = Game.GetTradeManager
+    Game.GetTradeManager = nil
+    local missing = A.options(query).operations[1]
+    assert(missing.available == A.null and missing.targets == A.null)
+    assert(missing.targetsTotal == A.null and missing.targetsMore == A.null and missing.targetOffset == 0)
+    assert(missing.reason:find('unavailable', 1, true))
+    Game.GetTradeManager = function() return {
+      GetTradeRoutePath = function() error('native route query failed') end,
+    } end
+    local failed = A.options(query).operations[1]
+    assert(failed.available == A.null and failed.targets == A.null and failed.targetsTotal == A.null)
+    Game.GetTradeManager = nativeManager
+    PlayersVisibility[0].IsVisible = function() return nil end
+    local unknownVisibility = A.options(query).operations[1]
+    assert(unknownVisibility.available == A.null and unknownVisibility.targetsTotal == A.null)
+    local invalidOffset = pcall(A.options, {unitId=query.unitId, targetOffset=-1})
+    local invalidLimit = pcall(A.options, {unitId=query.unitId, targetLimit=51})
+    assert(not invalidOffset and not invalidLimit)
+  `);
+});
+
+test("trade-route submission sends the same origin and destination parameters as the native chooser", () => {
+  scenario(`
+    STUB_VISIBLE['2,2'] = true
+    local result = AstraCiv.action({
+      type='unit_operation', unitId='test:unit:0:7', operation='MAKE_TRADE_ROUTE',
+      destinationX=2, destinationY=2,
+    })
+    assert(result.accepted == true and result.status == 'submitted')
+    local check, request
+    for _, call in ipairs(STUB_TRACE()) do
+      if call.call == 'UnitManager.CanStartOperation' and call.data.operation == 2013 then check = call.data.parameters end
+      if call.call == 'UnitManager.RequestOperation' and call.data.operation == 2013 then request = call.data.parameters end
+    end
+    assert(check and request)
+    for _, params in ipairs({check, request}) do
+      assert(params[UnitOperationTypes.PARAM_X0] == 2 and params[UnitOperationTypes.PARAM_Y0] == 2)
+      assert(params[UnitOperationTypes.PARAM_X1] == 1 and params[UnitOperationTypes.PARAM_Y1] == 1)
+    end
+  `);
+});
+
+test("trade-route target pagination defaults to twenty and caps the requested page at fifty", () => {
+  scenario(`
+    -- The fixture's small map cannot contain 55 real cities. Supply distinct own-city identities
+    -- at a known own plot to exercise only the result bound, not Civ map generation rules.
+    local player = Players[0]
+    local originalCities = player.GetCities
+    player.GetCities = function(self)
+      local original = originalCities(self)
+      local cities = {original:FindID(3)}
+      for id = 100, 153 do
+        cities[#cities + 1] = {
+          GetOwner = function() return 0 end,
+          GetID = function() return id end,
+          GetX = function() return 1 end,
+          GetY = function() return 1 end,
+        }
+      end
+      return {Members = function() return ipairs(cities) end}
+    end
+    Game.GetTradeManager = function() return {GetTradeRoutePath = function() return {4} end} end
+    local args = {unitId='test:unit:0:7', operation='MAKE_TRADE_ROUTE'}
+    local first = AstraCiv.options(args).operations[1]
+    assert(first.targetsTotal == 55 and #first.targets == 20 and first.targetsMore == true)
+    assert(first.targetOffset == 0 and first.targets[20].cityId == 'test:city:0:118')
+    args.targetOffset, args.targetLimit = 20, 50
+    local remaining = AstraCiv.options(args).operations[1]
+    assert(remaining.targetsTotal == 55 and #remaining.targets == 35 and remaining.targetsMore == false)
+    assert(remaining.targets[1].cityId == 'test:city:0:119')
+  `);
+});

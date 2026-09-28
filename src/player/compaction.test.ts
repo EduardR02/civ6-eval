@@ -11,11 +11,13 @@ import { saveJson } from "./storage.ts";
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); });
 
-function fixture(compactionEvents: unknown[]) {
+function fixture(compactionEvents: unknown[], modelId = "fixture", inputTokens = 101, compactThreshold: number | undefined = modelId === "fixture" ? 100 : undefined, effort?: "high" | "max") {
   const runDir = mkdtempSync(join(tmpdir(), "civ-compaction-"));
-  let input: unknown;
+  const requests: { body: { input: Record<string, unknown>[]; reasoning: { effort: string } }; version: string | null }[] = [];
+  let input: Record<string, unknown>[] | undefined;
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: async request => {
-    const body = await request.json() as { input: Record<string, unknown>[] };
+    const body = await request.json() as { input: Record<string, unknown>[]; reasoning: { effort: string } };
+    requests.push({ body, version: request.headers.get("version") });
     const compact = body.input.at(-1)?.type === "compaction_trigger";
     if (!compact) input = body.input;
     const events = compact ? compactionEvents : [{ type: "response.completed", response: { status: "completed", output: [] } }];
@@ -24,12 +26,12 @@ function fixture(compactionEvents: unknown[]) {
   cleanups.push(() => { server.stop(true); rmSync(runDir, { recursive: true, force: true }); });
   const token = `fixture.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture" } })).toString("base64url")}.fixture`;
   const runtime = { getAuth: async () => ({ auth: { apiKey: token } }) } as unknown as ModelRuntime;
-  const model: Model<Api> = { id: "fixture", name: "fixture", provider: "openai-codex", api: "openai-codex-responses", baseUrl: `http://127.0.0.1:${server.port}`, reasoning: true, input: ["text"], contextWindow: 10000, maxTokens: 1000, cost: { input: 10, output: 10, cacheRead: 10, cacheWrite: 10 } };
+  const model: Model<Api> = { id: modelId, name: modelId, provider: "openai-codex", api: "openai-codex-responses", baseUrl: `http://127.0.0.1:${server.port}`, reasoning: true, input: ["text"], contextWindow: 272000, maxTokens: 128000, cost: { input: 10, output: 10, cacheRead: 10, cacheWrite: 10 } };
   const path = join(runDir, "player", "agents", "main", "native.json");
   const user = { role: "user", content: [{ type: "input_text", text: "Current request" }] };
-  saveJson(path, { version: 1, items: [user], seenInputs: [], completedCalls: ["old_call"], inputTokens: 101, compactions: 0, totalUsage: emptyUsage() });
-  const create = () => new NativeResponses("main", { runDir, projectRoot: process.cwd(), compactThreshold: 100, rpc: async () => ({}), execute: async () => ({ content: [] }) }, runtime, model, () => {}, () => {});
-  return { create, path, user, input: () => input };
+  saveJson(path, { version: 1, items: [user], seenInputs: [], completedCalls: ["old_call"], inputTokens, compactions: 0, totalUsage: emptyUsage() });
+  const create = () => new NativeResponses("main", { runDir, projectRoot: process.cwd(), compactThreshold, effort, rpc: async () => ({}), execute: async () => ({ content: [] }) }, runtime, model, () => {}, () => {});
+  return { create, path, user, input: () => input, requests };
 }
 
 test("streamed compaction merges late identity metadata and preserves the request without subscription API charges", async () => {
@@ -58,6 +60,36 @@ test("failed streamed compaction cannot replace context or authorize a tool", as
   expect(input()).toBeUndefined();
   expect(JSON.parse(readFileSync(path, "utf8")).items).toEqual([user]);
   expect(() => native.executionStarted("call_fixture|fc_fixture", {})).toThrow("no durable native call identity");
+});
+
+test("Astra, Sol and Luna compact at exactly 272000 tokens with model reasoning preserved on both requests", async () => {
+  const compacted = { type: "compaction", encrypted_content: "opaque-fixture" };
+  const events = [{ type: "response.output_item.done", output_index: 0, item: compacted }, { type: "response.completed", response: { status: "completed", output: [] } }];
+  for (const modelId of ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]) {
+    const { create, path, requests } = fixture(events, modelId, 271999);
+    expect((await create().stream({ messages: [] }).result()).stopReason).toBe("stop");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.body.input.at(-1)?.type).not.toBe("compaction_trigger");
+    const saved = JSON.parse(readFileSync(path, "utf8"));
+    saveJson(path, { ...saved, inputTokens: 272000 });
+    expect((await create().stream({ messages: [] }).result()).stopReason).toBe("stop");
+    expect(requests).toHaveLength(3);
+    expect(requests[1]!.body.input.at(-1)).toEqual({ type: "compaction_trigger" });
+    expect(requests[2]!.body.input).toEqual([saved.items[0], compacted]);
+    expect(requests.map(request => request.version)).toEqual(["0.155.1", "0.155.1", "0.155.1"]);
+    expect(requests.map(request => request.body.reasoning.effort)).toEqual(Array(3).fill(modelId === "gpt-6-luna" ? "max" : "high"));
+  }
+});
+
+test("explicit native threshold and effort override Luna defaults without clamping to context minus output", async () => {
+  const { create, requests } = fixture([
+    { type: "response.output_item.done", output_index: 0, item: { type: "compaction", encrypted_content: "opaque-fixture" } },
+    { type: "response.completed", response: { status: "completed", output: [] } },
+  ], "gpt-6-luna", 271999, 271999, "high");
+  expect((await create().stream({ messages: [] }).result()).stopReason).toBe("stop");
+  expect(requests).toHaveLength(2);
+  expect(requests[0]!.body.input.at(-1)).toEqual({ type: "compaction_trigger" });
+  expect(requests.map(request => request.body.reasoning.effort)).toEqual(["high", "high"]);
 });
 
 type NativeItem = Record<string, unknown>;

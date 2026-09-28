@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { calculateCost, createAssistantMessageEventStream, type Api, type AssistantMessage, type Context, type Model, type SimpleStreamOptions, type Usage } from "@earendil-works/pi-ai";
 import { processResponsesStream } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import type { Content, PlayerOptions } from "../contracts.ts";
+import { defaultReasoningEffort, type Content, type PlayerOptions } from "../contracts.ts";
 import { ELIDED_IMAGE_TEXT, elision, elisionPlan, resolveRequestLimits, serializedBytes, type Elision, type ResolvedLimits } from "./limits.ts";
 import { journal, loadJson, privateDirectory, saveJson } from "./storage.ts";
 type ResponseStreamEvent = Parameters<typeof processResponsesStream>[0] extends AsyncIterable<infer Event> ? Event : never;
@@ -81,6 +81,41 @@ function imageParts(item: Item): Item[] {
   if (Array.isArray(item.output)) return item.output;
   return [];
 }
+/** Codex quota is account-local; a generic 429 can instead be a brief throttle. */
+function codexQuotaResponse(status: number, body: string): boolean {
+  if (status !== 429 && status !== 403) return false;
+  if (!body.trim()) return false;
+  let code: unknown;
+  try {
+    const parsed = JSON.parse(body);
+    code = parsed?.error?.code ?? parsed?.error?.type ?? parsed?.code ?? parsed?.type;
+  } catch { /* Some Codex errors are plain text. */ }
+  if (typeof code === "string" && ["usage_limit_reached", "usage_not_included", "limit_reached", "insufficient_quota"].includes(code)) return true;
+  if (typeof code === "string" && ["rate_limit_exceeded", "rate_limit_reached", "rate_limit_error"].includes(code)) return false;
+  if (/\b(?:concurren\w*|per[- ](?:second|minute)|too many requests)\b/i.test(body)) return false;
+  return /\b(?:usage[_ -]?limit[_ -]?reached|usage[_ -]?not[_ -]?included|insufficient[_ -]?quota|quota[_ -]?(?:exceeded|exhausted)|subscription.{0,40}(?:limit|cap)|(?:limit|cap).{0,40}subscription)\b/i.test(body);
+}
+/** Error pages are untrusted and may be large or echo credentials; only inspect a bounded prefix. */
+async function readQuotaErrorDetail(response: Response): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let remaining = 16_384;
+  try {
+    while (remaining > 0) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const part = value.subarray(0, remaining);
+      text += decoder.decode(part, { stream: true });
+      remaining -= part.byteLength;
+    }
+    return text + decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
 
 /** The Pi transcript is a UI/tool-execution projection, NEVER the source for assistant replay.
  * Canonical inputs are raw provider output items, including unknown/opaque item types.
@@ -101,7 +136,7 @@ export class NativeResponses {
   /** Items already handed to the transport; the boundary between seen history and fresh results. */
   private sentItems: number;
 
-  constructor(private readonly id: string, private readonly options: PlayerOptions, private readonly runtime: ModelRuntime, private readonly model: Model<Api>, private readonly reserveCall: (kind: string, requestId: string) => void, private readonly accountUsage: (usage: Usage, kind: string, requestId: string) => void) {
+  constructor(private readonly id: string, private readonly options: PlayerOptions, private readonly runtime: ModelRuntime, private readonly model: Model<Api>, private readonly reserveCall: (kind: string, requestId: string) => void, private readonly accountUsage: (usage: Usage, kind: string, requestId: string) => void, private readonly rotateCodexAccount?: (failedAccountId: string, retryAfterMs?: number) => boolean) {
     const directory = join(options.runDir, "player", "agents", id);
     privateDirectory(directory);
     this.path = join(directory, "native.json");
@@ -286,6 +321,7 @@ export class NativeResponses {
           headers.set("chatgpt-account-id", account);
         }
         headers.set("OpenAI-Beta", "responses=experimental");
+        headers.set("version", "0.155.1");
         headers.set("originator", "pi");
         headers.set("User-Agent", "civ6-player/pi-0.84.4");
         headers.set("session-id", sessionId);
@@ -338,40 +374,59 @@ export class NativeResponses {
     // sides of this assignment stay on the concrete generic rather than the wider ArrayBufferLike.
     let encoded: Buffer<ArrayBuffer> = Buffer.from(JSON.stringify(body), "utf8");
     if (this.limits.maxBytes !== undefined && encoded.byteLength > this.limits.maxBytes) encoded = this.fitByteLimit(kind, body, encoded);
-    const headers = await this.headers(signal);
-    const id = randomUUID();
-    this.reserveCall(kind, id);
-    this.activeRequest = { id, kind, reported: false };
-    this.state.inFlight = { id, kind };
-    // The body is built and about to be dispatched, so this is the durable boundary: everything in
-    // the ledger is now sent history, and only later appends can be fresh.
-    this.sentItems = this.state.items.length;
-    this.save();
-    // Header values are deliberately absent: even account identifiers remain private to transport.
-    const endpoint = this.endpoint() + (kind === "compact" && this.model.provider === "openai" ? "/compact" : "");
-    // The full input is already durable in native.json; the journal records the request envelope
-    // plus only the items this call appended. A restart re-journals from zero, re-establishing the
-    // baseline. In-place rewrites (see enforceImageBudget) are reported by their own record.
-    const input = Array.isArray(body.input) ? body.input as Item[] : [];
-    // Transient summary instructions and compaction triggers are not ledger items.
-    const appended = this.state.items.slice(this.journalledItems);
-    const instructions = typeof body.instructions === "string" ? body.instructions : "";
-    journal(this.logPath, {
-      kind: "request", id, operation: kind, endpoint, headerNames: [...headers.keys()],
-      items: input.length, bytes: encoded.byteLength, appendedFrom: this.journalledItems, appended,
-      instructionsBytes: Buffer.byteLength(instructions, "utf8"),
-      instructionsHash: createHash("sha256").update(instructions).digest("hex"),
-    });
-    this.journalledItems = this.state.items.length;
-    const response = await fetch(endpoint, { method: "POST", headers, body: encoded, signal });
-    if (!response.ok) {
-      // Error pages can be huge and can echo credentials. Status is the useful,
-      // safe diagnostic; never persist or promote arbitrary response bodies.
-      await response.body?.cancel();
-      journal(this.logPath, { kind: "http_error", id, status: response.status });
-      throw new Error(`${this.model.provider} ${kind} HTTP ${response.status}. No automatic retry was performed.`);
+    const attempted = new Set<string>();
+    for (;;) {
+      const headers = await this.headers(signal);
+      const account = this.model.provider === "openai-codex" ? headers.get("chatgpt-account-id") : null;
+      if (account && attempted.has(account)) throw new Error("Codex quota failover returned to an exhausted account; no request was replayed.");
+      const id = randomUUID();
+      this.reserveCall(kind, id);
+      this.activeRequest = { id, kind, reported: false };
+      this.state.inFlight = { id, kind };
+      // The body is built and about to be dispatched, so this is the durable boundary: everything in
+      // the ledger is now sent history, and only later appends can be fresh.
+      this.sentItems = this.state.items.length;
+      this.save();
+      // Header values are deliberately absent: even account identifiers remain private to transport.
+      const endpoint = this.endpoint() + (kind === "compact" && this.model.provider === "openai" ? "/compact" : "");
+      // The full input is already durable in native.json; the journal records the request envelope
+      // plus only the items this call appended. A restart re-journals from zero, re-establishing the
+      // baseline. In-place rewrites (see enforceImageBudget) are reported by their own record.
+      const input = Array.isArray(body.input) ? body.input as Item[] : [];
+      // Transient summary instructions and compaction triggers are not ledger items.
+      const appended = this.state.items.slice(this.journalledItems);
+      const instructions = typeof body.instructions === "string" ? body.instructions : "";
+      journal(this.logPath, {
+        kind: "request", id, operation: kind, endpoint, headerNames: [...headers.keys()],
+        items: input.length, bytes: encoded.byteLength, appendedFrom: this.journalledItems, appended,
+        instructionsBytes: Buffer.byteLength(instructions, "utf8"),
+        instructionsHash: createHash("sha256").update(instructions).digest("hex"),
+      });
+      this.journalledItems = this.state.items.length;
+      const response = await fetch(endpoint, { method: "POST", headers, body: encoded, signal });
+      if (response.ok) return response;
+      // Inspect only a quota failure's response body, never persist it: errors may echo credentials.
+      const inspect = !!this.rotateCodexAccount && !!account && (response.status === 429 || response.status === 403);
+      const detail = inspect ? await readQuotaErrorDetail(response) : "";
+      if (!inspect) await response.body?.cancel();
+      const quota = inspect && codexQuotaResponse(response.status, detail);
+      journal(this.logPath, { kind: "http_error", id, status: response.status, quota: !!quota });
+      this.finishRequest("failed");
+      delete this.state.inFlight;
+      this.save();
+      if (quota && account) {
+        attempted.add(account);
+        const retryAfter = response.headers.get("retry-after");
+        const seconds = retryAfter === null ? NaN : Number(retryAfter);
+        const delay = Number.isFinite(seconds) ? seconds * 1000 : retryAfter ? Date.parse(retryAfter) - Date.now() : NaN;
+        if (this.rotateCodexAccount!(account, Number.isFinite(delay) && delay >= 0 ? delay : undefined)) {
+          journal(this.logPath, { kind: "account_switch", id, reason: "quota", operation: kind });
+          this.options.onEvent?.({ type: "account_switch", agentId: this.id, text: "Codex quota exhausted; switched subscription account", at: new Date().toISOString() });
+          continue; // No response items or tool calls were produced; retry the identical native body.
+        }
+      }
+      throw new Error(`${this.model.provider} ${kind} HTTP ${response.status}. No further automatic retry was performed.`);
     }
-    return response;
   }
 
   private async streamedCompaction(response: Response, signal: AbortSignal): Promise<{ result: Item; output: Item[] }> {
@@ -404,7 +459,8 @@ export class NativeResponses {
   }
 
   private async compact(context: Context, signal: AbortSignal): Promise<void> {
-    const threshold = this.options.compactThreshold ?? Math.floor(this.model.contextWindow * 0.65);
+    const gpt6 = this.model.id === "gpt-6-astra" || this.model.id === "gpt-6-sol" || this.model.id === "gpt-6-luna";
+    const threshold = this.options.compactThreshold ?? (gpt6 && (this.model.provider === "openai-codex" || this.model.provider === "openai") ? 272_000 : Math.floor(this.model.contextWindow * 0.65));
     if (this.state.inputTokens < threshold) return;
     if (this.state.items.some(item => (item.type === "function_call" || item.type === "custom_tool_call") && !this.completed.has(item.call_id as string))) throw new Error("Compaction requires completed durable tool results; original context is intact.");
     let compacted: Item[];
@@ -422,7 +478,7 @@ export class NativeResponses {
         model: this.model.id, instructions: context.systemPrompt,
         input: [...this.state.items, { role: "user", content: [{ type: "input_text", text: COMPACTION_INSTRUCTIONS }, { type: "input_text", text: COMPACTION_REQUEST }] }],
         stream: true, store: false, include: ["reasoning.encrypted_content"],
-        reasoning: { effort: this.options.effort ?? "high", summary: "auto" },
+        reasoning: { effort: this.options.effort ?? defaultReasoningEffort(this.model.id), summary: "auto" },
         max_output_tokens: this.model.maxTokens,
       }, signal);
       const summary = await this.streamedCompaction(response, signal);
@@ -448,7 +504,7 @@ export class NativeResponses {
         model: this.model.id, instructions: context.systemPrompt,
         input: [...this.state.items, { type: "compaction_trigger" }],
         stream: true, store: false, include: ["reasoning.encrypted_content"],
-        reasoning: { effort: this.options.effort ?? "high", summary: "auto" },
+        reasoning: { effort: this.options.effort ?? defaultReasoningEffort(this.model.id), summary: "auto" },
       }, signal);
       const summary = await this.streamedCompaction(response, signal);
       result = summary.result;
@@ -511,7 +567,7 @@ export class NativeResponses {
         const body: Item = {
           model: this.model.id, instructions: context.systemPrompt, input: this.state.items,
           stream: true, store: false, include: ["reasoning.encrypted_content"],
-          reasoning: { effort: this.options.effort ?? "xhigh", summary: "auto" },
+          reasoning: { effort: this.options.effort ?? defaultReasoningEffort(this.model.id), summary: "auto" },
           tools: (context.tools ?? []).map(tool => ({ type: "function", name: tool.name, description: tool.description, parameters: tool.parameters, strict: false })),
           tool_choice: "auto", parallel_tool_calls: false,
         };

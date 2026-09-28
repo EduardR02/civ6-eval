@@ -5,7 +5,7 @@ import { createInterface } from "node:readline";
 import { loadConfig } from "./config.ts";
 import { PlayerHost } from "./host.ts";
 import { readOmpApiKey, readOmpCredential } from "./player/auth.ts";
-import type { PlayerEvent, TaskRecord } from "./contracts.ts";
+import { defaultReasoningEffort, type PlayerEvent, type TaskRecord } from "./contracts.ts";
 import { readUsageReport, formatUsageReport } from "./usage.ts";
 import { runDashboard } from "./dashboard.ts";
 
@@ -31,8 +31,9 @@ Options:
                   expert-informed loads expertGuidePath into the main player's system prompt
                   as labelled reference; the run archives its exact text, hash and configuration.
   --provider MODE openai, codex or opencode-go
-  --model NAME    Provider model id, for example deepseek-flash or gpt-6-astra
-  --effort LEVEL  Codex/OpenAI: low, medium, high, xhigh; opencode-go: low, high, max
+  --model NAME    Provider model id (for example gpt-6-astra, gpt-6-sol,
+                  gpt-6-luna, deepseek-flash or glm-5.3-flash)
+  --effort LEVEL  low, medium, high, xhigh or max where supported by the model
   --completion M  explicit (default) or response; see below
   --prompt TEXT   One task for play; omit for the interactive console
   --code TEXT     Python source for exec (mutually exclusive with --file)
@@ -42,9 +43,17 @@ Options:
 
 Configured values win. Without a configuration file the fallbacks are provider
 codex, model gpt-6-astra (glm-5.3-flash for opencode-go), effort high, 200 saved
-model calls, and completion mode explicit. The repository civ6.config.json pins
-whatever the next run should use; --provider/--model/--effort/--calls/--completion
-override it for one invocation.
+model calls, and completion mode explicit. Reasoning defaults are high for
+gpt-6-astra and gpt-6-sol, max for gpt-6-luna, and high for other models. A
+configured effort stays with its provider/model profile; changing --provider or
+--model without --effort selects the new model's default instead.
+
+Per-run examples (these override the configured model for this invocation):
+  bun start play --provider codex --model gpt-6-sol --prompt 'Review the current position'
+  bun start play --provider codex --model gpt-6-luna --prompt 'Review the current position'
+
+The repository civ6.config.json pins the next run; --provider/--model/--effort/
+--calls/--completion override it for one invocation.
 
 Completion modes (play):
   explicit  The task ends only when the model declares its outcome through the
@@ -63,8 +72,9 @@ Completion modes (play):
 
 Authentication: ChatGPT/Codex subscription from ~/.omp/agent/agent.db by default.
 Set authPath to ~/.codex/auth.json to use the desktop/CLI login instead.
-OPENAI_API_KEY is used only with explicit provider openai. Credentials never
-enter player Python sandboxes; the OMP store is read-only and never refreshed here.
+OPENAI_API_KEY is used only with provider openai; OPENCODE_API_KEY can be used
+with opencode-go instead of OMP. Credentials never enter player Python sandboxes;
+the OMP store is read-only and never refreshed here.
 The current CLI does not start scored games automatically; open your intended
 Gathering Storm game, or ask the player to create one through the UI.
 
@@ -143,6 +153,7 @@ async function main(): Promise<void> {
     return;
   }
   const config = await loadConfig(projectRoot, option("config"));
+  const configuredProfile = { provider: config.provider, model: config.model };
   if (option("provider")) {
     const value = option("provider");
     if (value !== "openai" && value !== "codex" && value !== "opencode-go") throw new Error("--provider must be codex, openai or opencode-go");
@@ -150,13 +161,15 @@ async function main(): Promise<void> {
     config.provider = value as typeof config.provider;
   }
   if (option("model")) config.model = option("model")!;
+  if (!option("effort") && (config.provider !== configuredProfile.provider || config.model !== configuredProfile.model)) {
+    config.effort = defaultReasoningEffort(config.model);
+  }
   if (option("effort")) {
     const value = option("effort")!;
     if (!["low", "medium", "high", "xhigh", "max"].includes(value)) throw new Error("Invalid --effort");
     config.effort = value as typeof config.effort;
   }
   if (config.provider === "opencode-go" && !["low", "high", "max", "xhigh"].includes(config.effort)) throw new Error("opencode-go --effort must be low, high, max or xhigh");
-  if (config.provider !== "opencode-go" && config.effort === "max") throw new Error("Codex/OpenAI --effort max is unsupported; choose xhigh");
   if (option("calls")) {
     const value = option("calls")!;
     const count = value === "unlimited" ? value : Number(value);
@@ -206,7 +219,7 @@ async function main(): Promise<void> {
     } else if (event.type === "usage") {
       const data = event.data as { usage?: { input: number; output: number; cacheRead: number }; kind?: string } | undefined;
       if (data?.usage) console.log(`\n[${event.agentId}] ${data.kind ?? "model"}: ${data.usage.input} new input, ${data.usage.cacheRead} cached, ${data.usage.output} output tokens`);
-    } else if (["tool_start", "agent_start", "agent_error", "compaction"].includes(event.type)) {
+    } else if (["tool_start", "agent_start", "agent_error", "compaction", "account_switch"].includes(event.type)) {
       console.log(`\n[${event.agentId}] ${event.type}${event.text ? `: ${event.text}` : ""}`);
     }
   };

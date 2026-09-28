@@ -333,7 +333,7 @@ _namespace = {
                            "action", "rules", "civilopedia", "keybinds", "dismiss_notifications")),
     "agent": Agents(),
     "artifact": Service("artifact", ("read", "write", "list")),
-    "history": Service("history", ("search", "read", "note")),
+    "history": Service("history", ("search", "read", "note", "evidence")),
     "pyautogui": _install_pyautogui(),
 }
 

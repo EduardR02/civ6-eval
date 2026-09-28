@@ -2,6 +2,11 @@ export type Json = null | boolean | number | string | Json[] | { [key: string]: 
 export type Arguments = Record<string, unknown>;
 export type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
+/** Default reasoning effort for model profiles without an explicit configured or run override. */
+export function defaultReasoningEffort(model?: string): "high" | "max" {
+  return model === "gpt-6-luna" ? "max" : "high";
+}
+
 /** Explicit provider transport and presentation limits for one configured run. */
 export interface RequestLimits {
   maxImages?: number;

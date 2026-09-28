@@ -1,5 +1,6 @@
-import { mkdir, readFile, writeFile, appendFile, readdir, lstat, realpath, rename, unlink, stat } from "node:fs/promises";
+import { mkdir, readFile, writeFile, appendFile, readdir, opendir, open, lstat, realpath, rename, unlink, stat } from "node:fs/promises";
 import { createReadStream, readFileSync } from "node:fs";
+import { constants as fsConstants } from "node:fs";
 import { createInterface } from "node:readline";
 import { createServer, type Server } from "node:net";
 import { homedir } from "node:os";
@@ -27,6 +28,45 @@ function validAgent(id: string): void {
 const MAX_NOTE_BYTES = 8 * 1024;
 const NOTE_WINDOW_MS = 60_000;
 const MAX_NOTES_PER_WINDOW = 30;
+const EVIDENCE_HISTORY_BYTES = 1024 * 1024;
+const EVIDENCE_SNAPSHOT_BYTES = 4 * 1024 * 1024;
+const EVIDENCE_TOTAL_SNAPSHOT_BYTES = 16 * 1024 * 1024;
+const EVIDENCE_CANDIDATES = 256;
+const EVIDENCE_SNAPSHOTS = 16;
+const EVIDENCE_TEXT_CHARS = 320;
+const EVIDENCE_TIME_MS = 2000;
+
+/** Read a fixed byte window from a real file, never following a provider-controlled link. */
+async function evidenceFile(path: string, maxBytes: number, tail = false, offset?: number): Promise<{ data: Buffer; size: number } | null> {
+  if (!(await lstat(path)).isFile()) return null;
+  const file = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const info = await file.stat();
+    if (!info.isFile()) return null;
+    if (!tail && offset === undefined && info.size > maxBytes) return null;
+    const start = offset ?? (tail ? Math.max(0, info.size - maxBytes) : 0);
+    if (start > info.size) return null;
+    const length = Math.min(info.size - start, maxBytes);
+    const data = Buffer.alloc(length);
+    let read = 0;
+    while (read < length) {
+      const part = await file.read(data, read, length - read, start + read);
+      if (!part.bytesRead) break;
+      read += part.bytesRead;
+    }
+    return { data: data.subarray(0, read), size: info.size };
+  } finally { await file.close(); }
+}
+
+function evidenceExcerpt(text: string, index: number) {
+  const textOffset = Math.max(0, index - 80);
+  return {
+    text: text.slice(textOffset, textOffset + EVIDENCE_TEXT_CHARS),
+    textOffset, totalChars: text.length,
+    truncated: textOffset > 0 || textOffset + EVIDENCE_TEXT_CHARS < text.length,
+  };
+}
+
 /**
  * Which snapshot sections a captured observation actually carries. The bridge normalises `sections`;
  * an archive without it predates sectioning and carried every collection.
@@ -381,6 +421,7 @@ export class PlayerHost {
   }
   private async history(method: string, args: Arguments, agentId = "main"): Promise<unknown> {
     if (method === "history.note") return this.note(agentId, args);
+    if (method === "history.evidence") return this.evidence(args);
     if (method !== "history.search" && method !== "history.read") throw new Error(`Unknown history method: ${method}`);
     const limit = Math.min(100, Math.max(1, Number(args.limit ?? 20)));
     const offset = args.offset === undefined ? undefined : Number(args.offset);
@@ -409,6 +450,217 @@ export class PlayerHost {
       } finally { lines.close(); input.destroy(); }
     }
     return method === "history.search" ? { matches: selected, total: matched } : { rows: selected, total };
+  }
+  /** Search only immutable game observations and public run outputs, with finite IO and response size. */
+  private async evidence(args: Arguments): Promise<unknown> {
+    if (args.byteOffset !== undefined) return this.evidenceRecord(args);
+    const rawQuery = textArg(args, "query");
+    const query = rawQuery.trim().toLowerCase();
+    if (query.length < 2 || Buffer.byteLength(rawQuery, "utf8") > 120) throw new Error("query must contain 2–120 characters (at most 120 UTF-8 bytes)");
+    const limit = args.limit === undefined ? 6 : args.limit;
+    if (!Number.isSafeInteger(limit) || (limit as number) < 1 || (limit as number) > 8) throw new Error("limit must be an integer from 1 to 8");
+    const snapshotId = args.snapshotId;
+    if (snapshotId !== undefined && (typeof snapshotId !== "string" || snapshotId.length > 80 || !/^s-[a-f0-9-]+$/.test(snapshotId))) throw new Error("Invalid snapshot id");
+    const maxMatches = limit as number;
+    const scanned = { snapshots: 0, snapshotBytes: 0, historyBytes: 0 };
+    let incomplete = false;
+    const snapshots: Record<string, unknown>[] = [];
+    const history: Record<string, unknown>[] = [];
+    const latestObservedTurn = this.lastObserved.turn;
+    const latestSnapshotId = this.latestSnapshot ?? null;
+    await this.eventQueue;
+    const deadline = Date.now() + EVIDENCE_TIME_MS;
+
+    const directory = join(this.runDir, "snapshots");
+    if (!(await lstat(directory)).isDirectory()) throw new Error("Snapshot archive must be a real directory");
+    const candidates: { id: string; mtime: number }[] = [];
+    if (!snapshotId && latestSnapshotId) candidates.push({ id: latestSnapshotId, mtime: Infinity });
+    if (snapshotId) candidates.push({ id: snapshotId, mtime: 0 });
+    else {
+      const entries = await opendir(directory);
+      let names = 0;
+      for await (const entry of entries) {
+        if (++names > EVIDENCE_CANDIDATES) { incomplete = true; break; }
+        if (Date.now() >= deadline) { incomplete = true; break; }
+        if (!entry.isFile() || !/^s-[a-f0-9-]+\.json$/.test(entry.name) || entry.name === `${latestSnapshotId}.json`) continue;
+        const info = await lstat(join(directory, entry.name));
+        if (info.isFile()) candidates.push({ id: entry.name.slice(0, -5), mtime: info.mtimeMs });
+      }
+      candidates.sort((a, b) => b.mtime - a.mtime || b.id.localeCompare(a.id));
+      if (candidates.length > EVIDENCE_SNAPSHOTS) incomplete = true;
+    }
+    for (const { id } of candidates.slice(0, EVIDENCE_SNAPSHOTS)) {
+      if (snapshots.length >= maxMatches) break;
+      const priority = !snapshotId && id === latestSnapshotId;
+      if ((Date.now() >= deadline && !priority) || scanned.snapshotBytes >= EVIDENCE_TOTAL_SNAPSHOT_BYTES) { incomplete = true; break; }
+      let file: { data: Buffer; size: number } | null;
+      try { file = await evidenceFile(join(directory, `${id}.json`), Math.min(EVIDENCE_SNAPSHOT_BYTES, EVIDENCE_TOTAL_SNAPSHOT_BYTES - scanned.snapshotBytes)); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") { incomplete = true; continue; }
+        throw error;
+      }
+      if (!file) { incomplete = true; continue; }
+      scanned.snapshots++;
+      scanned.snapshotBytes += file.data.length;
+      let snapshot: Record<string, unknown>;
+      try {
+        snapshot = JSON.parse(file.data.toString("utf8"));
+        if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot) || snapshot.snapshotId !== id) { incomplete = true; continue; }
+      } catch { incomplete = true; continue; }
+      const turn = Number.isSafeInteger(snapshot.turn) && (snapshot.turn as number) >= 0 ? snapshot.turn as number : null;
+      const sameGame = typeof snapshot.gameId === "string" && snapshot.gameId === this.lastObserved.gameId;
+      const ageTurns = sameGame && turn !== null && latestObservedTurn !== null && turn <= latestObservedTurn ? latestObservedTurn - turn : null;
+      const rawCoverage = snapshot.coverage;
+      const coverage = rawCoverage && typeof rawCoverage === "object" && !Array.isArray(rawCoverage) &&
+        ["units", "cities", "map"].every(key => ["complete", "partial", "omitted"].includes((rawCoverage as Record<string, unknown>)[key] as string))
+        ? { units: (rawCoverage as Record<string, unknown>).units, cities: (rawCoverage as Record<string, unknown>).cities, map: (rawCoverage as Record<string, unknown>).map } : null;
+      const provenance = {
+        source: "snapshot", snapshotId: id, turn,
+        capturedAt: typeof snapshot.capturedAt === "string" && snapshot.capturedAt.length <= 40 ? snapshot.capturedAt : null,
+        sections: Array.isArray(snapshot.sections) && snapshot.sections.length <= 16 &&
+          snapshot.sections.every(value => typeof value === "string" && value.length <= 40) ? snapshot.sections : null,
+        coverage, ageTurns,
+      };
+      const match = (value: unknown, pointer: string, section: string) => {
+        if (snapshots.length >= maxMatches || (Date.now() >= deadline && !priority)) return;
+        const text = JSON.stringify(value);
+        if (!text) return;
+        const index = text.toLowerCase().indexOf(query);
+        if (index >= 0) snapshots.push({ ...provenance, pointer, section, ...evidenceExcerpt(text, index) });
+      };
+      for (const [section, value] of Object.entries(snapshot)) {
+        if (snapshots.length >= maxMatches) break;
+        if (Date.now() >= deadline && !priority) { incomplete = true; break; }
+        if (section.length > 80) { incomplete = true; continue; }
+        if (section === "snapshotId" || section === "capturedAt") continue;
+        if (section === "map" && value && typeof value === "object" && !Array.isArray(value)) {
+          for (const [key, part] of Object.entries(value)) {
+            if (snapshots.length >= maxMatches) break;
+            if (key === "tiles" && Array.isArray(part)) {
+              for (let i = 0; i < part.length && snapshots.length < maxMatches; i++) {
+                if (Date.now() >= deadline && !priority) { incomplete = true; break; }
+                match(part[i], `/map/tiles/${i}`, "map");
+              }
+            } else if (key.length <= 80) match(part, `/map/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`, "map");
+            else incomplete = true;
+          }
+        } else if (Array.isArray(value)) {
+          for (let i = 0; i < value.length && snapshots.length < maxMatches; i++) {
+            if (Date.now() >= deadline && !priority) { incomplete = true; break; }
+            match(value[i], `/${section.replaceAll("~", "~0").replaceAll("/", "~1")}/${i}`, section);
+          }
+        } else match(value, `/${section.replaceAll("~", "~0").replaceAll("/", "~1")}`, section);
+      }
+    }
+
+    const historyPath = join(this.runDir, "history.jsonl");
+    let file: { data: Buffer; size: number } | null;
+    try { file = snapshotId ? null : await evidenceFile(historyPath, EVIDENCE_HISTORY_BYTES, true); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      file = null;
+    }
+    if (!file && !snapshotId) incomplete = true;
+    if (file) {
+      scanned.historyBytes = file.data.length;
+      if (file.size > EVIDENCE_HISTORY_BYTES) incomplete = true;
+      const start = file.size - file.data.length;
+      const firstNewline = start ? file.data.indexOf(10) : -1;
+      const first = start ? firstNewline + 1 : 0;
+      if (start && firstNewline < 0) incomplete = true;
+      const end = file.data.lastIndexOf(10);
+      let line = 0;
+      if (!start) for (let i = 0; i <= end; i++) if (file.data[i] === 10) line++;
+      // Recent public evidence wins when a query has more matches than the response limit.
+      // Count newlines once for absolute line numbers; parsing can then stop after enough hits.
+      for (let recordEnd = end; recordEnd > first && history.length < maxMatches; ) {
+        if (Date.now() >= deadline) { incomplete = true; break; }
+        const previous = file.data.lastIndexOf(10, recordEnd - 1);
+        const pos = Math.max(first, previous + 1);
+        const recordOffset = start + pos;
+        const record = file.data.toString("utf8", pos, recordEnd);
+        recordEnd = previous;
+        const recordLine = start === 0 ? line-- : null;
+        let event: Record<string, unknown>;
+        try {
+          event = JSON.parse(record);
+          if (!event || typeof event !== "object" || Array.isArray(event)) { incomplete = true; continue; }
+        } catch { incomplete = true; continue; }
+        let value: unknown;
+        let source: string;
+        if (event.kind === "execution_result") { source = "execution"; value = event.content; }
+        else if (event.kind === "popup" && event.popup && typeof event.popup === "object") { source = "popup"; value = event.popup; }
+        else if (event.kind === "note") { source = "note"; value = event.text; }
+        else continue;
+        const blocks = source === "execution" && Array.isArray(value) ? value : [value];
+        for (let i = 0; i < blocks.length && history.length < maxMatches; i++) {
+          const block = blocks[i];
+          if (source === "execution" && (!block || typeof block !== "object" || block.type !== "text" || typeof block.text !== "string")) continue;
+          const text = source === "execution" && block && typeof block === "object" && typeof block.text === "string"
+            ? block.text : source === "note" && typeof block === "string" ? block : JSON.stringify(block);
+          if (!text) continue;
+          const index = text.toLowerCase().indexOf(query);
+          if (index < 0) continue;
+          history.push({
+            source, at: typeof event.at === "string" && event.at.length <= 40 ? event.at : null, line: recordLine,
+            byteOffset: recordOffset, executionId: source === "execution" && typeof event.executionId === "string" && event.executionId.length <= 80 ? event.executionId : null,
+            blockIndex: source === "execution" ? i : undefined,
+            lastObservedTurn: Number.isSafeInteger(event.lastObservedTurn) ? event.lastObservedTurn : null,
+            ...evidenceExcerpt(text, index),
+          });
+        }
+      }
+    }
+    const snapshotAllowance = Math.ceil(maxMatches / 2);
+    const matches = [...snapshots.slice(0, snapshotAllowance), ...history.slice(0, maxMatches - Math.min(snapshotAllowance, snapshots.length))];
+    if (matches.length < maxMatches) matches.push(...snapshots.slice(snapshotAllowance, maxMatches));
+    return { matches, latestObservedTurn, latestSnapshotId, scanned, incomplete, resultLimitReached: snapshots.length + history.length > matches.length || snapshots.length >= maxMatches || history.length >= maxMatches };
+  }
+  /** Recover one selected public history block by its stable byte position, without reading a host path. */
+  private async evidenceRecord(args: Arguments): Promise<unknown> {
+    const byteOffset = args.byteOffset;
+    const blockIndex = args.blockIndex ?? 0;
+    const textOffset = args.textOffset ?? 0;
+    const textLimit = args.textLimit ?? 2000;
+    if (!Number.isSafeInteger(byteOffset) || (byteOffset as number) < 0 ||
+        !Number.isSafeInteger(blockIndex) || (blockIndex as number) < 0 || (blockIndex as number) > 100 ||
+        !Number.isSafeInteger(textOffset) || (textOffset as number) < 0 ||
+        !Number.isSafeInteger(textLimit) || (textLimit as number) < 1 || (textLimit as number) > 2000)
+      throw new Error("Invalid public evidence offset or limit");
+    await this.eventQueue;
+    const position = byteOffset as number;
+    const file = await evidenceFile(join(this.runDir, "history.jsonl"), EVIDENCE_HISTORY_BYTES, false, Math.max(0, position - 1));
+    if (!file || (position && file.data[0] !== 10)) throw new Error("Evidence offset is not a record boundary");
+    const begin = position ? 1 : 0;
+    const end = file.data.indexOf(10, begin);
+    if (end < 0) throw new Error("Public evidence record exceeds the bounded read");
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(file.data.toString("utf8", begin, end));
+      if (!event || typeof event !== "object" || Array.isArray(event)) throw new Error("Invalid public evidence record");
+    } catch { throw new Error("Invalid public evidence record"); }
+    let source: string;
+    let text: string;
+    if (event.kind === "execution_result" && Array.isArray(event.content)) {
+      source = "execution";
+      const block = event.content[blockIndex as number];
+      if (!block || typeof block !== "object" || block.type !== "text" || typeof block.text !== "string")
+        throw new Error("No public text at this execution block");
+      text = block.text;
+    } else if (event.kind === "popup" && blockIndex === 0 && event.popup && typeof event.popup === "object") {
+      source = "popup"; text = JSON.stringify(event.popup);
+    } else if (event.kind === "note" && blockIndex === 0 && typeof event.text === "string") {
+      source = "note"; text = event.text;
+    } else throw new Error("Evidence offset does not identify a public record");
+    const start = textOffset as number;
+    const length = textLimit as number;
+    return {
+      source, byteOffset: position, blockIndex,
+      executionId: source === "execution" && typeof event.executionId === "string" && event.executionId.length <= 80 ? event.executionId : null,
+      at: typeof event.at === "string" && event.at.length <= 40 ? event.at : null,
+      text: text.slice(start, start + length), textOffset: start, totalChars: text.length,
+      truncated: start > 0 || start + length < text.length,
+    };
   }
   async execute(code: string, agentId = "main", options?: ExecuteOptions): Promise<ExecutionResult> {
     validAgent(agentId);

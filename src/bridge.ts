@@ -293,7 +293,7 @@ const METHOD_SCHEMA: Record<string, string> = {
   "civ.probe": "{verbose?:boolean}; capabilities as advertised by the runtime generator on this call (not a ruleset claim), popup catalog from the fixed reviewed screen adapters, contexts only with verbose=true",
   "civ.snapshot": `{include?:string|string[] of ${SECTIONS.join("|")}|all (default ${DEFAULT_SECTIONS.join(",")}), region?:"owned"|"visible"|"all"|{x,y,radius<=128}|{x0,y0,x1,y1}, edges?:boolean, detail?:"summary"|"full", mapOffset?:integer>=0, mapLimit?:1..100000}; omitted sections are absent, not empty; coverage={units,cities,map} says complete|partial|omitted per queried collection; region and mapOffset/mapLimit make map partial`,
   "civ.inspect": "{id:string} or {x:integer,y:integer} (+kind?:string, edges?:boolean); single-record lookup, never a full-map read; a live miss returns the remembered record with lastSeenTurn and remembered=true instead of scanning the map",
-  "civ.options": `{unitId?:string} | {cityId?:string} | {}; operation?:string (unit: short name from its list; city: item name, place_district, citizens or tile_purchase; player scope: research, civic, government or policies), targets?:boolean, detail?:"summary"|"full", offset?:integer>=0, limit?:1..500`,
+  "civ.options": `{unitId?:string} | {cityId?:string} | {}; operation?:string (unit: short name from its list; city: item name, place_district, citizens or tile_purchase; player scope: research, civic, government or policies), targets?:boolean, detail?:"summary"|"full", offset?:integer>=0, limit?:1..500; MAKE_TRADE_ROUTE targets are opt-in, native-legal currently visible cities, paged by targetOffset?:integer>=0 and targetLimit?:1..50 (default 20), with targetsTotal/targetsMore. Each target has cityId,x,y,name,owner,distance,tradingPost,tradeRouteQuest,pathLength and originYields/destinationYields: nonzero {yield,value} pairs ([] means known zero; null means unknown). detail="full" and targetLimit=1 adds bounded visible pathPlots. No ranking or road guarantee.`,
   "civ.path": "{unitId:string,x:integer,y:integer}; engine-authorised per-plot path and turn data with busy=true and honest truncation when the engine or bounds cut it",
   "civ.decisions": `{kind?:string, id?:string, popups?:"all"|"none", detail?:"summary"|"full", offset?:integer>=0, limit?:1..500}; pending gameplay decisions with stable ids plus fixed-context popup observations; popups:"none" skips popup-context probing on list calls; popup ids resolve against the adapter registry only; every rendered popup reports its captured text (content/contentStatus) and whether a lossless automatic close is possible (autoDismissible, autoDismissReason)`,
   "civ.decide": `{id:string,choice?:scalar,choices?:array of <=${MAX_BATCH} selections}; answers one gameplay decision, or closes one reviewed popup by its popup: id (choice/choices rejected for popups). A popup close runs only that screen's own native close handler: it chooses nothing, and gameplay choosers (event, promotion, raze, espionage, map pin, deals) are never closed. Presence and, for an automatic close, byte-identical captured content are re-checked inside the same screen invocation; then it reports advanced=true when the screen immediately shows its next queued item. Submission is not completion, and a thrown-away acknowledgement is never replayed. A request refused before it reached the engine returns status="refused" with reasons; only an already-sent request reports an unknown outcome`,
@@ -732,6 +732,13 @@ print(__MARKER__ .. ':DONE')`;
         if (args.detail !== undefined && args.detail !== "summary" && args.detail !== "full") throw new Error('detail must be "summary" or "full".');
         if (args.offset !== undefined) requireInteger(args.offset, "offset", 0, 1_000_000);
         if (args.limit !== undefined) requireInteger(args.limit, "limit", 1, 500);
+        if (args.targetOffset !== undefined || args.targetLimit !== undefined) {
+          if (args.unitId === undefined || (args.targets !== true && args.operation !== "MAKE_TRADE_ROUTE")) {
+            throw new Error('targetOffset/targetLimit require unitId and either targets=true or operation="MAKE_TRADE_ROUTE".');
+          }
+        }
+        if (args.targetOffset !== undefined) requireInteger(args.targetOffset, "targetOffset", 0, 1_000_000);
+        if (args.targetLimit !== undefined) requireInteger(args.targetLimit, "targetLimit", 1, 50);
         return;
       case "civ.path":
         requireId(args.unitId, "unitId");

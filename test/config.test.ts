@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, writeFile, rm, readdir, readFile, stat } from "node:fs/promises";
+import { mkdtemp, writeFile, rm, readdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { pathToFileURL } from "node:url";
@@ -7,6 +7,28 @@ import { loadConfig } from "../src/config.ts";
 
 const directories: string[] = [];
 afterEach(async () => { for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true }); });
+
+test("absent reasoning effort follows the model default and compaction defaults to 272000", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "civ-model-defaults-"));
+  directories.push(directory);
+  const file = join(directory, "civ6.config.json");
+  expect(await loadConfig(directory)).toMatchObject({
+    model: "gpt-6-astra", provider: "codex", effort: "high", compactThreshold: 272000,
+  });
+  for (const [model, effort] of [
+    ["gpt-6-astra", "high"],
+    ["gpt-6-sol", "high"],
+    ["gpt-6-luna", "max"],
+    ["deepseek-flash", "high"],
+  ] as const) {
+    await writeFile(file, JSON.stringify({ model }));
+    expect((await loadConfig(directory)).effort).toBe(effort);
+  }
+  await writeFile(file, JSON.stringify({ model: "gpt-6-luna", effort: "medium" }));
+  expect((await loadConfig(directory)).effort).toBe("medium");
+  await writeFile(file, JSON.stringify({ provider: "opencode-go" }));
+  expect(await loadConfig(directory)).toMatchObject({ model: "glm-5.3-flash", effort: "high" });
+});
 
 test("request limits are validated at load and absent means no added retention policy", async () => {
   const directory = await mkdtemp(join(tmpdir(), "civ-limits-"));
@@ -21,18 +43,6 @@ test("request limits are validated at load and absent means no added retention p
   }
   await writeFile(file, JSON.stringify({ requestLimits: { maxImage: 45 } }));
   await expect(loadConfig(directory)).rejects.toThrow("Unknown requestLimits key");
-});
-
-test("the default expert guide path is the canonical guide that exists", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "civ-guide-"));
-  directories.push(directory);
-  const file = join(directory, "empty.json");
-  await writeFile(file, "{}");
-  // The default is relative to the project root, so load an empty configuration from the real one.
-  const root = resolve(import.meta.dir, "..");
-  const config = await loadConfig(root, file);
-  expect(config.expertGuidePath).toBe(resolve(root, "guides", "herson-bbg", "SKILL.md"));
-  expect((await stat(config.expertGuidePath)).isFile()).toBe(true);
 });
 
 test("ambient API credentials cannot switch a subscription player to API billing", async () => {

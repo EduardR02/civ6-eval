@@ -116,6 +116,24 @@ test("native compaction preserves opaque output and completed identities without
   expect(requestInput).toEqual([opaque]);
 });
 
+test("OpenAI GPT-6 Luna keeps max on the wire and compacts at its 272000-token default", async () => {
+  const opaque = { type: "compaction", encrypted_content: "opaque-api-fixture" };
+  const requests: { compact: boolean; effort?: string }[] = [];
+  const { create, path } = fixture(async request => {
+    const compact = new URL(request.url).pathname.endsWith("/compact");
+    const body = await request.json() as { reasoning?: { effort: string } };
+    requests.push({ compact, effort: body.reasoning?.effort });
+    return compact ? Response.json({ output: [opaque] }) : sse([{ type: "response.completed", response: { status: "completed", output: [] } }]);
+  }, undefined, { id: "gpt-6-luna", contextWindow: 1050000, maxTokens: 128000 });
+  saveJson(path, { version: 1, items: [{ role: "user", content: [{ type: "input_text", text: "old context" }] }], seenInputs: [], completedCalls: [], inputTokens: 271999, compactions: 0, totalUsage: emptyUsage() });
+  expect((await create({ compactThreshold: undefined }).stream({ messages: [] }).result()).stopReason).toBe("stop");
+  expect(requests).toEqual([{ compact: false, effort: "max" }]);
+  const state = JSON.parse(readFileSync(path, "utf8"));
+  saveJson(path, { ...state, inputTokens: 272000 });
+  expect((await create({ compactThreshold: undefined }).stream({ messages: [] }).result()).stopReason).toBe("stop");
+  expect(requests).toEqual([{ compact: false, effort: "max" }, { compact: true, effort: undefined }, { compact: false, effort: "max" }]);
+});
+
 test("streamed native items survive a Codex terminal response with empty output", async () => {
   const reasoning = { type: "reasoning", id: "rs_fixture", summary: [], encrypted_content: "opaque-roundtrip", future_field: 42 };
   const { create, path } = fixture(() => sse([

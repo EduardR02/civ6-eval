@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, mkdir, writeFile, rm, appendFile, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, appendFile, readFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PlayerHost } from "../src/host.ts";
@@ -114,6 +114,151 @@ test("history search returns bounded excerpts with recoverable full-record offse
   expect(found.matches[0]!.truncated).toBe(true);
   const recovered = await host.rpc("analyst", "history.read", { offset: found.matches[0]!.line - 1, limit: 1, textOffset: text.indexOf("recover-me"), textLimit: 10 }) as { rows: { text: string }[] };
   expect(recovered.rows[0]!.text).toBe("recover-me");
+});
+
+test("public evidence locates historical snapshot facts with exact coverage and recoverable pointers", async () => {
+  const { host, directory } = await fixture();
+  const oldId = "s-11111111-1111-4111-8111-111111111111";
+  const previous = {
+    snapshotId: oldId, gameId: "game-1", capturedAt: "2026-01-01T12:00:00.000Z", turn: 7,
+    sections: ["core", "cities"], coverage: { units: "omitted", cities: "partial", map: "omitted" },
+    cities: [{ id: "C1", name: "Amber Harbor", own: true, visibility: "visible" }],
+  };
+  await writeFile(join(directory, "snapshots", `${oldId}.json`), JSON.stringify(previous));
+  host.bridge.preparePresentation = async () => ({ observed: [], presented: [], dismissed: [], advanced: [], resolved: [], remaining: [], callbackFailures: [], unavailable: {}, more: false });
+  host.bridge.request = async () => ({ turn: 11, gameId: "game-1", playerId: 0, sections: ["core"], coverage: { units: "omitted", cities: "omitted", map: "omitted" } });
+  host.bridge.exportKnowledge = () => null;
+  await host.rpc("main", "civ.snapshot", {});
+  const result = await host.rpc("analyst", "history.evidence", { query: "Amber Harbor", snapshotId: oldId }) as {
+    matches: { source: string; snapshotId: string; pointer: string; section: string; turn: number; ageTurns: number; capturedAt: string; coverage: unknown; sections: string[] }[];
+    latestObservedTurn: number; incomplete: boolean;
+  };
+  expect(result.matches[0]).toMatchObject({
+    source: "snapshot", snapshotId: oldId, pointer: "/cities/0", section: "cities",
+    turn: 7, ageTurns: 4, capturedAt: previous.capturedAt, coverage: previous.coverage, sections: previous.sections,
+  });
+  const recovered = await host.rpc("analyst", "civ.snapshot", { snapshotId: oldId }) as typeof previous;
+  expect(recovered.cities[0]!.name).toBe("Amber Harbor");
+  expect(result.latestObservedTurn).toBe(11);
+  expect(result.incomplete).toBe(false);
+  const absent = await host.rpc("analyst", "history.evidence", { query: "unknown city", snapshotId: oldId }) as { matches: unknown[]; incomplete: boolean };
+  expect(absent.matches).toEqual([]);
+  expect(absent.incomplete).toBe(false);
+  host.bridge.request = async () => ({ turn: 20, gameId: "another-game", playerId: 0, sections: ["core"], coverage: { units: "omitted", cities: "omitted", map: "omitted" } });
+  await host.rpc("main", "civ.snapshot", {});
+  const differentGame = await host.rpc("analyst", "history.evidence", { query: "Amber Harbor", snapshotId: oldId }) as { matches: { ageTurns: number | null }[] };
+  expect(differentGame.matches[0]!.ageTurns).toBeNull();
+});
+
+test("public evidence only exposes selected run outputs, with bounded excerpts and exact recovery", async () => {
+  const { host, directory } = await fixture();
+  const secret = "private-provider-needle";
+  await writeFile(join(directory, "provider-session.json"), secret);
+  await writeFile(join(directory, "inputs.json"), secret);
+  await writeFile(join(directory, "knowledge.json"), secret);
+  await appendFile(join(directory, "history.jsonl"), JSON.stringify({ kind: "provider_private", text: secret }) + "\n");
+  await appendFile(join(directory, "history.jsonl"), JSON.stringify({ kind: "execution", executionId: "private-id", code: secret }) + "\n");
+  const output = "before ".repeat(100) + "PUBLIC-SIGNAL" + " after".repeat(100);
+  await appendFile(join(directory, "history.jsonl"), JSON.stringify({
+    at: "2026-01-01T13:00:00Z", kind: "execution_result", executionId: "public-id",
+    content: [{ type: "text", text: output }, { type: "image", artifact: "private/path.png" }],
+  }) + "\n");
+  const found = await host.rpc("analyst", "history.evidence", { query: "PUBLIC-SIGNAL" }) as {
+    matches: { source: string; executionId: string; line: number; byteOffset: number; blockIndex: number; text: string; textOffset: number; totalChars: number; truncated: boolean; at: string }[];
+  };
+  expect(found.matches).toHaveLength(1);
+  expect(found.matches[0]).toMatchObject({ source: "execution", executionId: "public-id", blockIndex: 0, at: "2026-01-01T13:00:00Z" });
+  expect(found.matches[0]!.text).toContain("PUBLIC-SIGNAL");
+  expect(found.matches[0]!.text.length).toBeLessThanOrEqual(320);
+  expect(found.matches[0]!.truncated).toBe(true);
+  const byLine = await host.rpc("analyst", "history.read", { offset: found.matches[0]!.line - 1, limit: 1 }) as { rows: { text: string }[] };
+  expect(JSON.parse(byLine.rows[0]!.text).executionId).toBe("public-id");
+  const recovered = await host.rpc("analyst", "history.evidence", {
+    byteOffset: found.matches[0]!.byteOffset, blockIndex: 0, textOffset: output.indexOf("PUBLIC-SIGNAL"), textLimit: 13,
+  }) as { text: string; totalChars: number };
+  expect(recovered.text).toBe("PUBLIC-SIGNAL");
+  expect(recovered.totalChars).toBe(output.length);
+  const noteText = "PUBLIC-NOTE from an analyst";
+  const note = await host.rpc("analyst", "history.note", { text: noteText }) as { recorded: boolean };
+  expect(note.recorded).toBe(true);
+  const notes = await host.rpc("analyst", "history.evidence", { query: "PUBLIC-NOTE" }) as { matches: { source: string; byteOffset: number }[] };
+  expect(notes.matches[0]!.source).toBe("note");
+  const recoveredNote = await host.rpc("analyst", "history.evidence", { byteOffset: notes.matches[0]!.byteOffset }) as { text: string };
+  expect(recoveredNote.text).toBe(noteText);
+  const privateSearch = await host.rpc("analyst", "history.evidence", { query: secret }) as { matches: unknown[] };
+  expect(privateSearch.matches).toEqual([]);
+  await expect(host.rpc("analyst", "history.evidence", { byteOffset: 0 })).rejects.toThrow("public record");
+  await expect(host.rpc("analyst", "history.evidence", { byteOffset: 0, textLimit: 100000 })).rejects.toThrow();
+});
+
+test("public evidence bounds its history window, output, queries and snapshot archive", async () => {
+  const { host, directory } = await fixture();
+  const marker = "late-needle";
+  const old = "x".repeat(1024 * 1024 + 100);
+  await appendFile(join(directory, "history.jsonl"), JSON.stringify({ kind: "execution_result", content: [{ type: "text", text: old }] }) + "\n");
+  await appendFile(join(directory, "history.jsonl"), JSON.stringify({
+    kind: "execution_result", at: "2026-01-01T13:00:00Z", executionId: "late-id", content: [{ type: "text", text: `${marker} ${"z".repeat(20000)}` }],
+  }) + "\n");
+  const result = await host.rpc("analyst", "history.evidence", { query: marker, limit: 1 }) as {
+    matches: { byteOffset: number; line: null; executionId: string; text: string }[];
+    scanned: { historyBytes: number; snapshotBytes: number }; incomplete: boolean;
+  };
+  expect(result.matches[0]).toMatchObject({ line: null, executionId: "late-id" });
+  expect(result.scanned.historyBytes).toBeLessThanOrEqual(1024 * 1024);
+  expect(result.incomplete).toBe(true);
+  const recovered = await host.rpc("analyst", "history.evidence", { byteOffset: result.matches[0]!.byteOffset, textLimit: marker.length }) as { text: string };
+  expect(recovered.text).toBe(marker);
+  await expect(host.rpc("analyst", "history.evidence", { query: "a", limit: 1 })).rejects.toThrow();
+  await expect(host.rpc("analyst", "history.evidence", { query: marker, limit: 9 })).rejects.toThrow();
+  await expect(host.rpc("analyst", "history.evidence", { query: marker, snapshotId: "../provider-session" })).rejects.toThrow();
+  const oldId = "s-22222222-2222-4222-8222-222222222222";
+  await writeFile(join(directory, "snapshots", `${oldId}.json`), JSON.stringify({ snapshotId: oldId, turn: 2, cities: [{ name: marker }] }));
+  const found = await host.rpc("analyst", "history.evidence", { query: marker, snapshotId: oldId }) as { matches: { source: string; ageTurns: number | null; coverage: unknown; sections: unknown }[] };
+  expect(found.matches.find(match => match.source === "snapshot")).toMatchObject({ ageTurns: null, coverage: null, sections: null });
+  const link = "s-33333333-3333-4333-8333-333333333333";
+  await writeFile(join(directory, "provider-session.json"), JSON.stringify({ snapshotId: link, name: marker }));
+  try {
+    await symlink(join(directory, "provider-session.json"), join(directory, "snapshots", `${link}.json`), "file");
+    const linked = await host.rpc("analyst", "history.evidence", { query: marker, snapshotId: link }) as { matches: { source: string }[]; incomplete: boolean };
+    expect(linked.matches.every(match => match.source !== "snapshot")).toBe(true);
+    expect(linked.incomplete).toBe(true);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+  }
+});
+
+test("public evidence prefers recent matches when the output limit is reached", async () => {
+  const { host, directory } = await fixture();
+  await appendFile(join(directory, "history.jsonl"),
+    JSON.stringify({ kind: "note", text: "route-memory older" }) + "\n" +
+    JSON.stringify({ kind: "note", text: "route-memory latest" }) + "\n");
+  const result = await host.rpc("analyst", "history.evidence", { query: "route-memory", limit: 1 }) as {
+    matches: { source: string; text: string; byteOffset: number }[];
+  };
+  expect(result.matches).toHaveLength(1);
+  expect(result.matches[0]).toMatchObject({ source: "note", text: "route-memory latest" });
+  const recovered = await host.rpc("analyst", "history.evidence", { byteOffset: result.matches[0]!.byteOffset }) as { text: string };
+  expect(recovered.text).toBe("route-memory latest");
+});
+
+test("public evidence retains the latest capture when older archives exceed the directory window", async () => {
+  const { host, directory } = await fixture();
+  await Promise.all(Array.from({ length: 260 }, (_, index) => {
+    const snapshotId = `s-${index.toString(16).padStart(8, "0")}`;
+    return writeFile(join(directory, "snapshots", `${snapshotId}.json`), JSON.stringify({ snapshotId, turn: 1 }));
+  }));
+  host.bridge.preparePresentation = async () => ({ observed: [], presented: [], dismissed: [], advanced: [], resolved: [], remaining: [], callbackFailures: [], unavailable: {}, more: false });
+  host.bridge.request = async () => ({ turn: 12, gameId: "current-game", playerId: 0, headline: "Latest Needle" });
+  host.bridge.exportKnowledge = () => null;
+  const latest = await host.rpc("main", "civ.snapshot", {}) as { snapshotId: string };
+  const found = await host.rpc("analyst", "history.evidence", { query: "Latest Needle" }) as {
+    matches: { source: string; snapshotId: string; pointer: string }[];
+    latestSnapshotId: string; scanned: { snapshots: number }; incomplete: boolean;
+  };
+  expect(found.latestSnapshotId).toBe(latest.snapshotId);
+  expect(found.matches[0]).toMatchObject({ source: "snapshot", snapshotId: latest.snapshotId, pointer: "/headline" });
+  expect(found.scanned.snapshots).toBeLessThanOrEqual(16);
+  expect(found.incomplete).toBe(true);
 });
 
 test("complaints expose readable bounded public evidence without private host paths", async () => {

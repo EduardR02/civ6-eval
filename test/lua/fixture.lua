@@ -60,9 +60,9 @@
 --   3. The map is a 3x3 grid with row-major plot indices and a hand-written six-direction
 --      neighbour table.  The real map is a wrapped hex grid; adjacency parity, wrapping and
 --      off-map behaviour are NOT modelled.
---   4. One own unit, one own city, one foreign unit, no foreign cities, no districts, no
---      buildings, no notifications, no religions in play.  Anything that only misbehaves at
---      scale or with several entities cannot be caught here.
+--   4. One own unit, one own city, one foreign city on a separately gated visible plot, no
+--      districts, buildings, notifications or religions in play. Anything that only
+--      misbehaves at scale or with several entities cannot be caught here.
 --   5. Yields, costs, combat values and turn counts are constants.  No arithmetic the game
 --      would do is reproduced.
 --   6. Events/LuaEvents record subscriptions and never fire.  state.lua's notification
@@ -131,6 +131,16 @@ STUB_CITY_COMMAND_RESULTS = {}
 STUB_OPERATION_TARGETS = {}
 STUB_CITY_OPERATION_TARGETS = {}
 STUB_CITY_COMMAND_TARGETS = {}
+-- TradeRouteChooser checks destination X0/Y0 and origin X1/Y1, then asks for a route path.
+-- These independent knobs let tests distinguish illegal operations, no path and missing APIs.
+STUB_TRADE_LEGAL = {}
+STUB_TRADE_PATHS = {}
+-- Each one-based yield array matches the TradeSupport.lua manager calls; receiving-player
+-- multipliers are keyed by zero-based YieldTypes and intentionally differ across owners.
+STUB_TRADE_YIELDS = {}
+STUB_TRADE_MULTIPLIERS = {}
+STUB_TRADE_POSTS = {}
+STUB_TRADE_QUESTS = {}
 STUB_REQUEST_INDEX = 0
 STUB_REQUEST_MODES = {}
 STUB_COMMAND_REQUEST_MODES = {}
@@ -449,16 +459,30 @@ function ownCity:GetReligion() return cityReligion end
 function ownCity:GetCitizens() return citizens end
 -- The route list is what a trader's own unit record joins against (UnitPanel.lua:2170-2190).
 function ownCity:GetTrade()
-  return { GetOutgoingRoutes = function()
-    if STUB_ROUTES_BROKEN then return 'unreadable route list' end
-    return STUB_OUTGOING_ROUTES or {}
-  end }
+  return {
+    GetOutgoingRoutes = function()
+      if STUB_ROUTES_BROKEN then return 'unreadable route list' end
+      return STUB_OUTGOING_ROUTES or {}
+    end,
+    HasActiveTradingPost = function(_, owner) return STUB_TRADE_POSTS['0:3'] == true end,
+  }
 end
 function ownCity:GetDistrictID() return -1 end
 
+local foreignCity = {}
+function foreignCity:GetOwner() assert(visible(2, 2), 'foreign city read under fog') return 1 end
+function foreignCity:GetID() assert(visible(2, 2), 'foreign city read under fog') return 12 end
+function foreignCity:GetX() return 2 end -- coordinates only; all other foreign fields need visibility
+function foreignCity:GetY() return 2 end
+function foreignCity:GetName() assert(visible(2, 2), 'foreign city name read under fog') return 'LOC_FOREIGN_CITY' end
+function foreignCity:GetTrade()
+  assert(visible(2, 2), 'foreign city trade read under fog')
+  return {HasActiveTradingPost = function(_, owner) return STUB_TRADE_POSTS['1:12'] == true end}
+end
+
 local units = collection({ ownUnit })
 local cities = collection({ ownCity })
-local foreignCities = collection({})
+local foreignCities = collection({ foreignCity })
 
 local religion = {}
 function religion:GetPantheon() return -1 end
@@ -561,6 +585,10 @@ function minorCity:GetX() return 2 end
 function minorCity:GetY() return 0 end
 function minorCity:GetPopulation() return 2 end
 
+function minorCity:GetTrade()
+  assert(visible(2, 0), 'minor city trade read under fog')
+  return {HasActiveTradingPost = function(_, owner) return STUB_TRADE_POSTS['2:11'] == true end}
+end
 local minorInfluence = {}
 function minorInfluence:CanReceiveInfluence() return true end
 function minorInfluence:GetTokensReceived(pid) return STUB_TOKENS_RECEIVED end
@@ -592,6 +620,9 @@ function minorPlayer:GetID() return 2 end
 function minorPlayer:GetInfluence() return minorInfluence end
 function minorPlayer:GetCities() return collection({ minorCity }) end
 function minorPlayer:GetUnits() return collection({}) end
+function minorPlayer:GetTrade()
+  return {GetInternationalYieldModifier = function(_, index) return STUB_TRADE_MULTIPLIERS[2][index] end}
+end
 
 local diplomacyApi = {}
 function diplomacyApi:HasMet(pid) return STUB_MINOR_MET end
@@ -599,6 +630,7 @@ function diplomacyApi:HasMet(pid) return STUB_MINOR_MET end
 PlayerManager = { GetAliveMinors = function() return { minorPlayer } end }
 
 local player = {}
+function player:GetID() return 0 end
 function player:IsTurnActive() return STUB_ACTIVE end
 function player:IsAlive() return true end
 function player:IsTurnActiveComplete() return STUB_ACTIVE end
@@ -610,7 +642,12 @@ function player:GetReligion() return religion end
 function player:GetTreasury() return treasury end
 function player:GetResources() return resources end
 function player:GetGovernors() return governors end
-function player:GetTrade() return { GetOutgoingRouteCapacity = function() return 1 end } end
+function player:GetTrade()
+  return {
+    GetOutgoingRouteCapacity = function() return 1 end,
+    GetInternationalYieldModifier = function(_, index) return STUB_TRADE_MULTIPLIERS[0][index] end,
+  }
+end
 function player:GetDiplomacy() return diplomacyApi end
 function player:GetInfluence() return influence end
 function player:GetStats() return {} end
@@ -637,6 +674,12 @@ end
 UnitManager = {
   CanStartOperation = function(unit, operation, _, parameters)
     trace('UnitManager.CanStartOperation', { operation = operation, parameters = copyTable(parameters) })
+    if operation == 2013 then
+      assert(type(parameters) == 'table' and parameters[UnitOperationTypes.PARAM_X1] == unit:GetX()
+        and parameters[UnitOperationTypes.PARAM_Y1] == unit:GetY(), 'trade check lacks native origin')
+      local destination = coordKey(parameters[UnitOperationTypes.PARAM_X0], parameters[UnitOperationTypes.PARAM_Y0])
+      if STUB_TRADE_LEGAL[destination] == false then return false, {} end
+    end
     return operationResult()
   end,
   RequestOperation = function(unit, operation, parameters)
@@ -761,8 +804,40 @@ UI = {
   end,
 }
 
+local tradeManager = {
+  GetTradeRoutePath = function(_, originOwner, originId, destinationOwner, destinationId)
+    trace('TradeManager.GetTradeRoutePath', {
+      originOwner = originOwner, originId = originId,
+      destinationOwner = destinationOwner, destinationId = destinationId,
+    })
+    return STUB_TRADE_PATHS[tostring(destinationOwner)..':'..tostring(destinationId)]
+  end,
+}
+-- Native TradeSupport.lua invokes six distinct array methods (route/path/modifiers for each
+-- receiver); making them independent catches omitted path yields and wrong-side computations.
+for _, side in ipairs({'Origin', 'Destination'}) do
+  for _, part in ipairs({'YieldsFromPotentialRoute', 'YieldsFromPath', 'YieldsFromModifiers'}) do
+    local name = 'Calculate'..side..part
+    tradeManager[name] = function(_, originOwner, originId, owner, id)
+      trace('TradeManager.'..name, {originOwner = originOwner, originId = originId, owner = owner, id = id})
+      return STUB_TRADE_YIELDS[side][part]
+    end
+  end
+end
+local questsManager = {
+  HasActiveQuestFromPlayer = function(_, pid, owner, quest)
+    assert(owner ~= 1 or visible(2, 2), 'foreign quest read under fog')
+    assert(owner ~= 2 or visible(2, 0), 'minor quest read under fog')
+    trace('Quests.HasActiveQuestFromPlayer', {player = pid, owner = owner, quest = quest})
+    return STUB_TRADE_QUESTS[owner] == true
+  end,
+}
+
 Game = {
   GetLocalPlayer = function() return 0 end,
+  GetPlayers = function() return {player, Players[1], minorPlayer} end,
+  GetTradeManager = function() return tradeManager end,
+  GetQuestsManager = function() return questsManager end,
   GetCurrentGameTurn = function() return STUB_TURN end,
   IsAllowTacticalCommands = function() return STUB_ALLOW_TACTICAL end,
   IsAllowStrategicCommands = function() return STUB_ALLOW_STRATEGIC end,
@@ -770,7 +845,14 @@ Game = {
 
 Players = {
   [0] = player,
-  [1] = { GetUnits = function() return collection({ foreignUnit }) end, GetCities = function() return foreignCities end },
+  [1] = {
+    GetID = function() return 1 end,
+    GetUnits = function() return collection({ foreignUnit }) end,
+    GetCities = function() return foreignCities end,
+    GetTrade = function()
+      return {GetInternationalYieldModifier = function(_, index) return STUB_TRADE_MULTIPLIERS[1][index] end}
+    end,
+  },
   [2] = minorPlayer,
 }
 PlayersVisibility = { [0] = {
@@ -821,6 +903,8 @@ end }
 -- Static two-argument call: Cities.GetCityInPlot(x, y).
 Cities = { GetCityInPlot = function(x, y)
   if x == 1 and y == 1 then return ownCity end
+  if x == 2 and y == 2 then return foreignCity end
+  if x == 2 and y == 0 then return minorCity end
   return nil
 end }
 
@@ -929,6 +1013,7 @@ UnitOperationTypes = {
   FORTIFY = 18, DEPLOY = 19, MAKE_TRADE_ROUTE = 25,
   PARAM_X = 100, PARAM_Y = 101, PARAM_MODIFIERS = 102,
   PARAM_IMPROVEMENT_TYPE = 103, PARAM_X0 = 104, PARAM_Y0 = 105,
+  PARAM_X1 = 109, PARAM_Y1 = 110,
   PARAM_UNIT_PLAYER = 106, PARAM_UNIT_ID = 107, PARAM_FLAGS = 108,
 }
 UnitCommandTypes = {
@@ -1014,6 +1099,7 @@ GameInfo = {
     { Index = 10, Hash = 2010, OperationType = 'UNITOPERATION_ROUTE_TO', Description = 'LOC_ROUTE_TO', VisibleInUI = false, CategoryInUI = 'MOVE' },
     { Index = 11, Hash = 2011, OperationType = 'UNITOPERATION_TELEPORT_TO', Description = 'LOC_TELEPORT', VisibleInUI = false, CategoryInUI = 'MOVE' },
     { Index = 12, Hash = 2012, OperationType = 'UNITOPERATION_REST_REPAIR', Description = 'LOC_REST_REPAIR', VisibleInUI = true, CategoryInUI = 'INPLACE' },
+    { Index = 13, Hash = 2013, OperationType = 'UNITOPERATION_MAKE_TRADE_ROUTE', Description = 'LOC_TRADE', VisibleInUI = true, CategoryInUI = 'SPECIFIC' },
   }),
   UnitCommands = rows({
     { Index = 0, Hash = 2100, CommandType = 'UNITCOMMAND_PROMOTE', Description = 'LOC_PROMOTE', VisibleInUI = true, CategoryInUI = 'SPECIFIC' },
@@ -1088,6 +1174,7 @@ GameInfo = {
 }
 GameInfo['Yields']['YIELD_GOLD'] = GameInfo.Yields[1]
 GameInfo['Yields']['YIELD_FAITH'] = GameInfo.Yields[2]
+GameInfo.Quests = { QUEST_SEND_TRADE_ROUTE = { Index = 9, QuestType = 'QUEST_SEND_TRADE_ROUTE' } }
 
 function STUB_INSTALL(name)
   STUB_SCENARIO = name
@@ -1127,6 +1214,27 @@ function STUB_INSTALL(name)
   STUB_CITY_OPERATION_RESULTS = {}
   STUB_CITY_COMMAND_RESULTS = {}
   STUB_OPERATION_TARGETS = { [UnitOperationResults.PLOTS] = { 2, 3, 4 }, [UnitOperationResults.MODIFIERS] = { 1, 0, 1 } }
+  STUB_TRADE_LEGAL = {}
+  STUB_TRADE_PATHS = { ['0:3'] = {4, 5}, ['1:12'] = {4, 8}, ['2:11'] = {4, 2} }
+  STUB_TRADE_YIELDS = {
+    Origin = {
+      YieldsFromPotentialRoute = {2, 4, 0},
+      YieldsFromPath = {1, 3, 0},
+      YieldsFromModifiers = {2, 1, 0},
+    },
+    Destination = {
+      YieldsFromPotentialRoute = {0, 2, 1},
+      YieldsFromPath = {0, 1, 2},
+      YieldsFromModifiers = {0, 1, 0},
+    },
+  }
+  STUB_TRADE_MULTIPLIERS = {
+    [0] = {[0] = 1.5, [1] = 2, [2] = 1},
+    [1] = {[0] = 1, [1] = 3, [2] = 2},
+    [2] = {[0] = 1, [1] = 1.25, [2] = 1},
+  }
+  STUB_TRADE_POSTS = {['1:12'] = true}
+  STUB_TRADE_QUESTS = {[2] = true}
   STUB_CITY_OPERATION_TARGETS = { [CityOperationResults.PLOTS] = { 2, 4 } }
   STUB_CITY_COMMAND_TARGETS = { [CityCommandResults.PLOTS] = { 2 } }
   STUB_REQUEST_INDEX = 0
